@@ -613,9 +613,14 @@ void TemporalUpscaler::CreatePipelines() {
             .bindingCount = u32(bindings.size()),
             .pBindings = bindings.data(),
         }));
+        const vk::PushConstantRange push{.stageFlags = vk::ShaderStageFlagBits::eCompute,
+                                         .offset = 0,
+                                         .size = sizeof(u32)};
         debug_pipeline_layout = Check(device.createPipelineLayoutUnique({
             .setLayoutCount = 1,
             .pSetLayouts = &*debug_desc_layout,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &push,
         }));
     }
     debug_pipeline = compute(UPSCALE_DEBUG_COMP, *debug_pipeline_layout);
@@ -867,10 +872,21 @@ void TemporalUpscaler::DebugViewUi(vk::CommandBuffer cmdbuf, u32 w, u32 h) {
         {.dstBinding = 2, .descriptorCount = 1,
          .descriptorType = vk::DescriptorType::eSampledImage, .pImageInfo = &objects_info},
     }};
+    // The UI image keeps the game's format; BGRA ones are written through the RGBA view.
+    const u32 bgra = ui_format == vk::Format::eB8G8R8A8Unorm ||
+                     ui_format == vk::Format::eB8G8R8A8Srgb;
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *debug_pipeline);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *debug_pipeline_layout, 0,
                                 writes);
+    cmdbuf.pushConstants(*debug_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                         sizeof(bgra), &bgra);
     cmdbuf.dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    static vk::Format reported = vk::Format::eUndefined;
+    if (reported != ui_format) {
+        reported = ui_format;
+        std::printf("Upscaler: motion vector view over the %s UI image\n",
+                    vk::to_string(ui_format).c_str());
+    }
     const vk::MemoryBarrier2 done{
         .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
         .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
