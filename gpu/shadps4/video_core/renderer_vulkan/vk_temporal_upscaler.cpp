@@ -17,6 +17,7 @@
 #include "bbport_settings.h"
 #include "bbport_toggles.h"
 #include "ffx_vk_portable.h"
+#include "video_core/host_shaders/upscale_debug_comp.h"
 #include "video_core/host_shaders/upscale_merge_comp.h"
 #include "video_core/host_shaders/upscale_reactive_comp.h"
 #include "video_core/host_shaders/taa_comp.h"
@@ -597,6 +598,27 @@ void TemporalUpscaler::CreatePipelines() {
         }));
     }
     merge_pipeline = compute(UPSCALE_MERGE_COMP, *merge_pipeline_layout);
+    {
+        // Debug view over the UI image: the image, then the motion and object motion images.
+        std::array<vk::DescriptorSetLayoutBinding, 3> bindings{};
+        for (u32 i = 0; i < bindings.size(); ++i) {
+            bindings[i] = {.binding = i,
+                           .descriptorType = i == 0 ? vk::DescriptorType::eStorageImage
+                                                    : vk::DescriptorType::eSampledImage,
+                           .descriptorCount = 1,
+                           .stageFlags = vk::ShaderStageFlagBits::eCompute};
+        }
+        debug_desc_layout = Check(device.createDescriptorSetLayoutUnique({
+            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+            .bindingCount = u32(bindings.size()),
+            .pBindings = bindings.data(),
+        }));
+        debug_pipeline_layout = Check(device.createPipelineLayoutUnique({
+            .setLayoutCount = 1,
+            .pSetLayouts = &*debug_desc_layout,
+        }));
+    }
+    debug_pipeline = compute(UPSCALE_DEBUG_COMP, *debug_pipeline_layout);
     storage_layout(3, reactive_desc_layout, reactive_pipeline_layout, 3 * sizeof(float));
     reactive_pipeline = compute(UPSCALE_REACTIVE_COMP, *reactive_pipeline_layout);
     storage_layout(2, taa_sharpen_desc_layout, taa_sharpen_pipeline_layout, sizeof(float));
@@ -756,18 +778,7 @@ void TemporalUpscaler::ExtraSharpen(vk::CommandBuffer cmdbuf, vk::Image target, 
         extra_sharpen_width = w;
         extra_sharpen_height = h;
     }
-    vk::ImageView target_view = *output_view;
-    if (ldr) {
-        if (!ui_storage_view) {
-            // The UI image's own format may be sRGB; FSR 3 writes it through a UNORM view too.
-            ui_storage_view = Check(device.createImageViewUnique({
-                .image = target, .viewType = vk::ImageViewType::e2D,
-                .format = vk::Format::eR8G8B8A8Unorm,
-                .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
-            }));
-        }
-        target_view = *ui_storage_view;
-    }
+    const vk::ImageView target_view = ldr ? UiStorageView(target) : *output_view;
     const auto image_barrier = [&](vk::Image image, vk::ImageLayout old_layout,
                                    vk::PipelineStageFlags2 src, vk::AccessFlags2 src_access,
                                    vk::PipelineStageFlags2 dst, vk::AccessFlags2 dst_access) {
@@ -814,6 +825,59 @@ void TemporalUpscaler::ExtraSharpen(vk::CommandBuffer cmdbuf, vk::Image target, 
     cmdbuf.dispatch((w + 7) / 8, (h + 7) / 8, 1);
     image_barrier(target, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
                   vk::AccessFlagBits2::eShaderStorageWrite, all, rw);
+}
+
+vk::ImageView TemporalUpscaler::UiStorageView(vk::Image target) {
+    if (!ui_storage_view) {
+        // The UI image's own format may be sRGB; FSR 3 writes it through a UNORM view too.
+        ui_storage_view = Check(instance.GetDevice().createImageViewUnique({
+            .image = target, .viewType = vk::ImageViewType::e2D,
+            .format = vk::Format::eR8G8B8A8Unorm,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        }));
+    }
+    return *ui_storage_view;
+}
+
+void TemporalUpscaler::DebugViewUi(vk::CommandBuffer cmdbuf, u32 w, u32 h) {
+    if (BbSettings::Get().debug_view != BbSettings::DebugMotion) {
+        return;
+    }
+    const vk::MemoryBarrier2 visible{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead |
+                         vk::AccessFlagBits2::eShaderStorageWrite |
+                         vk::AccessFlagBits2::eShaderSampledRead,
+    };
+    cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &visible});
+    const vk::ImageView objects = camera_motion.ObjectMotionView();
+    const vk::DescriptorImageInfo target_info{.imageView = UiStorageView(vk::Image(ui_image)),
+                                              .imageLayout = vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo motion_info{.imageView = *motion_view,
+                                              .imageLayout = vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo objects_info{.imageView = objects ? objects : *motion_view,
+                                               .imageLayout = vk::ImageLayout::eGeneral};
+    const std::array<vk::WriteDescriptorSet, 3> writes = {{
+        {.dstBinding = 0, .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &target_info},
+        {.dstBinding = 1, .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eSampledImage, .pImageInfo = &motion_info},
+        {.dstBinding = 2, .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eSampledImage, .pImageInfo = &objects_info},
+    }};
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *debug_pipeline);
+    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *debug_pipeline_layout, 0,
+                                writes);
+    cmdbuf.dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    const vk::MemoryBarrier2 done{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+    };
+    cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &done});
 }
 
 void TemporalUpscaler::OnBlendedSceneDraw() {
@@ -1274,7 +1338,9 @@ float TemporalUpscaler::SceneMipBias() const {
     if (!Active() || BbSettings::Get().upscaler == BbSettings::UpscalerTaa) return 0.0f;
     const float render = float(BbSettings::Get().active_render_width.load());
     const float output = float(Scaled() ? target_width : 1920u);
-    return render > 0.0f && render < output ? std::log2(render / output) : 0.0f;
+    // log2(render / output) - 1 when upscaling, as NVIDIA's DLSS guide and AMD's FSR docs give
+    // (textures keep output-resolution detail; the upscalers resolve the extra aliasing).
+    return render > 0.0f && render < output ? std::log2(render / output) - 1.0f : 0.0f;
 }
 
 bool TemporalUpscaler::Scaled() const {
@@ -1643,6 +1709,7 @@ void TemporalUpscaler::RunScaled() {
             cmdbuf.blitImage(vk::Image(output_image), vk::ImageLayout::eGeneral,
                              vk::Image(ui_image), vk::ImageLayout::eGeneral, region,
                              vk::Filter::eNearest);
+            DebugViewUi(cmdbuf, ow, oh);
             barrier(vk::Image(ui_image), vk::ImageAspectFlagBits::eColor,
                     vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eBlit,
                     vk::AccessFlagBits2::eTransferWrite, vk::ImageLayout::eGeneral,
@@ -1741,6 +1808,7 @@ void TemporalUpscaler::RunScaled() {
         reset = false;
         dispatched_last_frame = true;
         ExtraSharpen(cmdbuf, vk::Image(ui_image), true, ow, oh);
+        DebugViewUi(cmdbuf, ow, oh);
     }
     barrier(vk::Image(ui_image), vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral, all,
             rw, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eColorAttachmentOutput,
