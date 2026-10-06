@@ -238,13 +238,20 @@ again to change the settings; Save settings writes them without building. It nee
 Windows: `setup.bat` compiles `tools\setup\BbportSetup.cs` with the C# compiler of .NET Framework
 4 into `out\bbport-setup.exe`. The steps below do the same by hand.
 
-1. Install MSYS2 to `C:\msys64` (another folder: set `BB_MSYS2`) and, in an MSYS2 shell:
+1. Install MSYS2 to `C:\msys64` (another folder: set `BB_MSYS2`) and, in an MSYS2 shell, update it
+   (`pacman -Syu`, again until nothing is left to do) and install the packages:
 
    ```
    pacman -S --needed git mingw-w64-clang-x86_64-{clang,lld,libc++,cmake,ninja,pkgconf,python,sdl3,boost,fmt,glslang,spirv-cross,spirv-headers,vulkan-headers,vulkan-loader,vulkan-memory-allocator,xxhash,zydis,robin-map,ffmpeg}
    ```
 
-2. `git clone --recursive <this repository> bbport`, then from `cmd` or Explorer:
+   `vulkan-headers` must be 1.4.350 or newer: with an outdated package database `pacman -S` installs
+   an older one, and the GPU library fails with `no member named
+   'PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE'`.
+
+2. `git clone --recursive <this repository> bbport` (until the Windows port is merged upstream:
+   `git clone --recursive -b windows-port https://github.com/yumlevi/bloodborne_pc bbport`; the
+   upstream sources alone fail in CMake, e.g. on `magic_enum`), then from `cmd` or Explorer:
 
    ```
    run.bat --game-dir D:\Games\CUSA03173

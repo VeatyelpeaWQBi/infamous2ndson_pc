@@ -61,7 +61,11 @@ class Options {
 
 class SetupForm : Form {
     const string Title = "Bloodborne PC (bbport) setup";
-    const string DefaultRepo = "https://github.com/deadinside28/bloodborne_pc.git";
+    // Windows support is on this branch until deadinside28/bloodborne_pc#6 is merged (then:
+    // https://github.com/deadinside28/bloodborne_pc.git, master). Upstream master alone fails
+    // in CMake (it needs Linux packages such as magic_enum).
+    const string DefaultRepo = "https://github.com/yumlevi/bloodborne_pc.git";
+    const string DefaultBranch = "windows-port";
     // README "Windows"; brace expansion by bash.
     const string Packages = "git mingw-w64-clang-x86_64-{clang,lld,libc++,cmake,ninja,pkgconf,sdl3,boost,fmt,glslang,spirv-cross,spirv-headers,vulkan-headers,vulkan-loader,vulkan-memory-allocator,xxhash,zydis,robin-map,ffmpeg}";
     const string Msys2Installer = "https://repo.msys2.org/distrib/msys2-x86_64-latest.exe";
@@ -182,7 +186,7 @@ class SetupForm : Form {
         AddSpan(folders, rootStatus);
         if (!checkout) {
             repoBox = new TextBox { Dock = DockStyle.Fill, Text = DefaultRepo };
-            branchBox = new TextBox { Dock = DockStyle.Fill, Text = "master" };
+            branchBox = new TextBox { Dock = DockStyle.Fill, Text = DefaultBranch };
             AddRow(folders, "Repository", repoBox, null);
             AddRow(folders, "Branch", branchBox, null);
         }
@@ -634,7 +638,12 @@ class SetupForm : Form {
             int step = 0, steps = 6;
             Step(++step, steps, "MSYS2");
             EnsureMsys2(o);
-            Step(++step, steps, "MSYS2 packages (clang, cmake, SDL3, FFmpeg, Vulkan, ...)");
+            Step(++step, steps, "MSYS2 update and packages (clang, cmake, SDL3, FFmpeg, Vulkan, ...)");
+            // A stale package database installs too old packages (vulkan-headers before
+            // 1.4.350 does not compile): update MSYS2 first, as its documentation does. The
+            // second run finishes an update of MSYS2's own core.
+            Must(Bash(o, "pacman -Syu --noconfirm"), "updating MSYS2");
+            Must(Bash(o, "pacman -Syu --noconfirm"), "updating MSYS2");
             Must(Bash(o, "pacman -S --needed --noconfirm " + Packages), "installing the MSYS2 packages");
             Step(++step, steps, "Sources");
             EnsureSources(o);
@@ -705,9 +714,23 @@ class SetupForm : Form {
         }
         Must(status, "installing MSYS2");
         if (!File.Exists(bash)) throw new Exception("MSYS2 did not install to " + o.Msys);
-        // First start: keyring and core update (the second run finishes a core update).
-        Must(Bash(o, "pacman -Syu --noconfirm"), "updating MSYS2");
-        Must(Bash(o, "pacman -Syu --noconfirm"), "updating MSYS2");
+        // Its first start initializes the keyring; the package step then updates it.
+    }
+
+    /// The sources have the Windows port (run.bat, its launcher, the GPU library's Windows
+    /// branch); without it the build fails later in CMake with a less helpful message.
+    static void CheckWindowsSources(string root) {
+        string cmake = Path.Combine(root, @"gpu\CMakeLists.txt");
+        if (!File.Exists(Path.Combine(root, "run.bat")) ||
+            !File.Exists(Path.Combine(root, @"scripts\run_windows.py")) || !File.Exists(cmake) ||
+            !File.ReadAllText(cmake).Contains("if (WIN32)"))
+            throw new Exception("these bbport sources have no Windows support. Until it is merged upstream it is " +
+                                "on the " + DefaultBranch + " branch of " + DefaultRepo +
+                                " (git clone --recursive -b " + DefaultBranch + " " + DefaultRepo + ")");
+        if (!Directory.Exists(Path.Combine(root, @"third_party\LibAtrac9\C\src")) ||
+            !Directory.Exists(Path.Combine(root, @"gpu\third_party\fsr-vulkan\src")))
+            throw new Exception("the git submodules are missing (a ZIP download from GitHub lacks them): " +
+                                "clone with git --recursive, or let setup clone into an empty folder");
     }
 
     void EnsureSources(Options o) {
@@ -717,16 +740,16 @@ class SetupForm : Form {
                 Must(Bash(o, "git -c safe.directory='*' submodule update --init --recursive"), "fetching the submodules");
             else
                 Log("Not a git checkout: the submodules must already be present (a GitHub ZIP lacks them).");
+            CheckWindowsSources(o.Root);
             return;
         }
         if (Directory.Exists(o.Root) && Directory.GetFileSystemEntries(o.Root).Length > 0)
             throw new Exception(o.Root + " is not empty and has no bbport sources; choose an empty or new folder");
         Directory.CreateDirectory(o.Root);
         string url = string.IsNullOrEmpty(o.RepoUrl) ? DefaultRepo : o.RepoUrl;
-        string branch = string.IsNullOrEmpty(o.Branch) ? "master" : o.Branch;
+        string branch = string.IsNullOrEmpty(o.Branch) ? DefaultBranch : o.Branch;
         Must(Bash(o, "git clone --recursive -b '" + branch + "' '" + url + "' ."), "cloning " + url);
-        if (!File.Exists(Path.Combine(o.Root, "run.bat")))
-            throw new Exception("this branch has no Windows support (run.bat); choose the branch that has it");
+        CheckWindowsSources(o.Root);
     }
 
     int Bash(Options o, string command) {

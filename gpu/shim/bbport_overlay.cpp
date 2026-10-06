@@ -292,6 +292,7 @@ void Menu() {
     if (ImGui::Checkbox("Show mask (debug)", &show_mask)) {
         s.debug_view = show_mask ? BbSettings::DebugReactive : BbSettings::DebugNone;
     }
+    Hint("Shown with 1920 x 1080 output only (the mask view is part of that path).");
     ImGui::EndDisabled();
     ImGui::EndDisabled();
     Checkbox("Character motion vectors", s.object_motion);

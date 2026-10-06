@@ -173,6 +173,11 @@ private:
     /// of its own): one more RCAS pass over the target (output_image, or the 8-bit UI image with
     /// ldr) in General layout after the upscaler.
     void ExtraSharpen(vk::CommandBuffer cmdbuf, vk::Image target, bool ldr, u32 w, u32 h);
+    /// The 8-bit UI image as a storage image (its own format may be sRGB).
+    vk::ImageView UiStorageView(vk::Image target);
+    /// The menu's motion vector view over the UI image (General), for outputs other than
+    /// 1080p: the upscaler writes it directly there, without the merge pass's debug modes.
+    void DebugViewUi(vk::CommandBuffer cmdbuf, u32 w, u32 h);
 
     const Instance& instance;
     Scheduler& scheduler;
@@ -261,6 +266,9 @@ private:
     vk::UniqueDescriptorSetLayout merge_desc_layout;
     vk::UniquePipelineLayout merge_pipeline_layout;
     vk::UniquePipeline merge_pipeline;
+    vk::UniqueDescriptorSetLayout debug_desc_layout;
+    vk::UniquePipelineLayout debug_pipeline_layout;
+    vk::UniquePipeline debug_pipeline;
     std::array<VideoCore::UniqueImage, 2> taa_history;
     std::array<vk::UniqueImageView, 2> taa_history_views;
     u32 taa_next = 0;

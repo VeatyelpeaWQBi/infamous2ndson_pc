@@ -89,6 +89,32 @@ extern "C" void bbgpu_dump_guest_writes(void* ucontext) {
     if (Mode() == 0) {
         return;
     }
+    const char* sources[] = {"backing",      "WriteData",           "fence",
+                             "EOP (decoded)", "WriteData (decoded)", "EOS (decoded)"};
+    const std::uint64_t now = __rdtsc();
+    const auto print = [&](const Entry& e, const char* what) {
+        std::fprintf(stderr,
+                     "Write log: %s %s %#llx +%llu first %#llx tid %u, %.3f s before the fault\n",
+                     what, e.source < 6 ? sources[e.source] : "?", (unsigned long long)e.address,
+                     (unsigned long long)e.size, (unsigned long long)e.first, e.tid,
+                     double(now - e.tsc) / 3.0e9);
+    };
+    if (!ucontext) {
+        // A GPU library assertion (common/assert.cpp), e.g. a corrupted command stream: no
+        // guest fault, so no registers or block; the pattern hits and the latest writes.
+        std::fputs("Write log: dumped at a GPU assertion (no fault context)\n", stderr);
+        const std::uint64_t nh = hits_head.load();
+        for (std::uint64_t i = nh > hits.size() ? nh - hits.size() : 0; i < nh; ++i) {
+            print(hits[i % hits.size()], "pattern");
+        }
+        const std::uint64_t n = head.load();
+        int shown = 0;
+        for (std::uint64_t i = n; i-- > (n > Size ? n - Size : 0) && shown < 64; ++shown) {
+            print(ring[i % Size], "recent");
+        }
+        std::fprintf(stderr, "Write log: %llu writes logged\n", (unsigned long long)n);
+        return;
+    }
 #ifdef _WIN32
     const CONTEXT* c = static_cast<const EXCEPTION_POINTERS*>(ucontext)->ContextRecord;
     const std::uint64_t regs[] = {c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->R14, c->R15};
@@ -104,16 +130,6 @@ extern "C" void bbgpu_dump_guest_writes(void* ucontext) {
     for (int i = 0; i < 8; ++i) {
         std::fprintf(stderr, "Write log: %s=%#llx\n", names[i], (unsigned long long)regs[i]);
     }
-    const char* sources[] = {"backing",      "WriteData",           "fence",
-                             "EOP (decoded)", "WriteData (decoded)", "EOS (decoded)"};
-    const std::uint64_t now = __rdtsc();
-    const auto print = [&](const Entry& e, const char* what) {
-        std::fprintf(stderr,
-                     "Write log: %s %s %#llx +%llu first %#llx tid %u, %.3f s before the fault\n",
-                     what, e.source < 6 ? sources[e.source] : "?", (unsigned long long)e.address,
-                     (unsigned long long)e.size, (unsigned long long)e.first, e.tid,
-                     double(now - e.tsc) / 3.0e9);
-    };
     const std::uint64_t nh = hits_head.load();
     for (std::uint64_t i = nh > hits.size() ? nh - hits.size() : 0; i < nh; ++i) {
         print(hits[i % hits.size()], "pattern");

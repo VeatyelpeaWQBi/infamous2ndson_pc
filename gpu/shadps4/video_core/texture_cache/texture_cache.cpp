@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
+#include <set>
+#include <utility>
 #include <xxhash.h>
 
 #include "bbport_toggles.h"
@@ -712,9 +715,17 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
                 return image_ids[i];
             }
         }
-        LOG_WARNING(Render_Vulkan,
-                    "Failed to find exact image match for copy addr={:#x}, size={:#x}", address,
-                    size);
+        // bbport: callers fall back to the buffer path. The same aliasing repeats every frame
+        // (42,000 times in one session): each address and size is reported once.
+        static std::mutex warned_mutex;
+        static std::set<std::pair<VAddr, size_t>> warned;
+        std::scoped_lock lock{warned_mutex};
+        if (warned.size() < 256 && warned.emplace(address, size).second) {
+            LOG_WARNING(Render_Vulkan,
+                        "Failed to find exact image match for copy addr={:#x}, size={:#x} "
+                        "(reported once; the copy uses the buffer path)",
+                        address, size);
+        }
     }
     return {};
 }
