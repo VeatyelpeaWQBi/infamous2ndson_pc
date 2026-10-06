@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import run_windows
+from test_game_profiles import sfo_fixture
 
 
 class RestartResolutionTests(unittest.TestCase):
@@ -23,6 +24,8 @@ class RestartResolutionTests(unittest.TestCase):
             struct.pack_into('<IIQQQQQQ', elf, 64, 1, 0, 0, 0, 0, 0, 0x6000000, 0)
             (out / 'eboot.elf').write_bytes(elf)
             (data / 'eboot.bin').touch()
+            (data / 'sce_sys').mkdir()
+            (data / 'sce_sys/param.sfo').write_bytes(sfo_fixture('CUSA03173'))
             config = data / 'bbport.ini'
             config.write_text('upscaler=fsr3\npreset=1\noutput_res=1280x720\n' + ini_extra)
             environments = []
@@ -61,6 +64,7 @@ class RestartResolutionTests(unittest.TestCase):
                 env['PATH'] = str(Path(os.environ['WINDIR']) / 'System32')
             with patch.dict(os.environ, env, clear=True), patch.object(sys, 'argv', ['run_windows.py']), \
                     patch.object(run_windows, 'run', side_effect=run), \
+                    patch.object(run_windows, 'select_profile', return_value=dict(id='bloodborne', title_id='CUSA03173', address_patches=True)), \
                     patch.object(run_windows.subprocess, 'call', side_effect=launch):
                 for _ in range(3):
                     self.assertEqual(run_windows.main(), 0)

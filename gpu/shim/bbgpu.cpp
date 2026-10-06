@@ -48,12 +48,15 @@ Frontend::WindowSDL* g_window = nullptr;
 
 namespace Libraries::GnmDriver { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
 namespace Libraries::AvPlayer { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
+namespace Libraries::Videodec { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
 namespace Libraries::VideoOut { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
 namespace Libraries::Kernel { void RegisterEventQueue(Core::Loader::SymbolsResolver* sym); }
 
 namespace {
 struct Symbol {
     std::string nid, library, module;
+    unsigned version;
+    Core::Loader::SymbolType type;
     u64 address;
 };
 std::vector<Symbol> g_symbols;
@@ -61,9 +64,9 @@ u32 g_sdk_version;
 } // namespace
 
 namespace Core::Loader {
-void SymbolsResolver::AddSymbol(const char* nid, const char* library, const char* module, SymbolType,
+void SymbolsResolver::AddSymbol(const char* nid, const char* library, unsigned version, const char* module, SymbolType type,
                                 u64 address) {
-    g_symbols.push_back({nid, library, module, address});
+    g_symbols.push_back({nid, library, module, version, type, address});
 }
 } // namespace Core::Loader
 
@@ -205,6 +208,11 @@ static void StartProfileWriter() {
 #endif
 
 extern "C" int bbgpu_init(const BbGpuConfig* config) {
+    if (config->serial && std::strcmp(config->serial, "CUSA00309") == 0) {
+        _putenv_s("BB_GAME_PROFILE", "infamous");
+        _putenv_s("BB_UPSCALER", "none");
+        _putenv_s("BB_DEBUG_MOTION", "0");
+    }
     BbSettings::Load();
 #ifdef BB_PGO_GENERATE
     StartProfileWriter();
@@ -252,6 +260,7 @@ extern "C" void bbgpu_register_kernel(void) {
     Core::Loader::SymbolsResolver resolver;
     Libraries::Kernel::RegisterEventQueue(&resolver);
     Libraries::AvPlayer::RegisterLib(&resolver);
+    Libraries::Videodec::RegisterLib(&resolver);
 }
 
 extern "C" uintptr_t bbgpu_resolve(const char* scoped_nid) {
@@ -261,6 +270,19 @@ extern "C" uintptr_t bbgpu_resolve(const char* scoped_nid) {
         if (symbol.nid.size() == length && !std::memcmp(symbol.nid.data(), scoped_nid, length)) {
             return uintptr_t(symbol.address);
         }
+    }
+    return 0;
+}
+
+extern "C" uintptr_t bbgpu_resolve_identity(const char* nid, const char* library, uint16_t version,
+                                           const char* module, uint16_t module_version, int is_data) {
+    // Library registrations do not contain a module version: accept only the audited SDK ABI.
+    const uint16_t expected = std::strcmp(module, "libSceVideoOut") == 0 ? 0 : 257;
+    if (module_version != expected) return 0;
+    for (const auto& symbol : g_symbols) {
+        if (symbol.nid == nid && symbol.library == library && symbol.module == module &&
+            symbol.version == version && (symbol.type == Core::Loader::SymbolType::Object) == bool(is_data))
+            return uintptr_t(symbol.address);
     }
     return 0;
 }

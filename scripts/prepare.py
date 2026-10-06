@@ -223,12 +223,14 @@ def prepare(game, out):
     (out / 'entry.bin').write_bytes(image[:1024])
     resources = collections.Counter()
     total_bytes = 0
-    for path in (game / 'dvdroot_ps4').rglob('*'):
+    metadata = sfo((game / 'sce_sys/param.sfo').read_bytes())
+    resource_root = 'art' if metadata.get('TITLE_ID') == 'CUSA00309' else 'dvdroot_ps4'
+    for path in (game / resource_root).rglob('*'):
         if path.is_file():
-            resources[path.relative_to(game / 'dvdroot_ps4').parts[0]] += 1
+            resources[path.relative_to(game / resource_root).parts[0]] += 1
             total_bytes += path.stat().st_size
     report = dict(source_sha256=hashlib.sha256(source).hexdigest(), source_bytes=len(source),
-                  sfo=sfo((game / 'sce_sys/param.sfo').read_bytes()), entry=hex(header[4]),
+                  sfo=metadata, resource_root=resource_root, entry=hex(header[4]),
                   image_bytes=size, program_headers=ph, self_segments=segments,
                   unavailable_metadata_headers=missing, needed=[string(v) for t, v in dyn if t == 1],
                   relocation_counts=dict(counts), import_count=len(names), imports=names,

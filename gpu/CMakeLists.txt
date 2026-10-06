@@ -275,16 +275,23 @@ add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_sup
     shim/bbport_settings.cpp)
 target_include_directories(upscaler-support-test PRIVATE shim)
 target_compile_options(upscaler-support-test PRIVATE -UNDEBUG)
+add_executable(videodec-test EXCLUDE_FROM_ALL ../tests/test_videodec.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(videodec-test PRIVATE shim shadps4 third_party/gcn/include)
+target_link_libraries(videodec-test PRIVATE bbgpu)
+add_executable(image-compat-test EXCLUDE_FROM_ALL ../tests/test_image_compat.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(image-compat-test PRIVATE shim shadps4 third_party/gcn/include)
+target_compile_options(image-compat-test PRIVATE -fvisibility=hidden -fvisibility-inlines-hidden)
+target_link_libraries(image-compat-test PRIVATE bbgpu)
 
 # RelWithDebInfo normally defines NDEBUG. Assertions must stay active in every test.
 foreach(test_target IN ITEMS motion-history-test motion-shader-test ui-composition-test
-        scene-resolution-test taa-shader-test camera-motion-test upscaler-support-test)
+        scene-resolution-test taa-shader-test camera-motion-test upscaler-support-test videodec-test image-compat-test)
     target_compile_options(${test_target} PRIVATE -UNDEBUG)
     target_compile_definitions(${test_target} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
 endforeach()
 if (BB_BUILD_TESTS)
     enable_testing()
-    foreach(test_target IN ITEMS motion-history-test ui-composition-test upscaler-support-test)
+    foreach(test_target IN ITEMS motion-history-test ui-composition-test upscaler-support-test videodec-test)
         add_test(NAME ${test_target} COMMAND $<TARGET_FILE:${test_target}>)
         set_tests_properties(${test_target} PROPERTIES LABELS "unit" TIMEOUT 30)
     endforeach()
@@ -292,8 +299,16 @@ if (BB_BUILD_TESTS)
         "${CMAKE_CURRENT_BINARY_DIR}/test-shaders")
     set_tests_properties(motion-shader-test PROPERTIES LABELS "unit" TIMEOUT 30
         FIXTURES_SETUP motion_spirv)
+    add_test(NAME image-compat-shaders COMMAND $<TARGET_FILE:image-compat-test>
+        --shaders "${CMAKE_CURRENT_BINARY_DIR}/test-image-shaders")
+    set_tests_properties(image-compat-shaders PROPERTIES LABELS "unit" TIMEOUT 30 FIXTURES_SETUP image_spirv)
     find_program(SPIRV_VALIDATOR NAMES spirv-val)
     if (SPIRV_VALIDATOR)
+        foreach(image IN ITEMS 0 1 2)
+            add_test(NAME validate-image-${image} COMMAND ${SPIRV_VALIDATOR} --target-env vulkan1.3
+                "${CMAKE_CURRENT_BINARY_DIR}/test-image-shaders/image-${image}.spv")
+            set_tests_properties(validate-image-${image} PROPERTIES LABELS "unit" TIMEOUT 30 FIXTURES_REQUIRED image_spirv)
+        endforeach()
         foreach(shader IN ITEMS vertex-motion vertex-plain fragment-motion fragment-plain)
             add_test(NAME validate-${shader} COMMAND ${SPIRV_VALIDATOR} --target-env vulkan1.3
                 "${CMAKE_CURRENT_BINARY_DIR}/test-shaders/${shader}.spv")
@@ -307,6 +322,8 @@ if (BB_BUILD_TESTS)
         add_test(NAME ${test_target} COMMAND $<TARGET_FILE:${test_target}>)
         set_tests_properties(${test_target} PROPERTIES LABELS "gpu" TIMEOUT 120)
     endforeach()
+    add_test(NAME image-compat-textures COMMAND $<TARGET_FILE:image-compat-test>)
+    set_tests_properties(image-compat-textures PROPERTIES LABELS "gpu" TIMEOUT 120)
 endif()
 
 add_executable(fsr4-bench EXCLUDE_FROM_ALL tools/fsr4_bench.cpp

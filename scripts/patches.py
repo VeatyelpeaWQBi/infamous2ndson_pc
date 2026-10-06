@@ -267,6 +267,10 @@ def main():
         size=render_size(settings)
         if size: print(f'{size[0]}x{size[1]}')
         return
+    from game_profiles import select_profile
+    profile = select_profile(a.game_dir)
+    if not profile['address_patches']:
+        raise ValueError('Bloodborne address patches are disabled for Second Son. Use the native profile.')
     names=FPS_PRESETS[a.fps]+[n.strip() for n in a.extra.split(';') if n.strip()]
     names+=[n for n in effect_patches(read_settings(a.settings)) if n not in names]
     validate_patch_requirements(names,a.game_dir)

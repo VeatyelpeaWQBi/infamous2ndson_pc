@@ -6,13 +6,13 @@
 
 ## 当前阶段与边界
 
-本阶段已完成 Windows 构建、启动及测试基础设施验证。主程序及测试程序构建成功；80 项 Python/原生用例、2 个独立原生测试、8 项 CTest 单元检查和 3 项 Vulkan 集成测试全部通过。Second Son 游戏兼容性尚未实现或验证。详见 `WINDOWS_TEST_REPORT.2026-10-06.zh-CN.md`。
+Windows 基础设施已完成验证，并加入首轮 Second Son 适配。最新检查为 92 项 Python/原生用例、2 个独立原生测试、13 项 CTest 单元检查和 4 项 Vulkan 集成测试全部通过。实际游戏尚未启动验证。原基础设施报告保持历史记录；本轮结果与边界见 `INFAMOUS_ADAPTATION.2026-10-06.zh-CN.md`。
 
-当前启动器和图形逻辑仍有血源专用假设，不能把 `run.bat --game-dir CUSA00309` 当作本阶段的游戏验收。下一阶段先实现标题/程序指纹识别、补丁隔离、资源目录适配，再验证 Second Son。
+Second Son 启动器会识别标题与程序指纹、隔离血源补丁和 MOD、使用 art 资源布局及项目内独立缓存/存档。通过 `run-infamous.bat` 进行首次实际测试，日志为 `out/CUSA00309/game-test.log`。单元测试通过不等于实际游戏可玩。
 
 ## 1. 复用已有环境
 
-- Python：64 位 Windows Python 3.12 或更新版本。优先使用 `BB_PYTHON` 指定的现有程序，再使用 PATH 中的 `py -3` / `python`，最后才回退到已有的 MSYS2 Python。安装器不再默认安装第二套 Python。
+- Python：64 位 Windows Python 3.12 或更新版本。优先使用 `BB_PYTHON` 指定的现有程序、PATH 中的 python，再定位已有的默认 Windows Python 3.12 安装目录，之后才使用 py 启动器。专用沙箱账户可能看不到 USER 的 py 安装登记。
 - 编译器：已有的 MSYS2 CLANG64，配套 Clang、libc++、LLD、CMake、Ninja 和开发库。
 - MSYS2 定位：优先 `BB_MSYS2`，否则从 PATH 中的 CLANG64 编译器定位，再尝试 `C:\msys64`。
 - 运行时：保留 CLANG64 的 SDL3、FFmpeg、libc++ 等 DLL。启动器仅在当前子进程环境中加入其路径，不修改全局 PATH。

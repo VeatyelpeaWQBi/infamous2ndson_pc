@@ -4,20 +4,25 @@ This fork targets **Windows 10/11 x86-64 only**, using an existing MSYS2 CLANG64
 and Windows Python 3.12+. Linux, Unix, NixOS, Steam Deck, AppImage and WSL compatibility
 are outside its development and verification scope.
 
-**Current stage: Windows build/test infrastructure verified.** Windows executables build
-successfully. All 80 Python/native cases, two standalone native tests, eight CTest unit checks,
-and three Vulkan integration tests pass on this machine. Second Son (CUSA00309)
-game compatibility is not implemented or verified; the launcher still contains Bloodborne
-defaults and game-specific patches.
+**Current stage: first Second Son adaptation and test baseline.** Windows executables build
+successfully. All 92 Python/native cases, two standalone native tests, 13 CTest unit checks,
+and four Vulkan integration tests pass on this machine. CUSA00309 now has a fingerprint-gated
+native-render profile, scoped import resolution, PlayGo/event flags, direct Videodec and
+1D/array texture compatibility changes. Real gameplay has not been tested; unresolved system
+interfaces and actual game/resource behavior still need validation.
 
 - [Windows development and verification guide / Windows 开发与验证](docs/WINDOWS_DEVELOPMENT.zh-CN.md)
 - [Windows build and test report / 构建与测试报告](docs/WINDOWS_TEST_REPORT.2026-10-06.zh-CN.md)
 - [Windows dependency installation guide / Windows 依赖安装](docs/WINDOWS_INSTALL.zh-CN.md)
+- [Second Son feasibility and adaptation plan / 可行性评估与适配方案](docs/INFAMOUS_FEASIBILITY.zh-CN.md)
+- [Second Son adaptation and first game test / 首轮适配与游戏测试](docs/INFAMOUS_ADAPTATION.2026-10-06.zh-CN.md)
 - [Development rules](AGENTS.md) / [agent.md](agent.md)
 
 Entry points: `build.bat --check`, `build.bat --build-tests`, `test.bat`, and `test.bat --gpu`.
 `test.bat --python-only` runs the Python subset without compiling the runtime.
 Ordinary builds do not download missing dependencies; `--allow-downloads` is an explicit opt-in.
+After building and testing, `run-infamous.bat` starts the local `patches/CUSA00309` dump
+and writes its diagnostics to `out/CUSA00309/game-test.log`.
 
 ## Upstream reference: Bloodborne / Linux
 

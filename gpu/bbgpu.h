@@ -20,6 +20,8 @@ void bbgpu_register_kernel(void);
 int bbgpu_init(const BbGpuConfig *config);
 /* Function for an imported NID ("NID#lib#mod"), or 0 when the GPU library does not provide it. */
 uintptr_t bbgpu_resolve(const char *scoped_nid);
+uintptr_t bbgpu_resolve_identity(const char *nid, const char *library, uint16_t library_version,
+                                const char *module, uint16_t module_version, int is_data);
 /* Called first by the loader's SIGSEGV handler: 1 when a GPU page-tracking fault was handled.
  * The context is the handler's ucontext_t (Linux) or the vectored exception handler's
  * EXCEPTION_POINTERS (Windows). */

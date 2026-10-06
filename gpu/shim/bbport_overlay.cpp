@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 
 #include <SDL3/SDL.h>
@@ -156,6 +157,16 @@ void Hint(const char* text) {
 
 void Menu() {
     auto& s = BbSettings::Get();
+    if (const char* profile=std::getenv("BB_GAME_PROFILE"); profile && std::strcmp(profile,"infamous")==0) {
+        bool keep_open=true;
+        if (ImGui::Begin("inFAMOUS Second Son - diagnostics (Insert / L3+R3)", &keep_open)) {
+            ImGui::Text("%.0f FPS (%.1f ms)",frame_ms_avg>0.0f ? 1000.0f/frame_ms_avg : 0.0f,frame_ms_avg);
+            ImGui::TextUnformatted("Native render baseline. Game-specific upscaler settings are not enabled.");
+        }
+        ImGui::End();
+        if (!keep_open) menu_open=false;
+        return;
+    }
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + 40.0f * base_scale,
                                    viewport->WorkPos.y + 40.0f * base_scale),

@@ -88,7 +88,7 @@ static auto UserPaths = [] {
     // bbport: the port keeps GPU caches where BB_GPU_USER_DIR points.
     const char* port_dir = std::getenv("BB_GPU_USER_DIR");
     auto user_dir = port_dir ? std::filesystem::path(port_dir) : std::filesystem::current_path() / PORTABLE_DIR;
-    if (!std::filesystem::exists(user_dir)) {
+    if (!port_dir && !std::filesystem::exists(user_dir)) {
         // If it doesn't exist, use the standard path for the platform instead.
         // NOTE: On Windows we currently just create the portable directory instead.
 #ifdef __APPLE__
@@ -115,7 +115,10 @@ static auto UserPaths = [] {
         paths.insert_or_assign(shad_path, new_path);
     };
 
-    create_path(PathType::UserDir, user_dir);
+    // An explicit project cache must never silently fall back to a global user
+    // directory, including during initialization before main().
+    std::filesystem::create_directories(user_dir);
+    paths.insert_or_assign(PathType::UserDir, user_dir);
     create_path(PathType::LogDir, user_dir / LOG_DIR);
     create_path(PathType::ScreenshotsDir, user_dir / SCREENSHOTS_DIR);
     create_path(PathType::ShaderDir, user_dir / SHADER_DIR);

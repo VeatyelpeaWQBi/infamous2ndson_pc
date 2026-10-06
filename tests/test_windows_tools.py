@@ -34,12 +34,12 @@ class WindowsEntryTests(unittest.TestCase):
                 self.assertEqual(windows_tools.build(build_tests=True), 23)
                 args, kwargs = execute.call_args
                 self.assertEqual(args[0][0], str(bash))
-                self.assertIn('--build-tests', args[0][2])
+                self.assertIn('--build-tests', args[0][-1])
                 self.assertEqual(kwargs['env']['BB_ALLOW_DOWNLOADS'], '0')
                 self.assertEqual(kwargs['env']['MSYSTEM'], 'CLANG64')
                 self.assertEqual(kwargs['env']['MSYS2_PATH_TYPE'], 'inherit')
                 self.assertEqual(kwargs['env']['BB_PROJECT_ROOT'], str(ROOT))
-                self.assertIn('cygpath', args[0][2])
+                self.assertIn('cygpath', args[0][-1])
 
     def test_missing_existing_bash_fails_without_starting_a_process(self):
         with tempfile.TemporaryDirectory() as temporary, \

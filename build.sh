@@ -103,7 +103,7 @@ if [[ $build_tests == 1 ]]; then
     # All runtime tests use the same Win32 source set and flags as the executable.
     "$CC" "${cflags[@]}" "${includes[@]}" -I. -Isrc tests/test_pad.c src/runtime_host.c \
         "${libraries[@]}" -o out/pad-test.exe
-    for name in runtime sema; do
+    for name in runtime sema infamous; do
         "$CC" "${cflags[@]}" "${includes[@]}" -I. -Isrc "tests/test_$name.c" "${runtime[@]}" \
             out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" "${link[@]}" -o "out/$name-test.exe"
     done
@@ -111,7 +111,7 @@ if [[ $build_tests == 1 ]]; then
         -lws2_32 -o out/file-mods-test.exe
     "$CC" "${cflags[@]}" -I. -Isrc tests/test_content.c src/runtime_content.c -o out/content-test.exe
     cmake --build out/gpu --target motion-history-test ui-composition-test upscaler-support-test \
-        motion-shader-test scene-resolution-test taa-shader-test camera-motion-test
+        motion-shader-test scene-resolution-test taa-shader-test camera-motion-test videodec-test image-compat-test
 fi
 if [[ $run_tests == 1 ]]; then
     for name in pad runtime file-mods sema content; do "out/$name-test.exe"; done

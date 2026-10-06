@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import run_windows
+from test_game_profiles import sfo_fixture
 
 spec = importlib.util.spec_from_file_location('bbmods', ROOT / 'scripts/mods.py')
 mods = importlib.util.module_from_spec(spec)
@@ -24,6 +25,8 @@ class ModTests(unittest.TestCase):
         self.assets = self.game / 'dvdroot_ps4' / 'chr'
         self.assets.mkdir(parents=True)
         (self.game / 'eboot.bin').write_bytes(b'original executable')
+        (self.game / 'sce_sys').mkdir()
+        (self.game / 'sce_sys/param.sfo').write_bytes(sfo_fixture('CUSA03173'))
         (self.assets / 'a.dcx').write_bytes(b'original')
         (self.assets / 'b.dcx').write_bytes(b'untouched')
         self.moddir = self.root / 'mods'
@@ -114,7 +117,7 @@ class ModTests(unittest.TestCase):
         folder = result / 'dvdroot_ps4/chr'
         self.assertEqual((folder / 'a.dcx').read_bytes(), b'upper')
         self.assertEqual({p.name for p in folder.iterdir()}, {'a.dcx', 'b.dcx'})
-        self.assertEqual({p.name for p in result.iterdir()}, {'dvdroot_ps4', 'eboot.bin'})
+        self.assertEqual({p.name for p in result.iterdir()}, {'dvdroot_ps4', 'eboot.bin', 'sce_sys'})
 
     def test_wrapped_and_bare_layouts(self):
         layouts = {'Title': 'CUSA03173/dvdroot_ps4/chr', 'Archive': 'Archive v1.2/dvdroot_ps4/chr',

@@ -89,7 +89,18 @@ def patch_fs_loads(image, ph, base):
     return patched
 
 
-def link(game, out, module_names=DEFAULT_MODULES):
+def scoped_name(identity, symbol_type):
+    """Stable SDK identity; local IDs from different SELF files are unrelated."""
+    if not identity or symbol_type not in (1, 2):
+        raise ValueError('unsupported import identity/type')
+    value, library, owner = identity
+    name = f'{value}#{library[0]}:{library[1]}#{owner[0]}:{owner[1]}#{"D" if symbol_type == 1 else "F"}'
+    if len(name.encode('ascii')) >= 128:
+        raise ValueError('scoped import identity is too long')
+    return name
+
+
+def link(game, out, module_names=DEFAULT_MODULES, scoped_imports=False):
     main = module(game / 'eboot.bin')
     raw = (out / 'boot.bin').read_bytes()
     magic, size, entry, ns, nr, ni, flags = unpack('<8s6Q', raw, 0)
@@ -106,17 +117,28 @@ def link(game, out, module_names=DEFAULT_MODULES):
     if pos + size != len(raw):
         raise ValueError('unexpected boot trailer')
 
-    identities = {main['identity'](name): i for i, name in enumerate(names)}
+    original_names = list(names)
+    types = {}
+    for target, kind, index, addend in relocs:
+        if kind in (1, 2):
+            symbol_type = 1 if kind == 2 else 2
+            if index in types and types[index] != symbol_type:
+                raise ValueError('conflicting import symbol types')
+            types[index] = symbol_type
+    identities = {(main['identity'](name), types[i]): i for i, name in enumerate(names)}
+    if scoped_imports:
+        names = [scoped_name(main['identity'](name), types[i]) for i, name in enumerate(names)]
     main_libraries = {identity: key for key, identity in main['libraries'].items()}
     main_modules = {identity: key for key, identity in main['modules'].items()}
 
     def imported(symbol):
-        key = symbol['identity']
+        identity = symbol['identity']
+        key = (identity, symbol['type'])
         if key not in identities:
-            n, lib, mod = key
+            n, lib, mod = identity
             # Main-program spelling when the identity matches (existing host
             # tables use it); otherwise NID#library for new libraries.
-            name = (f'{n}#{main_libraries[lib]}#{main_modules[mod]}'
+            name = scoped_name(identity, symbol['type']) if scoped_imports else (f'{n}#{main_libraries[lib]}#{main_modules[mod]}'
                     if lib in main_libraries and mod in main_modules else f'{n}#{lib[0]}')
             identities[key] = len(names)
             names.append(name)
@@ -183,11 +205,12 @@ def link(game, out, module_names=DEFAULT_MODULES):
             if s['section'] and s['binding'] in (1, 2) and s['identity'] and s['type'] in (1, 2):
                 if not mapped(s['value'], max(1, s['size'])):
                     raise ValueError(f'{filename}: export outside load segments')
-                if s['identity'] in exports:
+                export_key = (s['identity'], s['type'])
+                if export_key in exports:
                     raise ValueError(f'{filename}: ambiguous export')
                 entry_value = (base + s['value'], 2 if s['type'] == 1 else 1, filename)
-                exports[s['identity']] = entry_value
-                by_nid[(s['identity'][0], s['identity'][1][0])].append(entry_value)
+                exports[export_key] = entry_value
+                by_nid[(s['identity'][0], s['identity'][1][0], s['identity'][1][1], s['identity'][2][1], s['type'])].append(entry_value)
                 count += 1
         fs_patched += patch_fs_loads(image, m['ph'], base)
         table.append(dict(file=filename, base=base, size=modsize, init=base + m['tags'].get(12, 0),
@@ -197,10 +220,11 @@ def link(game, out, module_names=DEFAULT_MODULES):
         base = (base + modsize + 65535) & ~65535
 
     bindings, unresolved = [], []
-    for identity, index in identities.items():
-        found = exports.get(identity)
+    for key, index in identities.items():
+        identity, symbol_type = key
+        found = exports.get(key)
         if not found and identity and identity[1][0] == 'libSceLibcInternal':
-            candidates = by_nid.get((identity[0], 'libc'), [])
+            candidates = by_nid.get((identity[0], 'libc', identity[1][1], identity[2][1], symbol_type), [])
             found = candidates[0] if len(candidates) == 1 else None
         if found:
             bindings.append((index, found[0], found[1]))
@@ -236,7 +260,12 @@ def link(game, out, module_names=DEFAULT_MODULES):
     report = dict(modules=[{k: (hex(v) if k in ('base', 'init', 'tls_address') else v) for k, v in t.items()} for t in table],
                   bindings=len(bindings), imports=len(names), fs_loads_patched=fs_patched,
                   main_tls=dict(zip(('vaddr', 'filesz', 'memsz', 'align'), main_tls_values)),
-                  unresolved_imports=unresolved)
+                  unresolved_imports=unresolved, scoped_imports=scoped_imports,
+                  main_original_imports=original_names,
+                  import_identities=[dict(index=index, name=names[index], nid=key[0][0],
+                     library=key[0][1], module=key[0][2], symbol_type=key[1],
+                     native_binding=next((hex(b[1]) for b in bindings if b[0]==index), None))
+                     for key,index in identities.items()])
     (out / 'link.json').write_text(json.dumps(report, indent=2) + '\n')
     summary = ', '.join(f"{t['file']}@{t['base']:#x}" for t in table)
     print(f'Linked modules: {summary}; {len(bindings)} native bindings, {len(unresolved)} imports left to the host runtime, '
@@ -249,5 +278,6 @@ if __name__ == '__main__':
     p.add_argument('game', type=Path)
     p.add_argument('--out', type=Path, default=Path(__file__).resolve().parent.parent / 'out')
     p.add_argument('--modules', nargs='*', default=list(DEFAULT_MODULES))
+    p.add_argument('--scoped-imports', action='store_true', help='retain library/module versions and symbol type')
     a = p.parse_args()
-    link(a.game, a.out, a.modules)
+    link(a.game, a.out, a.modules, a.scoped_imports)

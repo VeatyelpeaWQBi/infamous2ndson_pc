@@ -27,6 +27,9 @@ int main(void) {
     SDL_SetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT,"0x1d50/0x6189");
     assert(SDL_Init(SDL_INIT_VIDEO|SDL_INIT_GAMEPAD));
     assert(pad_init()==0 && pad_open(1,0,0,NULL)==1);
+    uint8_t colour[4]={20,70,130,0};
+    assert(pad_lightbar(1,colour)==0 && memcmp(lightbar,colour,3)==0);
+    assert(pad_lightbar(1,NULL)==ERR_INVALID_ARG && pad_lightbar(2,colour)==ERR_INVALID_HANDLE);
     PadData data;
     inject(path,"cross l3 touchpad_left");
     assert(pad_read_state(1,&data)==0);

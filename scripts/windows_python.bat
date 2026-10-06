@@ -2,10 +2,16 @@
 rem Reuse Windows Python first; MSYS2 Python is only a fallback.
 setlocal
 if defined BB_PYTHON goto configured
-where py >nul 2>nul
-if not errorlevel 1 goto launcher
 where python >nul 2>nul
 if not errorlevel 1 goto path_python
+rem A dedicated sandbox user cannot see USER's Python launcher registry.
+rem Reuse the existing Windows installation if command discovery misses it.
+if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" (
+    set "BB_PYTHON=%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
+    goto configured
+)
+where py >nul 2>nul
+if not errorlevel 1 goto launcher
 if not defined BB_MSYS2 set "BB_MSYS2=C:\msys64"
 if exist "%BB_MSYS2%\clang64\bin\python.exe" goto msys_python
 echo No existing Python found. Configure BB_PYTHON or install Python after approval.

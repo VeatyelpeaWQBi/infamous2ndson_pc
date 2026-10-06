@@ -308,46 +308,6 @@ static ABI int32_t trophy_info(int32_t ctx,int32_t handle,int32_t id,void *detai
     (void)id; return trophy_game_info(ctx,handle,details,data);
 }
 
-/* ---- PlayGo: fully installed package ---- */
-static int playgo_handle, playgo_chunks=-1;
-static ABI int32_t playgo_init(const void *params) {
-    (void)params;
-    int fd=(int)runtime_file_open("/app0/sce_sys/playgo-chunk.dat",0,0);
-    unsigned char header[12];
-    playgo_chunks=1;
-    if (fd>=0) {
-        if (runtime_file_read(fd,header,sizeof(header))==sizeof(header)) playgo_chunks=header[10]|header[11]<<8;
-        runtime_file_close(fd);
-    }
-    printf("Runtime: PlayGo initialized; %d chunks, all installed locally\n",playgo_chunks);
-    return 0;
-}
-static ABI int32_t playgo_open(int32_t *handle,const void *param) {
-    (void)param;
-    if (!handle) return PLAYGO_BAD_POINTER;
-    playgo_handle=1; *handle=1; return 0;
-}
-static ABI int32_t playgo_chunk_ids(int32_t handle,uint16_t *ids,uint32_t count,uint32_t *out) {
-    if (handle!=playgo_handle || !handle) return PLAYGO_BAD_HANDLE;
-    if (!out) return PLAYGO_BAD_POINTER;
-    if (ids && !count) return PLAYGO_BAD_SIZE;
-    if (!ids) { *out=(uint32_t)playgo_chunks; return 0; }
-    uint32_t n=count<(uint32_t)playgo_chunks ? count : (uint32_t)playgo_chunks;
-    for (uint32_t i=0;i<n;++i) ids[i]=(uint16_t)i;
-    *out=n; return 0;
-}
-static ABI int32_t playgo_locus(int32_t handle,const uint16_t *ids,uint32_t count,int8_t *loci) {
-    if (handle!=playgo_handle || !handle) return PLAYGO_BAD_HANDLE;
-    if (!ids || !loci) return PLAYGO_BAD_POINTER;
-    if (!count) return PLAYGO_BAD_SIZE;
-    for (uint32_t i=0;i<count;++i) {
-        if (ids[i]>=playgo_chunks) return PLAYGO_BAD_CHUNK;
-        loci[i]=3; /* LocalFast */
-    }
-    return 0;
-}
-static ABI int32_t playgo_speed(int32_t handle,int32_t speed) { (void)speed; return handle==playgo_handle && handle ? 0 : PLAYGO_BAD_HANDLE; }
-
 /* ---- DiscMap: the game is fully installed, no disc bitmap exists ---- */
 #define DISC_MAP_NO_BITMAP ((int32_t)0x81100004)
 static ABI int32_t discmap_on_hdd(const char *path,int64_t offset,int64_t size,int32_t *result) {
@@ -477,8 +437,6 @@ static const RuntimeExport exports[]={
     {"sceNpTrophyCreateContext",trophy_context}, {"sceNpTrophyCreateHandle",trophy_handle},
     {"sceNpTrophyRegisterContext",trophy_register}, {"sceNpTrophyUnlockTrophy",trophy_unlock},
     {"sceNpTrophyGetGameInfo",trophy_game_info}, {"sceNpTrophyGetTrophyInfo",trophy_info},
-    {"scePlayGoInitialize",playgo_init}, {"scePlayGoOpen",playgo_open}, {"scePlayGoGetChunkId",playgo_chunk_ids},
-    {"scePlayGoGetLocus",playgo_locus}, {"scePlayGoSetInstallSpeed",playgo_speed},
     {"sceMouseInit",ok_void}, {"sceMouseOpen",mouse_open}, {"sceMouseRead",mouse_read}, {"sceMouseClose",mouse_close},
     {"sceAudioInOpen",audio_in_open},
     {"sceDiscMapIsRequestOnHDD",discmap_on_hdd}, {"sceDiscMap_8A828CAEE7EDD5E9",discmap_8a82},

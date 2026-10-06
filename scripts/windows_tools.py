@@ -8,8 +8,8 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parent.parent
-NATIVE_TESTS = ('bb-probe', 'pad-test', 'runtime-test', 'file-mods-test', 'sema-test', 'content-test')
-UNIT_TESTS = ('motion-history-test', 'ui-composition-test', 'upscaler-support-test', 'motion-shader-test')
+NATIVE_TESTS = ('bb-probe', 'pad-test', 'runtime-test', 'file-mods-test', 'sema-test', 'content-test', 'infamous-test')
+UNIT_TESTS = ('motion-history-test', 'ui-composition-test', 'upscaler-support-test', 'motion-shader-test', 'videodec-test', 'image-compat-test')
 GPU_TESTS = ('scene-resolution-test', 'taa-shader-test', 'camera-motion-test')
 
 
@@ -68,10 +68,10 @@ def build(build_tests=False, allow_downloads=False):
                BB_ALLOW_DOWNLOADS='1' if allow_downloads else '0')
     if allow_downloads:
         print('Downloads enabled: missing submodules and CMake sources may be fetched into this checkout.', flush=True)
-    command = 'cd -- "$(cygpath -u "$BB_PROJECT_ROOT")" && bash build.sh'
+    command = 'export PATH="/clang64/bin:/usr/bin:$PATH"; cd -- "$(cygpath -u "$BB_PROJECT_ROOT")" && bash build.sh'
     if build_tests:
         command += ' --build-tests'
-    return subprocess.call([str(bash), '-lc', command], cwd=ROOT, env=env)
+    return subprocess.call([str(bash), '--noprofile', '--norc', '-c', command], cwd=ROOT, env=env)
 
 
 def test(python_only=False, gpu=False):
@@ -85,6 +85,11 @@ def test(python_only=False, gpu=False):
         if missing:
             raise RuntimeError('Missing test artifacts; run build.bat --build-tests first:\n' + '\n'.join(missing))
     env = tool_environment()
+    # The vendored path initializer runs before main(), so this directory must
+    # exist before launching tests. Never fall back to the user's shadPS4 data.
+    gpu_state = ROOT / 'out/windows-test-user/gpu'
+    gpu_state.mkdir(parents=True, exist_ok=True)
+    env['BB_GPU_USER_DIR'] = str(gpu_state)
     command = [sys.executable, str(ROOT / 'scripts/windows_tests.py')]
     if python_only:
         command.append('--python-only')

@@ -1,6 +1,7 @@
 /* Narrow, explicit PS4 libc contracts. No automatic success stubs. */
 #define _CRT_RAND_S
 #include "runtime.h"
+#include "runtime_identity.h"
 #include "gpu/bbgpu.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -179,8 +180,18 @@ static ABI __attribute__((noreturn)) void guest_libc_exit(int status) {
 }
 uintptr_t runtime_resolve(const char *name, int is_data) {
     if (!(capabilities & 1)) return 0;
+    if (strchr(name, ':')) {
+        RuntimeImportIdentity identity;
+        if (!runtime_identity_parse(name,&identity) || identity.is_data!=is_data) return 0;
+        const char *alias=runtime_identity_alias(name,is_data);
+        if (alias) name=alias;
+        else return bbgpu_resolve_identity(identity.nid,identity.library,identity.library_version,
+                                           identity.module,identity.module_version,is_data);
+    }
     if (is_data) {
         static int32_t need_libc_internal = 1; /* SDK marker variable referenced by Fios2 */
+        static const char *program_name="eboot.bin";
+        if (!strcmp(name, "djxxOmW6-aw#libkernel") || !strcmp(name,"djxxOmW6-aw#p#J")) return (uintptr_t)&program_name;
         if (!strcmp(name, "f7uOxY9mM1U#p#J")) return (uintptr_t)&stack_canary;
         if (!strcmp(name, "ZT4ODD2Ts9o#libSceLibcInternal")) return (uintptr_t)&need_libc_internal;
         return 0;
@@ -214,6 +225,8 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     if (timer) return timer;
     uintptr_t sema = runtime_sema_resolve(name);
     if (sema) return sema;
+    uintptr_t eventflag = runtime_eventflag_resolve(name);
+    if (eventflag) return eventflag;
     uintptr_t rwlock = runtime_rwlock_resolve(name);
     if (rwlock) return rwlock;
     uintptr_t memory = runtime_memory_resolve(name);
@@ -222,6 +235,8 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     if (kernel) return kernel;
     uintptr_t services = runtime_services_resolve(name);
     if (services) return services;
+    uintptr_t playgo = runtime_playgo_resolve(name);
+    if (playgo) return playgo;
     uintptr_t ajm = runtime_ajm_resolve(name);
     if (ajm) return ajm;
     uintptr_t audio = runtime_audio_resolve(name);
@@ -241,9 +256,15 @@ static const struct { const char *nid, *symbol; } import_names[]={
 };
 /* Symbol name for a scoped NID, or NULL when this eboot/libc never imports it. */
 const char *runtime_symbol(const char *nid) {
+    if (strchr(nid, ':')) {
+        RuntimeImportIdentity identity;
+        if (!runtime_identity_parse(nid,&identity)) return NULL;
+        nid=runtime_identity_alias(nid,identity.is_data);
+        if (!nid) return NULL;
+    }
     for (size_t i=0;i<sizeof(import_names)/sizeof(*import_names);++i)
         if (!strcmp(nid,import_names[i].nid)) return import_names[i].symbol;
-    return NULL;
+    return runtime_extra_symbol(nid);
 }
 /* Same symbol name means same contract whether imported from libkernel or
  * libScePosix, so newer modules resolve by name through runtime_symbol. */
