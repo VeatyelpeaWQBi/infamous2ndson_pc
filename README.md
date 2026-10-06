@@ -1,4 +1,28 @@
-# bbport — a native Linux port of Bloodborne
+# inFAMOUS Second Son — Windows adaptation fork
+
+This fork targets **Windows 10/11 x86-64 only**, using an existing MSYS2 CLANG64 toolchain
+and Windows Python 3.12+. Linux, Unix, NixOS, Steam Deck, AppImage and WSL compatibility
+are outside its development and verification scope.
+
+**Current stage: Windows build/test infrastructure verified.** Windows executables build
+successfully. All 80 Python/native cases, two standalone native tests, eight CTest unit checks,
+and three Vulkan integration tests pass on this machine. Second Son (CUSA00309)
+game compatibility is not implemented or verified; the launcher still contains Bloodborne
+defaults and game-specific patches.
+
+- [Windows development and verification guide / Windows 开发与验证](docs/WINDOWS_DEVELOPMENT.zh-CN.md)
+- [Windows build and test report / 构建与测试报告](docs/WINDOWS_TEST_REPORT.2026-10-06.zh-CN.md)
+- [Windows dependency installation guide / Windows 依赖安装](docs/WINDOWS_INSTALL.zh-CN.md)
+- [Development rules](AGENTS.md) / [agent.md](agent.md)
+
+Entry points: `build.bat --check`, `build.bat --build-tests`, `test.bat`, and `test.bat --gpu`.
+`test.bat --python-only` runs the Python subset without compiling the runtime.
+Ordinary builds do not download missing dependencies; `--allow-downloads` is an explicit opt-in.
+
+## Upstream reference: Bloodborne / Linux
+
+The material below describes the upstream project. Its game support, platforms and performance
+claims are reference material, not verified capabilities of this Windows / Second Son fork.
 
 **English** · [Русский](README.ru.md)
 

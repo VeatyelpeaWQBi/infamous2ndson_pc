@@ -11,6 +11,7 @@ vulkan = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(vulkan)
 
 
+@unittest.skip('Legacy Linux/AppImage packaging is outside this Windows fork.')
 class PackagedVulkanTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

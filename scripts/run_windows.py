@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Windows counterpart of run.sh: prepare the game image, compile the patches and start
-out/bb-probe.exe. Same environment variables and bbport.ini settings as run.sh.
+"""Windows launcher: prepare the game image, compile the patches and start
+out/bb-probe.exe. Uses existing Windows Python and the MSYS2 CLANG64 toolchain.
 
     run.bat [--game-dir DIR] [bb-probe options...]
 
 The game folder: --game-dir, else BB_GAME_DIR, else the last one used (out/game_dir.txt), else
-../CUSA03173 (as run.sh). Unless BB_PREBUILT=1
+../CUSA03173 (legacy Bloodborne default; Second Son profiles are not implemented yet).
+Unless BB_PREBUILT=1
 the port is (re)built first through MSYS2 (build.sh in the CLANG64 environment)."""
 import os
 from pathlib import Path
@@ -14,14 +15,11 @@ import shlex
 import subprocess
 import sys
 from mods import remove_overlay
+from windows_tools import build as windows_build, msys_root, require_windows
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / 'scripts'
 PYTHON = sys.executable
-
-
-def msys_root():
-    return Path(os.environ.get('BB_MSYS2', r'C:\msys64'))
 
 
 def run(arguments, capture=False, check=True, env=None):
@@ -34,11 +32,9 @@ def run(arguments, capture=False, check=True, env=None):
 
 def build():
     """build.sh in a CLANG64 login shell (its clang, cmake, ninja and pkg-config)."""
-    bash = msys_root() / 'usr/bin/bash.exe'
-    if not bash.is_file():
-        sys.exit(f'MSYS2 not found at {msys_root()} (set BB_MSYS2, or BB_PREBUILT=1 with a built out/)')
-    env = dict(os.environ, MSYSTEM='CLANG64', CHERE_INVOKING='1')
-    run([bash, '-lc', 'bash build.sh'], env=env)
+    status = windows_build()
+    if status:
+        sys.exit(status)
 
 
 def settings_value(config, key):
@@ -52,6 +48,7 @@ def settings_value(config, key):
 
 
 def main():
+    require_windows()
     arguments = sys.argv[1:]
     game = os.environ.get('BB_GAME_DIR')
     if arguments[:1] == ['--game-dir'] and len(arguments) > 1:

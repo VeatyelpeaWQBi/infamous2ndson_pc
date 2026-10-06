@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #include <assert.h>
-#include <unistd.h>
+#include "windows_test.h"
 #include "../src/runtime_pad.c"
 
 static int capture;
@@ -15,16 +15,14 @@ static void inject(const char *path, const char *tokens) {
     assert(f);
     fputs(tokens,f);
     fclose(f);
-    usleep(25000);
+    SDL_Delay(25);
 }
 
 int main(void) {
-    char path[]="/tmp/bbport-pad-test-XXXXXX";
-    int fd=mkstemp(path);
-    assert(fd>=0);
-    close(fd);
-    setenv("BB_PAD_FILE",path,1);
-    setenv("SDL_VIDEODRIVER","dummy",1);
+    char path[MAX_PATH];
+    test_temp_file(path,sizeof(path));
+    test_setenv("BB_PAD_FILE",path);
+    test_setenv("SDL_VIDEODRIVER","dummy");
     /* Only the virtual test controller is a gamepad, whatever is plugged in. */
     SDL_SetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT,"0x1d50/0x6189");
     assert(SDL_Init(SDL_INIT_VIDEO|SDL_INIT_GAMEPAD));

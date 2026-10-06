@@ -4,7 +4,6 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <setjmp.h>
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/ir/ir_emitter.h"
 

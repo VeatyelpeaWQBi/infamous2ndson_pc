@@ -8,7 +8,7 @@ void runtime_restart(void) { abort(); }
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <pthread.h>
+#include "windows_test.h"
 #include <stdatomic.h>
 #include <time.h>
 
@@ -49,9 +49,9 @@ static void libc_support(void) {
     assert(tls(last)==p+31 && tls(index)==p);
     p[0]=23;
     main_identity=GET(ThreadSelf,"aI+OeCz8xrQ#p#J")();
-    pthread_t worker;
-    assert(pthread_create(&worker,NULL,tls_worker,NULL)==0);
-    assert(pthread_join(worker,NULL)==0);
+    HostThread worker;
+    assert(host_thread_start(&worker,0,tls_worker,NULL)==0);
+    assert(host_thread_join(worker)==0);
     assert(p[0]==23 && initial[0]==42);
     void *attr=NULL;
     AttrInit init=GET(AttrInit,"nsYoNRywwNg#p#J");
@@ -254,12 +254,10 @@ static void rw_lifecycle(void) {
 }
 typedef struct {
     void *lock;
-    pthread_barrier_t ready, release, writer_ready;
+    TestBarrier ready, release, writer_ready;
     _Atomic int value;
 } RwFixture;
-static void barrier(pthread_barrier_t *b) {
-    int e=pthread_barrier_wait(b); assert(e==0 || e==PTHREAD_BARRIER_SERIAL_THREAD);
-}
+static void barrier(TestBarrier *b) { test_barrier_wait(b); }
 static void *reader_worker(void *context) {
     RwFixture *f=context;
     assert(rw_read(&f->lock)==0);
@@ -282,30 +280,30 @@ static void *holding_writer(void *context) {
     assert(rw_unlock(&f->lock)==0); return NULL;
 }
 static void fixture_init(RwFixture *f) {
-    assert(pthread_barrier_init(&f->ready,NULL,2)==0);
-    assert(pthread_barrier_init(&f->release,NULL,2)==0);
-    assert(pthread_barrier_init(&f->writer_ready,NULL,2)==0);
+    test_barrier_init(&f->ready);
+    test_barrier_init(&f->release);
+    test_barrier_init(&f->writer_ready);
 }
 static void fixture_destroy(RwFixture *f) {
     assert(rw_destroy(&f->lock)==0);
-    assert(pthread_barrier_destroy(&f->ready)==0);
-    assert(pthread_barrier_destroy(&f->release)==0);
-    assert(pthread_barrier_destroy(&f->writer_ready)==0);
+    test_barrier_destroy(&f->ready);
+    test_barrier_destroy(&f->release);
+    test_barrier_destroy(&f->writer_ready);
 }
 static void rw_concurrency(void) {
     rw_setup();
     RwFixture f={0}; fixture_init(&f);
-    pthread_t reader,writer;
+    HostThread reader,writer;
     assert(rw_read(&f.lock)==0);
-    assert(pthread_create(&reader,NULL,reader_worker,&f)==0);
+    assert(host_thread_start(&reader,0,reader_worker,&f)==0);
     barrier(&f.ready); /* two threads now hold read locks at once */
     assert(rw_unlock(&f.lock)==0);
-    assert(pthread_create(&writer,NULL,writer_worker,&f)==0);
+    assert(host_thread_start(&writer,0,writer_worker,&f)==0);
     barrier(&f.writer_ready);
     assert((uint32_t)rw_destroy(&f.lock)==0x80020010);
     assert(atomic_load(&f.value)==0);
     barrier(&f.release);
-    assert(pthread_join(reader,NULL)==0 && pthread_join(writer,NULL)==0);
+    assert(host_thread_join(reader)==0 && host_thread_join(writer)==0);
     assert(atomic_load(&f.value)==1);
     fixture_destroy(&f);
 }
@@ -313,14 +311,14 @@ static void rw_timeouts(void) {
     rw_setup();
     TimedLock read_timed=GET(TimedLock,"iPtZRWICjrM#p#J"), write_timed=GET(TimedLock,"adh--6nIqTk#p#J");
     RwFixture f={0}; fixture_init(&f);
-    pthread_t writer; assert(pthread_create(&writer,NULL,holding_writer,&f)==0);
+    HostThread writer; assert(host_thread_start(&writer,0,holding_writer,&f)==0);
     barrier(&f.ready);
     TestTime expired={0,0},invalid={0,1000000000};
     assert((uint32_t)read_timed(&f.lock,&expired)==0x8002003c);
     assert((uint32_t)write_timed(&f.lock,&expired)==0x8002003c);
     assert((uint32_t)read_timed(&f.lock,&invalid)==0x80020016);
     assert((uint32_t)rw_unlock(&f.lock)==0x80020001);
-    barrier(&f.release); assert(pthread_join(writer,NULL)==0);
+    barrier(&f.release); assert(host_thread_join(writer)==0);
     assert(read_timed(&f.lock,&invalid)==0); /* available lock ignores deadline */
     assert(rw_unlock(&f.lock)==0);
     fixture_destroy(&f);

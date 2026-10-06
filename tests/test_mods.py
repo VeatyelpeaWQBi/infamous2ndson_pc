@@ -7,6 +7,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+import run_windows
 
 spec = importlib.util.spec_from_file_location('bbmods', ROOT / 'scripts/mods.py')
 mods = importlib.util.module_from_spec(spec)
@@ -76,7 +78,9 @@ class ModTests(unittest.TestCase):
 
     def test_mod_symlinks_rejected(self):
         a = self.mod('A')
-        (a / 'dvdroot_ps4/escape').symlink_to(self.assets, target_is_directory=True)
+        # Windows junctions are directory links without an administrator requirement.
+        import _winapi
+        _winapi.CreateJunction(str(self.assets), str(a / 'dvdroot_ps4/escape'))
         with self.assertRaises(ValueError):
             mods.build_overlay(self.game, self.root / 'out', [('A', a)])
 
@@ -137,24 +141,31 @@ class ModTests(unittest.TestCase):
 
     def test_run_uses_overlay_propagates_exit_and_cleans_view(self):
         self.mod('A')
-        python = self.root / 'python'
-        python.write_text(f'#!{sys.executable}\nimport subprocess,sys\n'
-            'if sys.argv[1] == "scripts/mods.py" or sys.argv[1] == "-c":\n'
-            '    sys.exit(subprocess.call([sys.executable,*sys.argv[1:]]))\n')
-        python.chmod(0o755)
-        probe = self.root / 'probe'
-        probe.write_text(f'#!{sys.executable}\nimport json,sys,os\nfrom pathlib import Path\n'
-            'game=Path(sys.argv[sys.argv.index("--app0")+1])\n'
-            'Path(os.environ["BB_DATA_DIR"],"mounted.json").write_text(json.dumps({\n'
-            '"path":str(game),"content":(game/"dvdroot_ps4/chr/a.dcx").read_text()}))\n'
-            'sys.exit(7)\n')
-        probe.chmod(0o755)
-        env = dict(os.environ, BB_PREBUILT='1', BB_PROBE=str(probe), PYTHON=str(python),
+        mounted = {}
+        original_run = run_windows.run
+
+        def run(arguments, capture=False, check=True, env=None):
+            # Exercise the real Windows overlay builder; preparation is unrelated here.
+            if Path(arguments[1]).name == 'mods.py':
+                return original_run(arguments, capture=capture, check=check, env=env)
+            return '' if capture else 0
+
+        def launch(command, cwd):
+            game = Path(command[command.index('--app0') + 1])
+            mounted.update(path=str(game), content=(game / 'dvdroot_ps4/chr/a.dcx').read_text())
+            self.assertIn('--user', command)
+            return 7
+
+        env = dict(os.environ, BB_PREBUILT='1',
             BB_DATA_DIR=str(self.root), BB_GAME_DIR=str(self.game),
-            BB_MODS_DIR=str(self.moddir), BB_MODS_ENABLED='1', BB_MODS_CONFIG=str(self.root/'mods.json'))
-        result = subprocess.run(['bash', 'run.sh'], cwd=ROOT, env=env, capture_output=True, timeout=30)
-        self.assertEqual(result.returncode, 7, result.stderr)
-        mounted = json.loads((self.root / 'mounted.json').read_text())
+            BB_CONFIG=str(self.root / 'bbport.ini'), BB_MODS_DIR=str(self.moddir),
+            BB_MODS_ENABLED='1', BB_MODS_CONFIG=str(self.root/'mods.json'))
+        for key in ('BB_PROBE', 'BB_RENDER_RES', 'BB_OUTPUT_RES', 'BB_AUTO_RENDER_RES', 'BB_LIVE_RES'):
+            env.pop(key, None)
+        with patch.dict(os.environ, env, clear=True), patch.object(sys, 'argv', ['run_windows.py']), \
+                patch.object(run_windows, 'run', side_effect=run), \
+                patch.object(run_windows.subprocess, 'call', side_effect=launch):
+            self.assertEqual(run_windows.main(), 7)
         self.assertEqual(mounted['content'], 'mod')
         self.assertFalse(Path(mounted['path']).exists())
         self.assertEqual((self.assets/'a.dcx').read_bytes(), b'original')

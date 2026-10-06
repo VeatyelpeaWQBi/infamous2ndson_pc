@@ -2,6 +2,40 @@
 # drivers, adapted to the native_probe runtime through shims in shim/.
 cmake_minimum_required(VERSION 3.24)
 project(bbgpu LANGUAGES C CXX)
+if (NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(FATAL_ERROR "This fork supports Windows x86-64 only; use build.bat with MSYS2 CLANG64.")
+endif()
+if (NOT MINGW OR NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "Use the existing MSYS2 CLANG64 Clang/libc++/LLD toolchain.")
+endif()
+option(BB_ALLOW_DOWNLOADS "Allow missing FetchContent source downloads (explicit opt-in)" OFF)
+option(BB_BUILD_TESTS "Register the Windows C++ test suite" OFF)
+include(FetchContent)
+set(FETCHCONTENT_UPDATES_DISCONNECTED ON)
+if (BB_ALLOW_DOWNLOADS)
+    set(FETCHCONTENT_FULLY_DISCONNECTED OFF CACHE BOOL "Offline source population" FORCE)
+else()
+    set(FETCHCONTENT_FULLY_DISCONNECTED ON CACHE BOOL "Offline source population" FORCE)
+endif()
+function(bb_require_local_source name)
+    string(TOUPPER "${name}" upper_name)
+    set(local_source "${FETCHCONTENT_SOURCE_DIR_${upper_name}}")
+    if (NOT local_source)
+        set(local_source "${FETCHCONTENT_BASE_DIR}/${name}-src")
+        if (NOT EXISTS "${local_source}/CMakeLists.txt" AND
+                EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../out/dependencies/${name}/CMakeLists.txt")
+            set(local_source "${CMAKE_CURRENT_SOURCE_DIR}/../out/dependencies/${name}")
+        endif()
+    endif()
+    if (NOT EXISTS "${local_source}/CMakeLists.txt")
+        if (BB_ALLOW_DOWNLOADS)
+            return()
+        endif()
+        message(FATAL_ERROR "Missing ${name} source. No downloads started. Approve downloads and use build.bat --allow-downloads, or supply FETCHCONTENT_SOURCE_DIR_${upper_name}.")
+    endif()
+    # A local override prevents even a partially populated cache from starting a download.
+    set(FETCHCONTENT_SOURCE_DIR_${upper_name} "${local_source}" CACHE PATH "Existing ${name} source" FORCE)
+endfunction()
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -14,10 +48,13 @@ add_compile_options(-fno-omit-frame-pointer)
 # bbport: link-time optimization (BB_LTO, default on) and profile-guided optimization
 # (BB_PGO: off, generate = instrumented build writing into BB_PGO_DIR, use = build with that
 # profile). Covers bbgpu and the static libraries linked into it. No -march: the same build
-# runs on the Steam Deck.
+# targets Windows x86-64 CPUs.
 option(BB_LTO "Link-time optimization of bbgpu" ON)
 set(BB_PGO "off" CACHE STRING "Profile-guided optimization: off, generate, use")
 set(BB_PGO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../pgo" CACHE PATH "Profile directory")
+if (NOT BB_PGO STREQUAL "off")
+    message(FATAL_ERROR "Windows PGO is not validated. Use BB_PGO=off; do not reuse GCC/Linux profiles.")
+endif()
 if (BB_LTO)
     include(CheckIPOSupported)
     check_ipo_supported(RESULT bb_ipo_ok OUTPUT bb_ipo_error)
@@ -49,7 +86,7 @@ pkg_check_modules(XXHASH REQUIRED IMPORTED_TARGET libxxhash)
 pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
 find_package(Zydis REQUIRED)
 if (WIN32)
-    # bbport: Windows (MSYS2 MINGW64). bbgpu is a static library linked into bb-probe.exe
+    # Windows (MSYS2 CLANG64). bbgpu is a static library linked into bb-probe.exe
     # (a DLL cannot leave the runtime_* symbols undefined). Packages MSYS2 does not ship
     # (magic_enum, miniz, xbyak) are fetched; VMA is header-only there.
     include(FetchContent)
@@ -57,6 +94,7 @@ if (WIN32)
     if (NOT TARGET magic_enum::magic_enum)
         FetchContent_Declare(magic_enum GIT_REPOSITORY https://github.com/Neargye/magic_enum.git
             GIT_TAG v0.9.7 GIT_SHALLOW TRUE)
+        bb_require_local_source(magic_enum)
         FetchContent_MakeAvailable(magic_enum)
     endif()
     find_package(miniz QUIET)
@@ -67,6 +105,7 @@ if (WIN32)
         set(BUILD_NO_STDIO OFF CACHE BOOL "" FORCE)
         FetchContent_Declare(miniz GIT_REPOSITORY https://github.com/richgel999/miniz.git
             GIT_TAG 3.1.0 GIT_SHALLOW TRUE)
+        bb_require_local_source(miniz)
         FetchContent_MakeAvailable(miniz)
         if (NOT TARGET miniz::miniz)
             add_library(miniz::miniz ALIAS miniz)
@@ -76,6 +115,7 @@ if (WIN32)
     if (NOT TARGET xbyak::xbyak)
         FetchContent_Declare(xbyak GIT_REPOSITORY https://github.com/herumi/xbyak.git
             GIT_TAG v7.24.2 GIT_SHALLOW TRUE)
+        bb_require_local_source(xbyak)
         FetchContent_MakeAvailable(xbyak)
     endif()
     find_package(VulkanMemoryAllocator CONFIG QUIET)
@@ -85,11 +125,6 @@ if (WIN32)
         set_target_properties(GPUOpen::VulkanMemoryAllocator PROPERTIES
             INTERFACE_INCLUDE_DIRECTORIES ${VMA_INCLUDE_DIR})
     endif()
-else()
-    find_package(magic_enum REQUIRED)
-    find_package(VulkanMemoryAllocator CONFIG REQUIRED)
-    pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
-    find_package(miniz REQUIRED)
 endif()
 find_program(GLSLANG_COMPILER NAMES glslang glslangValidator REQUIRED)
 
@@ -168,12 +203,7 @@ set(COMMON
 file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp)
-if (WIN32)
-    set(BBGPU_LIBRARY_TYPE STATIC)
-else()
-    set(BBGPU_LIBRARY_TYPE SHARED)
-endif()
-add_library(bbgpu ${BBGPU_LIBRARY_TYPE} ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES}
+add_library(bbgpu STATIC ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES}
     shadps4/core/libraries/gnmdriver/gnmdriver.cpp
     shadps4/core/libraries/videoout/driver.cpp shadps4/core/libraries/videoout/video_out.cpp
     shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER}
@@ -199,17 +229,14 @@ if (WIN32)
     # Windows headers: no min/max macros, no winsock 1 clash; Windows 10+ APIs (SetThreadDescription).
     target_compile_definitions(bbgpu PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
     target_link_libraries(bbgpu PUBLIC xbyak::xbyak)
+    target_link_libraries(bbgpu PUBLIC winmm ws2_32 bcrypt ole32 shell32 user32 psapi kernel32 onecore)
     # bb-probe.exe links libbbgpu.a with these (out/gpu/bbgpu_link.txt, one argument per line,
     # in link order): the static library's transitive dependencies.
     include(cmake/LinkClosure.cmake)
     bb_write_link_closure(bbgpu ${CMAKE_CURRENT_BINARY_DIR}/bbgpu_link.txt)
-else()
-    # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe.
-    target_link_options(bbgpu PRIVATE -Wl,--allow-shlib-undefined)
-    target_link_libraries(bbgpu PUBLIC PkgConfig::X11)
 endif()
 
-# Explicit test targets; neither launches the game nor needs a Vulkan device.
+# Explicit Windows tests: unit targets need no GPU; gpu targets need a Vulkan device.
 add_executable(motion-history-test EXCLUDE_FROM_ALL ../tests/test_motion_history.cpp)
 target_compile_options(motion-history-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(motion-history-test PRIVATE ..)
@@ -247,6 +274,39 @@ add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_sup
     shim/bbport_settings.cpp)
 target_include_directories(upscaler-support-test PRIVATE shim)
 target_compile_options(upscaler-support-test PRIVATE -UNDEBUG)
+
+# RelWithDebInfo normally defines NDEBUG. Assertions must stay active in every test.
+foreach(test_target IN ITEMS motion-history-test motion-shader-test ui-composition-test
+        scene-resolution-test taa-shader-test camera-motion-test upscaler-support-test)
+    target_compile_options(${test_target} PRIVATE -UNDEBUG)
+    target_compile_definitions(${test_target} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
+endforeach()
+if (BB_BUILD_TESTS)
+    enable_testing()
+    foreach(test_target IN ITEMS motion-history-test ui-composition-test upscaler-support-test)
+        add_test(NAME ${test_target} COMMAND $<TARGET_FILE:${test_target}>)
+        set_tests_properties(${test_target} PROPERTIES LABELS "unit" TIMEOUT 30)
+    endforeach()
+    add_test(NAME motion-shader-test COMMAND $<TARGET_FILE:motion-shader-test>
+        "${CMAKE_CURRENT_BINARY_DIR}/test-shaders")
+    set_tests_properties(motion-shader-test PROPERTIES LABELS "unit" TIMEOUT 30
+        FIXTURES_SETUP motion_spirv)
+    find_program(SPIRV_VALIDATOR NAMES spirv-val)
+    if (SPIRV_VALIDATOR)
+        foreach(shader IN ITEMS vertex-motion vertex-plain fragment-motion fragment-plain)
+            add_test(NAME validate-${shader} COMMAND ${SPIRV_VALIDATOR} --target-env vulkan1.3
+                "${CMAKE_CURRENT_BINARY_DIR}/test-shaders/${shader}.spv")
+            set_tests_properties(validate-${shader} PROPERTIES LABELS "unit" TIMEOUT 30
+                FIXTURES_REQUIRED motion_spirv)
+        endforeach()
+    else()
+        message(STATUS "spirv-val not installed: SPIR-V validation is unavailable; no tools installed.")
+    endif()
+    foreach(test_target IN ITEMS scene-resolution-test taa-shader-test camera-motion-test)
+        add_test(NAME ${test_target} COMMAND $<TARGET_FILE:${test_target}>)
+        set_tests_properties(${test_target} PROPERTIES LABELS "gpu" TIMEOUT 120)
+    endforeach()
+endif()
 
 add_executable(fsr4-bench EXCLUDE_FROM_ALL tools/fsr4_bench.cpp
     shadps4/video_core/renderer_vulkan/fsr411/fsr411.cpp)

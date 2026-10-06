@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Run the production TAA shader on synthetic inputs, including undefined/invalid history.
-#include <cassert>
+#include "vulkan_test.h"
 #include <algorithm>
 #include <array>
 #include <cmath>

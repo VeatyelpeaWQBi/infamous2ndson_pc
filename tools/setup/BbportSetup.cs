@@ -63,7 +63,7 @@ class SetupForm : Form {
     const string Title = "Bloodborne PC (bbport) setup";
     const string DefaultRepo = "https://github.com/deadinside28/bloodborne_pc.git";
     // README "Windows"; brace expansion by bash.
-    const string Packages = "git mingw-w64-clang-x86_64-{clang,lld,libc++,cmake,ninja,pkgconf,python,sdl3,boost,fmt,glslang,spirv-cross,spirv-headers,vulkan-headers,vulkan-loader,vulkan-memory-allocator,xxhash,zydis,robin-map,ffmpeg}";
+    const string Packages = "git mingw-w64-clang-x86_64-{clang,lld,libc++,cmake,ninja,pkgconf,sdl3,boost,fmt,glslang,spirv-cross,spirv-headers,vulkan-headers,vulkan-loader,vulkan-memory-allocator,xxhash,zydis,robin-map,ffmpeg}";
     const string Msys2Installer = "https://repo.msys2.org/distrib/msys2-x86_64-latest.exe";
 
     // The in-game menu's choices (gpu/shim/bbport_overlay.cpp, bbport_settings.h).
@@ -575,7 +575,23 @@ class SetupForm : Form {
 
     // ---- install -----------------------------------------------------------------------------
 
+    bool ExistingPython() {
+        string configured = Environment.GetEnvironmentVariable("BB_PYTHON");
+        if (!String.IsNullOrEmpty(configured)) return File.Exists(configured);
+        foreach (string entry in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(';')) {
+            string folder = entry.Trim().Trim('"');
+            if (folder.Length == 0) continue;
+            if (File.Exists(Path.Combine(folder, "py.exe")) || File.Exists(Path.Combine(folder, "python.exe"))) return true;
+        }
+        string msys = Environment.GetEnvironmentVariable("BB_MSYS2") ?? @"C:\msys64";
+        return File.Exists(Path.Combine(msys, @"clang64\bin\python.exe"));
+    }
+
     bool CheckInputs(bool forInstall) {
+        if (!ExistingPython()) {
+            Warn("An existing Windows Python 3.12+ is required. Configure BB_PYTHON or install Python separately after approval. Setup does not install a second Python runtime.");
+            return false;
+        }
         string rootPath = rootBox.Text.Trim().Trim('"');
         if (rootPath.Length == 0) { Warn("Choose the install folder."); return false; }
         if (!checkout && rootPath.Contains(" ") && MessageBox.Show(this, "The install folder contains spaces, which the build tools handle poorly. Continue anyway?",
@@ -627,7 +643,8 @@ class SetupForm : Form {
             if (o.Fsr4Models) Must(Bash(o, "bash tools/fetch_fsr4_assets.sh"), "downloading the FSR 4 models");
             if (!o.DlssModel && !o.Fsr4Models) Log("(none selected)");
             Step(++step, steps, "Building bbport (several minutes the first time)");
-            Must(Bash(o, "bash build.sh"), "building bbport (log above; out/gpu-build.log has the GPU library's)");
+            // Install / Update explicitly opts into package and source downloads.
+            Must(Bash(o, "BB_ALLOW_DOWNLOADS=1 bash build.sh"), "building bbport (log above; out/gpu-build.log has the GPU library's)");
             Step(++step, steps, "Settings and shortcuts");
             Configure(o);
         } catch (Exception e) {

@@ -1,0 +1,32 @@
+@echo off
+rem Reuse Windows Python first; MSYS2 Python is only a fallback.
+setlocal
+if defined BB_PYTHON goto configured
+where py >nul 2>nul
+if not errorlevel 1 goto launcher
+where python >nul 2>nul
+if not errorlevel 1 goto path_python
+if not defined BB_MSYS2 set "BB_MSYS2=C:\msys64"
+if exist "%BB_MSYS2%\clang64\bin\python.exe" goto msys_python
+echo No existing Python found. Configure BB_PYTHON or install Python after approval.
+exit /b 1
+
+:configured
+if not exist "%BB_PYTHON%" (
+    echo Configured BB_PYTHON does not exist: %BB_PYTHON%
+    exit /b 1
+)
+"%BB_PYTHON%" %*
+exit /b %ERRORLEVEL%
+
+:launcher
+py -3 %*
+exit /b %ERRORLEVEL%
+
+:path_python
+python %*
+exit /b %ERRORLEVEL%
+
+:msys_python
+"%BB_MSYS2%\clang64\bin\python.exe" %*
+exit /b %ERRORLEVEL%

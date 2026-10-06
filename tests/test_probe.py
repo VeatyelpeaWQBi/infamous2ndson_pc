@@ -1,12 +1,12 @@
 """Boundary tests for the native loader; uses tiny synthetic x86-64 images."""
-from paths import ROOT
+from paths import ROOT, native_executable
 from pathlib import Path
 import struct
 import subprocess
 import tempfile
 import unittest
 
-EXE = ROOT / 'out/bb-probe'
+EXE = native_executable('bb-probe')
 
 
 def package(code, relocs=(), names=(), capabilities=None):
@@ -33,7 +33,7 @@ def native_package(name='fixture-native', binding_address=4112, binding_kind=1,
             + struct.pack('<8Q',32,1,0,0,40,1,1,0) + image)
 
 
-@unittest.skipUnless(EXE.exists(), 'build native probe first')
+@unittest.skipUnless(EXE.exists(), 'run build.bat --build-tests first')
 class LoaderTests(unittest.TestCase):
     def test_invalid_content_profile_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -115,8 +115,10 @@ class LoaderTests(unittest.TestCase):
 
     def test_illegal_instruction_reports_guest_offset(self):
         r = self.run_image(package(b'\x0f\x0b'))
-        self.assertEqual(r.returncode, 132)
-        self.assertIn('at guest offset 0x0,', r.stderr)
+        # The Windows exception handler reports the native exception code and
+        # terminates fatal faults with 139 (the POSIX SIGILL status is not used).
+        self.assertEqual(r.returncode, 139, r.stderr)
+        self.assertIn('Guest fault 0xc000001d at guest+0x0', r.stderr)
 
     def test_runtime_returns_from_verified_init_env(self):
         # Align stack, call _init_env through +32, then tail-jump to unknown +40.

@@ -90,8 +90,8 @@ def mod_files(folder):
     for directory, folders, files in os.walk(root, followlinks=False):
         directory = Path(directory)
         for name in [*folders, *files]:
-            if (directory / name).is_symlink():
-                raise ValueError(f'Mod symlinks are unsupported: {directory / name}')
+            if is_link(directory / name):
+                raise ValueError(f'Mod links are unsupported: {directory / name}')
         for name in sorted(files):
             source = directory / name
             relative = Path(prefix) / source.relative_to(root) if prefix else source.relative_to(root)

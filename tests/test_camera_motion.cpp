@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Execute production camera motion SPIR-V: distant geometry, sky and stale object vectors.
 #include <array>
-#include <cassert>
+#include "vulkan_test.h"
 #include <cmath>
 #include <cstdio>
 #include "video_core/renderer_vulkan/vk_instance.h"

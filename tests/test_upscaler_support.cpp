@@ -4,19 +4,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
-#include <unistd.h>
+#include "windows_test.h"
 #include "bbport_settings.h"
 
 int main() {
     using namespace BbSettings;
-    char path[] = "/tmp/bbport-upscaler-test-XXXXXX";
-    const int fd = mkstemp(path);
-    assert(fd >= 0);
-    close(fd);
-    setenv("BB_CONFIG", path, 1);
-    unsetenv("BB_UPSCALER");
-    unsetenv("BB_UPSCALE_PRESET");
-    unsetenv("BB_RENDER_RES");
+    char path[MAX_PATH];
+    test_temp_file(path,sizeof(path));
+    test_setenv("BB_CONFIG", path);
+    test_unsetenv("BB_UPSCALER");
+    test_unsetenv("BB_UPSCALE_PRESET");
+    test_unsetenv("BB_RENDER_RES");
     auto& s = Get();
     s.upscaler = UpscalerTaa;
     s.preset = Performance;
@@ -30,27 +28,31 @@ int main() {
     assert(RenderPreset() == Performance);
     for (bool fsr4 : {false, true}) {
         for (bool fsr411 : {false, true}) {
-            for (int requested = 0; requested < UpscalerCount; ++requested) {
-                FILE* config = std::fopen(path, "w");
-                assert(config);
-                std::fprintf(config, "upscaler=%s\npreset=3\noutput_res=2560x1440\n",
-                             UpscalerName(requested));
-                std::fclose(config);
-                s.fsr4_problem = nullptr;
-                Load();
-                assert(s.upscaler == requested);
-                ConfigureUpscalerSupport(fsr4, fsr411);
-                const bool unsupported = (requested == UpscalerFsr4 && !fsr4) ||
-                    (requested == UpscalerFsr411 && !(fsr4 && fsr411));
-                assert(s.upscaler == (unsupported ? UpscalerFsr3 : requested));
-                assert(s.fsr4_supported == fsr4);
-                assert(s.fsr411_supported == (fsr4 && fsr411));
-                assert(bool(s.fsr4_problem.load()) == unsupported);
-                assert(s.preset == Performance && s.output_res == 2);
-                // Startup patch settings still describe the already applied guest patches.
-                assert(s.startup_upscaler == requested);
-                ConfigureUpscalerSupport(fsr4, fsr411);
-                assert(s.upscaler == (unsupported ? UpscalerFsr3 : requested));
+            for (bool dlss : {false, true}) {
+                for (int requested = 0; requested < UpscalerCount; ++requested) {
+                    FILE* config = std::fopen(path, "w");
+                    assert(config);
+                    std::fprintf(config, "upscaler=%s\npreset=3\noutput_res=2560x1440\n",
+                                 UpscalerName(requested));
+                    std::fclose(config);
+                    s.fsr4_problem = nullptr;
+                    Load();
+                    assert(s.upscaler == requested);
+                    ConfigureUpscalerSupport(fsr4, fsr411, dlss);
+                    const bool unsupported = (requested == UpscalerFsr4 && !fsr4) ||
+                        (requested == UpscalerFsr411 && !(fsr4 && fsr411)) ||
+                        (requested == UpscalerDlss && !dlss);
+                    assert(s.upscaler == (unsupported ? UpscalerFsr3 : requested));
+                    assert(s.fsr4_supported == fsr4);
+                    assert(s.fsr411_supported == (fsr4 && fsr411));
+                    assert(s.dlss_supported == dlss);
+                    assert(bool(s.fsr4_problem.load()) == unsupported);
+                    assert(s.preset == Performance && s.output_res == 2);
+                    // Startup patch settings still describe the already applied guest patches.
+                    assert(s.startup_upscaler == requested);
+                    ConfigureUpscalerSupport(fsr4, fsr411, dlss);
+                    assert(s.upscaler == (unsupported ? UpscalerFsr3 : requested));
+                }
             }
         }
     }
@@ -59,7 +61,7 @@ int main() {
     s.upscaler = UpscalerFsr3;
     s.preset = Performance;
     assert(RenderPreset() == Performance && !ResolutionNeedsRestart());
-    setenv("BB_RENDER_RES", "1706x960", 1);
+    test_setenv("BB_RENDER_RES", "1706x960");
     assert(RenderPreset() == Quality && ResolutionNeedsRestart());
     s.preset = Quality;
     assert(!ResolutionNeedsRestart());
@@ -74,9 +76,9 @@ int main() {
     s.output_res = (output + 1) % OutputCount;
     assert(ResolutionNeedsRestart());
     s.output_res = output;
-    setenv("BB_RENDER_RES", "", 1);
+    test_unsetenv("BB_RENDER_RES");
     assert(!FixedRenderSession() && !ResolutionNeedsRestart());
-    unsetenv("BB_RENDER_RES");
+    test_unsetenv("BB_RENDER_RES");
     std::remove(path);
     std::puts("Upscaler support: saved choices and FSR 3.1 fallback PASS");
 }

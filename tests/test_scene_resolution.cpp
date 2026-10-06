@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Exercises the production target/resolve path on Vulkan (Lavapipe works, no game/window).
-#include <cassert>
+#include "vulkan_test.h"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
