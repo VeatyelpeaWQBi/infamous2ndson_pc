@@ -57,6 +57,7 @@ def native_environment(profile, data, env):
                BB_TIMEZONE_MINUTES=str(locale['timezone_minutes']),
                BB_ENTER_BUTTON='0' if locale['confirm_button']=='circle' else '1',
                BB_DRAW_PIPE='0',
+               BB_PREP_PRIORITY='low',
                BB_LIVE_RES='0', BB_FPS='30', BB_VBLANK_HZ='60',
                BB_SHOW_FPS='1' if locale.get('show_fps',True) else '0',
                BB_USER_DIR=str(state / 'user'), BB_GPU_USER_DIR=str(state / 'gpu'),

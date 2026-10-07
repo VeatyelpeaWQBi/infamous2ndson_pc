@@ -93,6 +93,7 @@ class GameProfiles(unittest.TestCase):
                 self.assertEqual(os.environ['BB_UPSCALER'],'none')
                 self.assertEqual(os.environ['BB_GAME_PROFILE'],'infamous')
                 self.assertEqual(os.environ['BB_DRAW_PIPE'],'0')
+                self.assertEqual(os.environ['BB_PREP_PRIORITY'],'low')
                 self.assertEqual(os.environ['BB_LANGUAGE'],'10')
                 self.assertEqual(os.environ['BB_REGION'],'HK')
                 self.assertEqual(os.environ['BB_TIMEZONE_MINUTES'],'480')

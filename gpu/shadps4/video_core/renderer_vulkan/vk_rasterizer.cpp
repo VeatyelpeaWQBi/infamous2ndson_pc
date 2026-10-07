@@ -1611,6 +1611,26 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
     push_data = MakeUserData(Regs());
+    // Prepared resource arrays are immutable for the lifetime of the submission.  Touch the
+    // next stage's hot arrays before binding the current one so the worker's result is brought
+    // into the GPU thread's cache while buffer resolution is in progress.  This is a read-only
+    // hint and has no effect when preparation fell back to the regular path.
+    const auto prefetch_prepared = [](const Shader::Info* stage, const PreparedStage* prepared) {
+        if (!prepared) {
+            return;
+        }
+        __builtin_prefetch(stage, 0, 3);
+        if (prepared->num_images) {
+            __builtin_prefetch(prepared->image_sharps, 0, 3);
+            __builtin_prefetch(prepared->image_hashes, 0, 3);
+        }
+        if (prepared->num_samplers) {
+            __builtin_prefetch(prepared->sampler_sharps, 0, 3);
+        }
+        if (prepared->num_buffers) {
+            __builtin_prefetch(prepared->buffer_sharps, 0, 3);
+        }
+    };
     if (!HelperEligible(pipeline)) {
         ++helper_serial;
         for (const auto* stage : pipeline->GetStages()) {
@@ -1621,6 +1641,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
                               stage->samplers.size());
             stage->PushUd(binding, push_data);
             const PreparedStage* prepared = FindPreparedStage(*stage);
+            prefetch_prepared(stage, prepared);
             BindBuffers(*stage, prepared, binding, push_data, set_write_index);
             BindTextures(*stage, prepared, binding, set_write_index, needs_barrier);
             uses_dma |= stage->uses_dma;
@@ -1650,6 +1671,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             set_writes.resize(set_writes.size() + num_descriptors);
             stage->PushUd(binding, push_data);
             const PreparedStage* prepared = FindPreparedStage(*stage);
+            prefetch_prepared(stage, prepared);
             buffer_stages[task.count] = {stage, prepared, binding, set_write_index};
             auto texture_binding = binding;
             texture_binding.buffer += num_buffers;

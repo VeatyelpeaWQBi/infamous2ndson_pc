@@ -90,3 +90,19 @@ BB_FPS=30 不等于这里设了 30 FPS 呈现上限，不能把 20/30 FPS 的下
 本轮已实现轻量 F10、异步诊断写入和逐帧数值计时；已完成 Windows 构建及单元/Vulkan 集成测试。
 未重新启动真实游戏，因此尚未验证实际 FPS 收益。下一次用户按原路线测试后，应读取
 `frames.csv` 和 `performance-summary.json`，再决定是否修改绘制并行或资源绑定路径。
+
+## 本轮 Windows 多线程优化
+
+本轮已完成并通过 Windows 构建：
+
+- 保留 `DrawPreparation` 的异步扫描和资源读取，最多使用 8 个 worker；inFAMOUS 配置将其从
+  `THREAD_PRIORITY_IDLE` 提升为 `THREAD_PRIORITY_BELOW_NORMAL`（`BB_PREP_PRIORITY=low`），减少
+  准备队列落后导致的 GPU 线程串行回退。
+- 在资源绑定前预取准备线程生成的只读纹理、采样器和缓冲区描述，不改变资源状态或命令顺序。
+- 对连续图形绘制增加管线选择短路缓存；缓存命中前仍复核寄存器校验和、着色器二进制哈希和运动向量地址，
+  不跳过着色器变化检查。
+- 未启用 `BB_TEXTURE_HELPER`：已有 A/B 数据显示逐绘制 fork/join 在当前 CPU 上没有收益。
+- 未恢复 `DrawPipe`：inFAMOUS 的 Continue 路径仍存在共享 Scheduler 生产者竞态，强行开启会重新引入崩溃。
+
+本轮未重新启动真实游戏，因而尚未宣称实际 FPS 已提升。需要使用同一路线重新录制一次 F11 性能文件，比较
+`bind_ns`、`pipeline_select_ns` 和超过 33/50 ms 的帧数，才能确认本轮优化对实际场景的收益。

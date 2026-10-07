@@ -280,6 +280,16 @@ it changes image state (`Runtime::BeforeImageAccess` in `Transit`, `FlushBarrier
 68% of draws were bound in parallel, the image was unchanged — and the frame rate too:
 85.9 FPS with the helper vs 85.8 without (A/B, 6 × 16 s).
 
+### Draw preparation priority on Windows (inFAMOUS profile)
+
+The draw-preparation scanner and workers already read immutable register/resource snapshots ahead
+of the GPU thread.  The generic default keeps them at `THREAD_PRIORITY_IDLE`, which can leave the
+queue behind during a draw-heavy frame.  The inFAMOUS Windows profile now uses
+`BB_PREP_PRIORITY=low` (`THREAD_PRIORITY_BELOW_NORMAL`) so up to eight workers can consume spare
+hardware threads without competing at normal priority with the guest and command threads.
+`BB_PREP_PRIORITY=background` restores the old idle behaviour; `normal` is available for controlled
+A/B testing.  This does not alter Vulkan command ownership or resource visibility.
+
 Instrumented with `rdtsc`: the helper's task took ~6200 cycles per fork where the same work
 cost ~4600 on the GPU thread, and the GPU thread still waited ~2500 cycles per fork in the
 join. The descriptor infos, image states and binding flags the helper writes are read by the

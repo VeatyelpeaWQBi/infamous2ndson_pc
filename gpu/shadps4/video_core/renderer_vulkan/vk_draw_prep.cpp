@@ -51,9 +51,24 @@ u32 DefaultWorkerCount() {
     if (const char* env = std::getenv("BB_PREP_WORKERS")) {
         return static_cast<u32>(std::clamp(std::atoi(env), 0, 16));
     }
-    // Workers are SCHED_IDLE and claim whole buffers, so more of them only use more idle
-    // cores: half the hardware threads (Steam Deck 4, 16-thread desktop 8).
+    // Workers claim whole buffers, so half the hardware threads is enough to stay ahead without
+    // crowding the guest: Steam Deck 4, 16-thread desktop 8.  Priority is selected separately.
     return std::clamp<u32>(BbThreads::Available() / 2, 1, 8);
+}
+
+void SetPreparationPriority() {
+    // Windows' THREAD_PRIORITY_IDLE is safe for background work, but it can leave the
+    // preparation queue behind while the game is decoding a draw-heavy frame.  The profile may
+    // request a normal or below-normal priority; the old idle behaviour remains the default for
+    // every other title and for explicit `BB_PREP_PRIORITY=background`.
+    const char* value = std::getenv("BB_PREP_PRIORITY");
+    if (value && std::strcmp(value, "normal") == 0) {
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Normal);
+    } else if (value && std::strcmp(value, "low") == 0) {
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+    } else {
+        BbThreads::MakeBackground();
+    }
 }
 
 /// Flattened user data of one submission: chunks never move, so the GPU thread can read a
@@ -205,8 +220,9 @@ DrawPreparation::DrawPreparation(PipelineCache& pipeline_cache_)
     for (u32 i = 0; i < worker_count; ++i) {
         workers.emplace_back([this, i](std::stop_token stop) { WorkerLoop(stop, i); });
     }
-    std::printf("GPU: draw preparation workers: %u (+1 scanner, %u hardware threads)\n",
-                worker_count, BbThreads::Available());
+    const char* priority = std::getenv("BB_PREP_PRIORITY");
+    std::printf("GPU: draw preparation workers: %u (+1 scanner, %u hardware threads, priority=%s)\n",
+                worker_count, BbThreads::Available(), priority && priority[0] ? priority : "background");
 }
 
 DrawPreparation::~DrawPreparation() {
@@ -326,7 +342,7 @@ void DrawPreparation::Collect() {
 
 void DrawPreparation::ScannerLoop(std::stop_token stop) {
     Common::SetCurrentThreadName("bb:DrawScan");
-    BbThreads::MakeBackground();
+    SetPreparationPriority();
     std::unique_ptr<AmdGpu::Regs> regs;
     u64 checksum = 0;
     u64 next_seq = 0;
@@ -380,7 +396,7 @@ void DrawPreparation::ScannerLoop(std::stop_token stop) {
 
 void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
     Common::SetCurrentThreadName(("bb:DrawPrep" + std::to_string(index)).c_str());
-    BbThreads::MakeBackground();
+    SetPreparationPriority();
     auto regs = std::make_unique<AmdGpu::Regs>();
     constexpr u64 NoPosition = ~0ull;
     u64 position = NoPosition; ///< `regs` holds the state at the start of this buffer

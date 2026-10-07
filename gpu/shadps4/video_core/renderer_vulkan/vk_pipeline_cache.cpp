@@ -355,6 +355,56 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 
 PipelineCache::~PipelineCache() = default;
 
+bool PipelineCache::MatchesGraphicsSelectionMemo(const DrawIndirectParams params) const {
+    const auto& memo = graphics_selection_memo;
+    if (!memo.valid || memo.reg_checksum != liverpool->gfx_reg_checksum ||
+        memo.params.vertex_sgpr_offset != params.vertex_sgpr_offset ||
+        memo.params.instance_sgpr_offset != params.instance_sgpr_offset ||
+        memo.motion_positions_address != Shader::MotionVectors::positions_address) {
+        return false;
+    }
+
+    const auto& regs = liverpool->regs;
+    // gfx_reg_checksum covers register writes.  Recheck the embedded shader hashes as well so a
+    // guest binary rewritten in place cannot reuse an old pipeline merely because its address
+    // and registers stayed the same.
+    for (u32 stage = 0; stage <= static_cast<u32>(Shader::HwStage::Local); ++stage) {
+        const bool enabled = regs.stage_enable.IsStageEnabled(stage);
+        const auto expected = memo.program_hashes[stage];
+        if (!enabled) {
+            if (expected != 0) {
+                return false;
+            }
+            continue;
+        }
+        const auto* program = regs.ProgramForStage(stage);
+        if (!program || !program->Address<u32*>()) {
+            return false;
+        }
+        if (AmdGpu::GetParams(*program).hash != expected) {
+            return false;
+        }
+    }
+    return memo.pipeline != nullptr;
+}
+
+void PipelineCache::RememberGraphicsSelection(const DrawIndirectParams params,
+                                              const GraphicsPipeline* pipeline,
+                                              const PipelineSelection& selection) {
+    auto& memo = graphics_selection_memo;
+    memo.valid = pipeline != nullptr;
+    memo.reg_checksum = liverpool->gfx_reg_checksum;
+    memo.params = params;
+    memo.motion_positions_address = Shader::MotionVectors::positions_address;
+    memo.program_hashes.fill(0);
+    for (const auto* info : selection.infos) {
+        if (info) {
+            memo.program_hashes[static_cast<u32>(info->hw_stage)] = info->pgm_hash;
+        }
+    }
+    memo.pipeline = pipeline;
+}
+
 // bbport: shader/pipeline compile time on the GPU thread, reported by BB_FRAME_STATS.
 std::atomic<u64> g_bb_compile_ns;
 std::atomic<u32> g_bb_compiles;
@@ -426,8 +476,12 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             return pipeline;
         }
     }
+    if (!prepared && MatchesGraphicsSelectionMemo(params)) {
+        return graphics_selection_memo.pipeline;
+    }
     sel.draw_indirect_params = params;
     if (!RefreshGraphicsKey(sel)) {
+        graphics_selection_memo.valid = false;
         return nullptr;
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(sel.graphics_key);
@@ -454,6 +508,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         }
         sel.fetch_shader.reset();
     }
+    RememberGraphicsSelection(params, it->second.get(), sel);
     return it->second.get();
 }
 
@@ -940,6 +995,7 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,
                                                              std::span<const u32> spv_code) {
+    graphics_selection_memo.valid = false;
     std::optional<vk::ShaderModule> new_module{};
     for (const auto& [_, program] : program_cache) {
         for (auto& m : program->modules) {
