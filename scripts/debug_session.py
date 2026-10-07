@@ -150,8 +150,11 @@ def collect(command,cwd,base,profile,env=None):
         'limits':{'runtime_log_bytes':8*MIB,'runtime_log_backups':1,'input_bytes':4*MIB,
                   'input_backups':1,'metrics_bytes':MIB,'metrics_backups':1,'sessions':3,
                   'gpu_operations':512,'frame_metrics_bytes':2*MIB,'frame_metrics_backups':1,
-                  'snapshot_max_resolution':[1920,1080],'snapshot_interval_ms':10000},
-        'settings':{key:env.get(key) for key in ('BB_GAME_PROFILE','BB_DRAW_PIPE','BB_VK_RECORD_THREAD','BB_FPS','BB_VBLANK_HZ',
+                  'performance_recording_cache_bytes':32*MIB,
+                  'snapshot_max_resolution':[1920,1080],'snapshot_source_max_resolution':[4096,2160],
+                  'snapshot_slots':8,'snapshot_mark_slots':4,'snapshot_followup_slots':4,'snapshot_followups':3,'snapshot_interval_ms':1000,
+                  'snapshot_manual_only':env.get('BB_CAPTURE_MANUAL_ONLY')=='1'},
+        'settings':{key:env.get(key) for key in ('BB_GAME_PROFILE','BB_SHADER_SOURCE','BB_SHADER_BUNDLE','BB_IMAGE_READ_MEMO','BB_FLAT_DATA_MEMO','BB_PRESENT_MODE','BB_HDR','BB_FSR1','BB_UPSCALER','BB_GPU_PROFILE','BB_PREP_PRIORITY','BB_PIPELINE_CACHE','BB_DRAW_PIPE','BB_VK_RECORD_THREAD','BB_FPS','BB_VBLANK_HZ',
             'BB_REGION','BB_LANGUAGE','BB_TIMEZONE_MINUTES','BB_ENTER_BUTTON','BB_PERF_STATS','BB_F10_DEEP')}}
     save_json(session/'manifest.json',manifest)
     executable=Path(command[0])
@@ -164,6 +167,9 @@ def collect(command,cwd,base,profile,env=None):
     startup=RotatingWriter(session/'startup.log',256*1024,backups=0)
     metrics_log=RotatingWriter(session/'metrics.jsonl',MIB)
     faults=[]; reader_errors=[]
+    from recover_performance_recording import RecordingJournal
+    recording_journal=RecordingJournal(session)
+    recording_errors=[]
     try:
         child=subprocess.Popen([str(c) for c in command],cwd=cwd,env=env,
             stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
@@ -187,6 +193,7 @@ def collect(command,cwd,base,profile,env=None):
                 line=raw.decode('utf-8',errors='replace').rstrip('\r\n')
                 stamp=datetime.now(timezone.utc).isoformat(timespec='milliseconds')
                 log.write(f'{stamp} {line}\n')
+                recording_journal.observe(line)
                 if first_bytes<240*1024:
                     startup.write(f'{stamp} {line}\n'); first_bytes+=len(raw)
                 if any(token in line for token in ('Host fault','Guest fault','STOP:','DEBUG_CRASH')):
@@ -204,6 +211,9 @@ def collect(command,cwd,base,profile,env=None):
         except PermissionError as error:
             monitor_error=str(error); print(f'DEBUG: process monitoring unavailable: {error}',flush=True)
         while child.poll() is None:
+            try: recording_journal.checkpoint()
+            except (OSError,ValueError) as error:
+                if not recording_errors: recording_errors.append(str(error))
             sample={'utc':datetime.now(timezone.utc).isoformat(timespec='milliseconds')}
             if monitor: sample.update(monitor.read())
             heartbeat=read_json(session/'gpu-heartbeat.json'); sample['gpu']=heartbeat
@@ -241,6 +251,22 @@ def collect(command,cwd,base,profile,env=None):
     result={**live,'finished':True,'exit_code':status,'ended_utc':datetime.now(timezone.utc).isoformat(),
         'faults':faults[:16],'monitor_error':monitor_error,'reader_errors':reader_errors,
         'latest':previous,'abnormal_exit':status!=0}
+    # Finalize outside the dead game process: works for _exit(), host/guest faults and forced
+    # termination, where the in-process recording toggle/destructors cannot run.
+    save_json(session/'status.json',result)
+    try:
+        recording_journal.checkpoint()
+        from recover_performance_recording import recover, analyze
+        recovered=recover(session)
+        if recovered:
+            result['recovered_recordings']=recovered
+            for recording in recovered:
+                path=session/f'performance-recording-{recording["recording_id"]}.csv'
+                save_json(path.with_suffix('.summary.json'),analyze(path))
+            print(f'DEBUG: automatically finalized {len(recovered)} interrupted performance recording(s).',flush=True)
+    except (OSError,ValueError) as error:
+        recording_errors.append(str(error))
+    if recording_errors: result['recording_errors']=recording_errors
     try:
         from frame_report import summarize
         save_json(session/'performance-summary.json',summarize(session))

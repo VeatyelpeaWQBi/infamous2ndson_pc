@@ -20,6 +20,7 @@
 #include <SDL3/SDL.h>
 #include "../bbgpu.h"
 #include "common/elf_info.h"
+#include "core/emulator.h"
 #include "common/logging/log.h"
 #include "common/rdtsc.h"
 #include "core/libraries/kernel/orbis_error.h"
@@ -74,20 +75,7 @@ void SymbolsResolver::AddSymbol(const char* nid, const char* library, unsigned v
 }
 } // namespace Core::Loader
 
-// ElfInfo's fields are private to Core::Emulator; the port fills them here.
 namespace Core {
-class Emulator {
-public:
-    static void FillElfInfo(const BbGpuConfig& config) {
-        auto& info = Common::ElfInfo::Instance();
-        info.initialized = true;
-        info.game_serial = config.serial ? config.serial : "UNKNOWN";
-        info.title = config.title ? config.title : "";
-        info.sdk_ver = config.sdk_version;
-        info.psf_attributes.raw = config.psf_attributes;
-    }
-};
-
 void MemoryManager::SetRasterizer(Vulkan::Rasterizer* rasterizer_) {
     rasterizer = rasterizer_;
     // Existing guest mappings are replayed by the runtime when hooks are installed.

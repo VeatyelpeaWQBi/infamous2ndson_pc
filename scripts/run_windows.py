@@ -72,6 +72,7 @@ def main():
         sys.exit(f'No eboot.bin in {game} (pass --game-dir or set BB_GAME_DIR).')
     original = game.resolve()
     profile = select_profile(original)
+    os.environ['BB_GAME_DIR'] = str(original)
     native_environment(profile, data, os.environ)
     if profile['id'] == 'infamous':
         out = out / profile['title_id']

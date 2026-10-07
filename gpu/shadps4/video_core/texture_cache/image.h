@@ -131,7 +131,7 @@ struct Image {
     using Barriers = boost::container::small_vector<vk::ImageMemoryBarrier2, 32>;
     void GetBarriers(Barriers& out_barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                      vk::PipelineStageFlags2 dst_stage,
-                     std::optional<SubresourceRange> subres_range = {});
+                     std::optional<SubresourceRange> subres_range = {}, bool allow_read_memo = true);
 
 public:
     struct BackingImage;
@@ -181,6 +181,14 @@ public:
         UniqueImage image;
         State state;
         std::vector<State> subresource_states;
+        // Repeated sampling of one partial view need not walk every mip/layer.
+        // Any different access invalidates this memo, including all writes.
+        struct {
+            bool valid = false;
+            std::optional<SubresourceRange> range;
+            vk::ImageLayout layout{};
+            vk::PipelineStageFlags2 stage{};
+        } read_memo;
         boost::container::small_vector<ImageViewInfo, 4> image_view_infos;
         boost::container::small_vector<ImageViewId, 4> image_view_ids;
         u32 last_view = 0; ///< bbport: index of the view FindView returned last

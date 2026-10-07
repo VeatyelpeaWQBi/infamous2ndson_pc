@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <vector>
+#include <stdexcept>
 
 namespace Serialization {
 
@@ -42,10 +43,10 @@ struct Archive {
     }
 
     void Advance(size_t size) {
-        ASSERT_MSG(offset + size <= container.size(),
-                   "Invalid or corrupted deserialization container/shader cache");
+        if (size>Remaining()) throw std::runtime_error("Truncated shader cache");
         offset += size;
     }
+    [[nodiscard]] size_t Remaining() const { return container.size()-offset; }
 
     std::vector<u8>&& TakeOff() {
         offset = 0;
@@ -105,8 +106,7 @@ struct Writer {
 struct Reader {
     template <typename T>
     void Read(T* ptr, size_t size) {
-        ASSERT_MSG(ar.offset + size <= ar.container.size(),
-                   "Invalid or corrupted deserialization container/shader cache");
+        if (size>ar.Remaining()) throw std::runtime_error("Truncated shader cache");
         std::memcpy(reinterpret_cast<void*>(ptr), ar.CurrPtr(), size);
         ar.Advance(size);
     }
@@ -121,7 +121,9 @@ struct Reader {
     void Read(auto& v) {
         size_t num_elements{};
         Read(num_elements);
-        for (int i = 0; i < num_elements; ++i) {
+        if (num_elements>ar.Remaining() || num_elements>v.max_size())
+            throw std::runtime_error("Invalid shader cache element count");
+        for (size_t i = 0; i < num_elements; ++i) {
             v.emplace_back();
             Read(v.back());
         }
@@ -130,6 +132,7 @@ struct Reader {
     void Read(std::string& s) {
         size_t length{};
         Read(length);
+        if (length>ar.Remaining()) throw std::runtime_error("Invalid shader cache string size");
         s.resize(length);
         Read(s.data(), length);
     }

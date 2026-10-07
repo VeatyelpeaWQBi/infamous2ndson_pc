@@ -99,8 +99,8 @@ BB_FPS=30 不等于这里设了 30 FPS 呈现上限，不能把 20/30 FPS 的下
   `THREAD_PRIORITY_IDLE` 提升为 `THREAD_PRIORITY_BELOW_NORMAL`（`BB_PREP_PRIORITY=low`），减少
   准备队列落后导致的 GPU 线程串行回退。
 - 在资源绑定前预取准备线程生成的只读纹理、采样器和缓冲区描述，不改变资源状态或命令顺序。
-- 对连续图形绘制增加管线选择短路缓存；缓存命中前仍复核寄存器校验和、着色器二进制哈希和运动向量地址，
-  不跳过着色器变化检查。
+- 曾对连续图形绘制增加管线选择短路缓存；后续审查发现资源表可在寄存器不变时被改写，
+  已撤销该捷径，常规路径重新读取资源表。当前改动见 `INFAMOUS_RUNTIME_SHADER_CACHE.zh-CN.md`。
 - 未启用 `BB_TEXTURE_HELPER`：已有 A/B 数据显示逐绘制 fork/join 在当前 CPU 上没有收益。
 - 未恢复 `DrawPipe`：inFAMOUS 的 Continue 路径仍存在共享 Scheduler 生产者竞态，强行开启会重新引入崩溃。
 

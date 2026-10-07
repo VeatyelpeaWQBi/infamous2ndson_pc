@@ -2,6 +2,7 @@
 
 ## 平台与目标
 
+- 本项目作为独立项目维护，不再跟踪、同步或合并 fork 上级项目的更新；后续开发以本地 inFAMOUS 适配目标为准，除非用户明确改变这一原则。
 - 本 fork 只开发、构建、运行和验证 Windows x86-64 版本，目标系统为 Windows 10/11。
 - 当前游戏适配目标为 inFAMOUS Second Son（CUSA00309）。Windows 环境改造不代表该游戏已经可玩。
 - 不要求维护 Linux、Unix、NixOS、Steam Deck、AppImage 或 WSL 的兼容性，不为这些平台新增实现、依赖或测试。

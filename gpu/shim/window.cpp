@@ -90,9 +90,11 @@ int WindowSDL::PollTextInput(std::string& out) {
 
 void WindowSDL::UpdateTextTitle() {
     const std::string title = text_active ? base_title + " \u2014 " + text_prompt + ": " + text + "_  (Enter = OK, Esc = cancel)"
-        : base_title + (mouse_relative
+        : base_title + (mouse_touch
+            ? " | Mouse touchpad ON: Left drag swipe, Right click press, F7 center, F8/Esc release"
+            : mouse_relative
             ? " | Mouse motion ON: move/ shake, Left click spray, F7 center, F6/Esc release"
-            : " | F6: mouse motion");
+            : " | F6: mouse motion | F8: mouse touchpad");
     SDL_SetWindowTitle(window, title.c_str());
 }
 
@@ -100,15 +102,18 @@ void WindowSDL::UpdateMouseMotion() {
     const bool allowed = !text_active && !BbOverlay::CapturesInput() &&
                          (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS);
     if (!allowed) mouse_motion.Release();
-    const bool active = mouse_motion.Active();
-    if (active == mouse_relative) return;
-    if (!SDL_SetWindowRelativeMouseMode(window, active)) {
+    const bool active = mouse_motion.Captured();
+    const bool touch = mouse_motion.TouchActive();
+    if (active == mouse_relative && touch == mouse_touch) return;
+    if (active != mouse_relative && !SDL_SetWindowRelativeMouseMode(window, active)) {
         LOG_WARNING(Frontend, "Mouse motion capture failed: {}", SDL_GetError());
         mouse_motion.Release();
         SDL_SetWindowRelativeMouseMode(window, false);
         mouse_relative = false;
+        mouse_touch = false;
     } else {
         mouse_relative = active;
+        mouse_touch = touch;
     }
     LOG_INFO(Frontend, "Mouse motion {}", mouse_relative ? "enabled" : "released");
     UpdateTextTitle();

@@ -51,13 +51,19 @@ def native_environment(profile, data, env):
                 'BB_UPSCALE_BEFORE_CS', 'BB_PATCHES', 'BB_PRESET_FILE', 'BB_TOGGLE_FILE', 'BB_DMEM_MB'):
         env.pop(key, None)
     state = Path(data) / 'profiles' / profile['title_id']
+    source=Path(env.get('BB_GAME_DIR',Path(data)/'patches'/profile['title_id']))/'art/cache/all_shaders.xpps'
     locale=console_locale(data)
+    # Mailbox and FIFO synchronize presentation; disallow tearing modes for this title.
+    if env.get('BB_PRESENT_MODE') not in ('Mailbox','Fifo'):
+        env['BB_PRESENT_MODE']='Mailbox'
+    env.setdefault('BB_FLAT_DATA_MEMO','1')
     env.update(BB_GAME_PROFILE='infamous', BB_UPSCALER='none', BB_DEBUG_MOTION='0',
                BB_REGION=locale['region'], BB_LANGUAGE=str(locale['system_language']),
                BB_TIMEZONE_MINUTES=str(locale['timezone_minutes']),
                BB_ENTER_BUTTON='0' if locale['confirm_button']=='circle' else '1',
                BB_DRAW_PIPE='0',
                BB_PREP_PRIORITY='low',
+               BB_SHADER_SOURCE=str(source),
                BB_LIVE_RES='0', BB_FPS='30', BB_VBLANK_HZ='60',
                BB_SHOW_FPS='1' if locale.get('show_fps',True) else '0',
                BB_USER_DIR=str(state / 'user'), BB_GPU_USER_DIR=str(state / 'gpu'),

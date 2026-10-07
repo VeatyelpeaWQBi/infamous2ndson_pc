@@ -27,6 +27,8 @@ struct Liverpool;
 namespace Vulkan {
 
 struct Frame {
+    HostPasses::PostProcessingPass::Settings diagnostic_color{};
+    u32 diagnostic_source_format{};
     u32 width;
     u32 height;
     VmaAllocation allocation;
@@ -47,6 +49,7 @@ enum SchedulerType {
 };
 
 class Rasterizer;
+class FrameSnapshotWriter;
 
 class Presenter {
 public:
@@ -111,6 +114,7 @@ private:
 private:
     u64 diagnostic_frames{};
     u64 diagnostic_capture_tick{};
+    u32 capture_followups{};
     float expected_ratio{1920.0 / 1080.0f};
     u32 expected_frame_width{1920};
     u32 expected_frame_height{1080};
@@ -138,6 +142,7 @@ private:
     std::condition_variable free_cv;
     std::condition_variable_any frame_cv;
     std::vector<VAddr> vo_buffers_addr;
+    std::unique_ptr<FrameSnapshotWriter> snapshot_writer;
 };
 
 } // namespace Vulkan

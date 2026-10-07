@@ -39,6 +39,7 @@ namespace Vulkan {
 class Instance;
 class Scheduler;
 class ShaderCache;
+class DriverPipelineCache;
 
 struct Program {
     struct Module {
@@ -122,6 +123,8 @@ public:
 
     void WarmUp();
     void Sync();
+    [[nodiscard]] size_t NumCachedPrograms() const { return program_cache.size(); }
+    [[nodiscard]] size_t NumCachedComputePipelines() const { return compute_pipelines.size(); }
 
     bool LoadComputePipeline(Serialization::Archive& ar);
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
@@ -161,19 +164,6 @@ public:
     }
 
 private:
-    struct GraphicsSelectionMemo {
-        bool valid = false;
-        u64 reg_checksum = 0;
-        DrawIndirectParams params{};
-        u64 motion_positions_address = 0;
-        std::array<u64, static_cast<u32>(Shader::HwStage::Compute) + 1> program_hashes{};
-        const GraphicsPipeline* pipeline = nullptr;
-    };
-
-    bool MatchesGraphicsSelectionMemo(const DrawIndirectParams params) const;
-    void RememberGraphicsSelection(const DrawIndirectParams params,
-                                   const GraphicsPipeline* pipeline,
-                                   const PipelineSelection& selection);
     bool RefreshGraphicsKey(PipelineSelection& sel);
     bool RefreshGraphicsStages(PipelineSelection& sel);
     bool RefreshComputeKey();
@@ -197,7 +187,7 @@ private:
     Scheduler& scheduler;
     AmdGpu::Liverpool* liverpool;
     DescriptorHeap desc_heap;
-    vk::UniquePipelineCache pipeline_cache;
+    std::unique_ptr<DriverPipelineCache> pipeline_cache;
     vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};
     Shader::Pools pools;
@@ -211,9 +201,6 @@ private:
     PipelineSelection sel{}; ///< GPU thread selection state
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
-    // Consecutive draws often keep all pipeline-affecting registers unchanged.  This memo skips
-    // rebuilding the same GraphicsPipelineKey while still validating shader binary hashes.
-    GraphicsSelectionMemo graphics_selection_memo{};
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

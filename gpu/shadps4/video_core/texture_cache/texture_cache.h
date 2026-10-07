@@ -23,6 +23,7 @@
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/sampler.h"
+#include "video_core/texture_cache/registry_changes.h"
 #include "video_core/texture_cache/tile_manager.h"
 
 namespace AmdGpu {
@@ -92,6 +93,11 @@ public:
     /// bbport: changes whenever an image is registered or unregistered.
     [[nodiscard]] u64 RegistryGeneration() const noexcept {
         return registry_generation.load(std::memory_order_acquire);
+    }
+    bool RegistryUnchanged(u64& previous,std::span<const RegistryRange> ranges) {
+        if (previous==RegistryGeneration()) return true;
+        std::scoped_lock lock{registry_mutex};
+        return registry_changes.Unchanged(previous,ranges);
     }
 
     /// bbport: FindImage's access tick for an image found by a memoized lookup. The LRU touch
@@ -447,6 +453,8 @@ private:
     };
     std::array<FindImageCacheEntry, 1024> find_image_cache{};
     std::atomic<u64> registry_generation{0};
+    RegistryChanges registry_changes;
+    std::mutex registry_mutex;
     std::mutex samplers_mutex;
     std::mutex download_images_mutex;
     struct MetaDataInfo {

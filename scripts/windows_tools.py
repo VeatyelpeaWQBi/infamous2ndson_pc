@@ -9,7 +9,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 NATIVE_TESTS = ('bb-probe', 'pad-test', 'runtime-test', 'file-mods-test', 'sema-test', 'content-test', 'infamous-test')
-UNIT_TESTS = ('motion-history-test', 'ui-composition-test', 'upscaler-support-test', 'motion-shader-test', 'videodec-test', 'image-compat-test')
+UNIT_TESTS = ('motion-history-test', 'ui-composition-test', 'upscaler-support-test', 'motion-shader-test', 'videodec-test', 'image-compat-test', 'performance-sim-test')
 GPU_TESTS = ('scene-resolution-test', 'taa-shader-test', 'camera-motion-test')
 
 

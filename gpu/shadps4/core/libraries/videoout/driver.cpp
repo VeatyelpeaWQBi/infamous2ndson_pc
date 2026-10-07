@@ -309,7 +309,10 @@ void VideoOutDriver::Flip(const Request& req) {
             Vulkan::g_bb_perf_compiles.load(),Vulkan::g_bb_perf_compile_ns.load(),
             image_upload_bytes.load(),buffer_upload_bytes.load(),t_protect.load(),
             t_refresh.load(),t_staging.load(),sync_recording_ns.load(),host_copies_wait_ns.load(),
-            copy_threads_wait_ns.load(),tick_wait_ns.load(),bind_ns.load(),pipeline_select_ns.load()});
+            copy_threads_wait_ns.load(),tick_wait_ns.load(),bind_ns.load(),pipeline_select_ns.load(),
+            buffer_bind_ns.load(),texture_bind_ns.load(),sampler_bind_ns.load(),
+            texture_set_hits.load(),texture_set_misses.load(),texture_set_revalidated.load(),
+            image_read_memo_hits.load(),image_subresource_checks.load(),flat_data_memo_hits.load(),flat_data_bytes_saved.load()});
     }
     // Numeric bounded telemetry replaces verbose per-stall text and preserves
     // cumulative counters; do not exchange/reset them underneath Frame().

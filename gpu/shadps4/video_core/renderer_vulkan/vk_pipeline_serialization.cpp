@@ -7,6 +7,7 @@
 #include "shader_recompiler/info.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_driver_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
@@ -168,8 +169,9 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     ASSERT(is_new);
 
+    auto cache_guard=pipeline_cache->Lock();
     it.value() =
-        std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile, *pipeline_cache,
+        std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile, pipeline_cache->Handle(),
                                           compute_key, *sel.infos[0], sel.modules[0], sdata, true);
 
     sel.infos.fill(nullptr);
@@ -243,8 +245,9 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     const auto [it, is_new] = graphics_pipelines.try_emplace(sel.graphics_key);
     ASSERT(is_new);
 
+    auto cache_guard=pipeline_cache->Lock();
     it.value() = std::make_unique<GraphicsPipeline>(
-        instance, scheduler, desc_heap, profile, sel.graphics_key, *pipeline_cache, sel.infos,
+        instance, scheduler, desc_heap, profile, sel.graphics_key, pipeline_cache->Handle(), sel.infos,
         sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, true);
 
     sel.infos.fill(nullptr);
@@ -262,12 +265,13 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     if (!LoadShaderMeta(ar, program->info, sel.fetch_shader, spec, perm_idx)) {
         return false;
     }
+    if (perm_idx>4095 || stage>=MaxShaderStages) return false;
 
     std::vector<u32> spv{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
                                        fmt::format("{:#018x}_{}", program->info.pgm_hash, perm_idx),
                                        spv);
-    if (spv.empty()) {
+    if (spv.size()<5 || spv[0]!=0x07230203) {
         return false;
     }
 
@@ -281,6 +285,12 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         module = CompileSPV(spv, instance.GetDevice());
         it_pgm.value() = std::move(program);
     } else {
+        const auto& modules=it_pgm.value()->modules;
+        if (perm_idx<modules.size() && modules[perm_idx].module &&
+            !(modules[perm_idx].spec==spec)) {
+            LOG_WARNING(Render_Vulkan,"Skipping conflicting cached permutation index {}",perm_idx);
+            return false;
+        }
         const auto& it = std::ranges::find(it_pgm.value()->modules, spec, &Program::Module::spec);
         if (it != it_pgm.value()->modules.end()) {
             // A matching permutation is valid only at its original index. A different index means
@@ -300,9 +310,13 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         }
     }
     it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
+    // Specialization compares Info resource counts; point at the owning program, never at the
+    // temporary program discarded when another cached stage already inserted this shader.
+    it_pgm.value()->modules[perm_idx].spec.info=&it_pgm.value()->info;
 
     sel.infos[stage] = &it_pgm.value()->info;
     sel.modules[stage] = module;
+    sel.runtime_infos[stage] = it_pgm.value()->modules[perm_idx].spec.runtime_info;
 
     return true;
 }
@@ -350,9 +364,25 @@ void PipelineCache::WarmUp() {
 
     u32 num_pipelines{};
     u32 num_total_pipelines{};
+    u32 num_stages{};
+    // Restore even stages whose last recording ended before a pipeline key was
+    // written. This makes the centralized package useful beyond pipeline hits.
+    Storage::DataBase::Instance().ForEachBlob(Storage::BlobType::ShaderMeta,
+        [&](std::vector<u8>&& data) {
+            try {
+                Serialization::Archive ar{std::move(data)};
+                if (LoadPipelineStage(ar,0)) ++num_stages;
+            } catch (const std::exception& error) {
+                LOG_WARNING(Render,"Ignoring invalid cached shader: {}",error.what());
+            }
+            sel.infos.fill(nullptr); sel.modules.fill(nullptr); sel.fetch_shader.reset();
+        });
+    LOG_INFO(Render,"Preloaded {} shader specializations",num_stages);
 
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
+            sel.infos.fill(nullptr); sel.modules.fill(nullptr); sel.fetch_shader.reset();
+            try {
             ++num_total_pipelines;
             // bbport: an interrupted cache write may leave an empty/header-only
             // key. It is rebuildable data, not a fatal guest startup error.
@@ -382,6 +412,9 @@ void PipelineCache::WarmUp() {
 
             if (result) {
                 ++num_pipelines;
+            }
+            } catch (const std::exception& error) {
+                LOG_WARNING(Render,"Ignoring invalid cached pipeline: {}",error.what());
             }
         });
 
@@ -414,6 +447,10 @@ bool Info::Deserialize(Serialization::Archive& ar) {
     Serialization::Reader info{ar};
 
     info.Read(this, sizeof(Shader::InfoPersistent));
+    if (buffers.size()>NUM_BUFFERS || images.size()>NUM_IMAGES ||
+        samplers.size()>NUM_SAMPLERS || fmasks.size()>NUM_FMASKS ||
+        u32(hw_stage)>u32(HwStage::Compute) || u32(sw_stage)>u32(SwStage::Compute))
+        throw std::runtime_error("Invalid cached shader resource/stage count");
     info.Read(flattened_ud_buf);
 
     return srt_info.Deserialize(ar);
@@ -455,6 +492,9 @@ bool PersistentSrtInfo::Deserialize(Serialization::Archive& ar) {
     srt.Read(this, sizeof(*this));
 
     if (walker_func_size) {
+        // Reading must validate before copying executable bytes. Writing grows
+        // its archive; remaining writable capacity is not an input-size limit.
+        if (walker_func_size>ar.Remaining()) throw std::runtime_error("Truncated cached SRT walker");
         walker_func = RegisterWalkerCode(ar.CurrPtr(), walker_func_size);
         ar.Advance(walker_func_size);
     }

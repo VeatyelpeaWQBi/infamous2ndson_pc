@@ -45,6 +45,7 @@ private:
     void UpdateTextTitle();
     void UpdateMouseMotion();
     bool mouse_relative{};
+    bool mouse_touch{};
     SDL_Window* window{};
     WindowSystemInfo window_info{};
 };

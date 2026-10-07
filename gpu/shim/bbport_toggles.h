@@ -107,6 +107,10 @@ inline const bool enabled = [] {
     return (env && env[0] == '1') || (perf && perf[0] == '1');
 }();
 inline std::atomic<std::uint64_t> bind_ns{0}, pipeline_select_ns{0};
+inline std::atomic<std::uint64_t> buffer_bind_ns{0}, texture_bind_ns{0}, sampler_bind_ns{0},
+    texture_set_hits{0}, texture_set_misses{0}, texture_set_revalidated{0};
+inline std::atomic<std::uint64_t> image_read_memo_hits{0}, image_subresource_checks{0};
+inline std::atomic<std::uint64_t> flat_data_memo_hits{0},flat_data_bytes_saved{0};
 struct Timer {
     std::atomic<std::uint64_t>& total;
     std::chrono::steady_clock::time_point start =

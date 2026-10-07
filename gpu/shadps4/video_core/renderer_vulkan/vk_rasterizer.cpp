@@ -21,6 +21,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
+#include "video_core/renderer_vulkan/vk_texture_set_key.h"
 #include "bbport_threads.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -2088,6 +2089,7 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
 void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* prepared,
                              Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data, u32& write_index) {
+    BbStats::Timer buffer_timer{BbStats::buffer_bind_ns};
     const u64 alignment = instance.StorageMinAlignment();
     for (u32 buffer_index = 0; buffer_index < stage.buffers.size(); ++buffer_index) {
         const auto& desc = stage.buffers[buffer_index];
@@ -2114,8 +2116,19 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     FrameCapture::Buffer(stage.pgm_hash, binding.buffer, 0,
                                          stage.FlatUserData().data(), ubo_size);
                 }
-                const u64 offset =
-                    vk_buffer.Copy(stage.FlatUserData().data(), ubo_size, alignment);
+                static const bool memo_enabled=[] {
+                    const char* value=std::getenv("BB_FLAT_DATA_MEMO"); return !value || value[0]!='0';
+                }();
+                const auto uploaded=flat_data_memo.Upload(reinterpret_cast<u64>(&stage),
+                    std::span<const u8>{reinterpret_cast<const u8*>(stage.FlatUserData().data()),ubo_size},
+                    [&]{return FlatDataMemo::Epoch{scheduler.CurrentTick(),vk_buffer.WrapGeneration()};},
+                    [&]{return vk_buffer.Copy(stage.FlatUserData().data(),ubo_size,alignment);},
+                    memo_enabled && !FrameCapture::Active());
+                const u64 offset=uploaded.offset;
+                if(BbStats::enabled && uploaded.reused) {
+                    BbStats::flat_data_memo_hits.fetch_add(1,std::memory_order_relaxed);
+                    BbStats::flat_data_bytes_saved.fetch_add(ubo_size,std::memory_order_relaxed);
+                }
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 // Permutations compiled without enabled planes never read the buffer, so the
@@ -2259,6 +2272,7 @@ Rasterizer::ImageDescCacheEntry& Rasterizer::CachedImageDescEntry(const AmdGpu::
 void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* prepared,
                               Shader::Backend::Bindings& binding, u32& write_index,
                               bool& barrier, bool on_helper) {
+    BbStats::Timer texture_timer{BbStats::texture_bind_ns};
     const u32 first_image_idx = image_infos.size();
     TextureSet* set_slot = nullptr;
     if (!on_helper && BindTexturesFromSet(stage, prepared, first_image_idx, barrier, set_slot)) {
@@ -2313,6 +2327,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
 
         if (!memory->IsValidGpuMapping(tsharp.Address(), 0) ||
             !IsKnownFormat(data_fmt, num_fmt)) {
+            set_ok = false; // A later mapping may make this non-null T# valid.
             LOG_WARNING(Render_Vulkan,
                         "Rejecting invalid T# address={:#x}, pitch={}, width={}, "
                         "data_format={}, num_format={}",
@@ -2512,6 +2527,16 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         set_slot->scene_generation = scene_targets->Generation();
         set_slot->count = static_cast<u32>(stage.images.size());
         std::copy_n(resolved.begin(), set_slot->count, set_slot->entries.begin());
+        for(u32 i=0;i<set_slot->count;++i) {
+            auto& range=set_slot->registry_ranges[i];
+            range={};
+            if (!resolved[i].id) continue;
+            const auto& lookup=image_bindings[i].second->info;
+            const auto& actual=texture_cache.GetImage(resolved[i].id).info;
+            const auto requested=VideoCore::RegistryRange::FromSize(lookup.guest_address,lookup.guest_size);
+            const auto backing=VideoCore::RegistryRange::FromSize(actual.guest_address,actual.guest_size);
+            range={std::min(requested.begin,backing.begin),std::max(requested.end,backing.end)};
+        }
     } else if (set_slot) {
         set_slot->key = 0;
     }
@@ -2540,6 +2565,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
 
 void Rasterizer::BindSamplers(const Shader::Info& stage, const PreparedStage* prepared,
                               Shader::Backend::Bindings& binding, u32& write_index) {
+    BbStats::Timer sampler_timer{BbStats::sampler_bind_ns};
     for (u32 sampler_index = 0; sampler_index < stage.samplers.size(); ++sampler_index) {
         const auto& sampler = stage.samplers[sampler_index];
         auto ssharp =
@@ -2589,7 +2615,7 @@ Rasterizer::BeginSignature Rasterizer::MakeBeginSignature(const GraphicsPipeline
 bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedStage* prepared,
                                      u32 first_image_idx, bool& barrier, TextureSet*& slot) {
     const u32 count = static_cast<u32>(stage.images.size());
-    if (!prepared || count == 0 || count > TextureSet::MaxImages ||
+    if (count == 0 || count > TextureSet::MaxImages ||
         BbToggle::Disabled(BbToggle::TextureSetMemo) || FrameCapture::Active()) {
         return false;
     }
@@ -2598,25 +2624,34 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
             return false;
         }
     }
-    u64 key = XXH3_64bits_withSeed(prepared->image_hashes, count * sizeof(u64),
-                                   reinterpret_cast<u64>(&stage));
-    key |= 1; // 0 marks an empty slot
+    // The GPU thread has already refreshed this stage's resource table. A late/failed
+    // speculative preparation must not disable whole-set memoization: hash the current T#s
+    // here, and retain exactly the same registry/backing/cleanliness/barrier validation.
+    std::array<u64, TextureSet::MaxImages> current_hashes;
+    const u64* hashes = prepared ? prepared->image_hashes : current_hashes.data();
+    if (!prepared) {
+        for (u32 i=0;i<count;++i) current_hashes[i]=ImageDescHash(stage.images[i].GetSharp(stage),stage.images[i]);
+    }
+    const u64 key=TextureSetKey(std::span{hashes,count},reinterpret_cast<u64>(&stage));
     auto& set = texture_sets[key % texture_sets.size()];
     slot = &set;
     const u64 generation = texture_cache.RegistryGeneration();
-    const bool match = set.key == key && set.stage == &stage && set.count == count &&
-                       set.generation == generation &&
+    const bool same_set = set.key == key && set.stage == &stage && set.count == count &&
                        set.scene_generation == scene_targets->Generation() &&
                        std::equal(set.hashes.begin(), set.hashes.begin() + count,
-                                  prepared->image_hashes);
+                                  hashes);
+    const bool revalidated = same_set && set.generation!=generation;
+    const bool match = same_set && texture_cache.RegistryUnchanged(
+        set.generation,std::span{set.registry_ranges}.first(count));
     if (!match) {
         ++texture_set_why[set.key != key ? 0 : set.generation != generation ? 1 : 3];
         ++texture_set_misses;
+        if (BbStats::enabled) BbStats::texture_set_misses.fetch_add(1,std::memory_order_relaxed);
         set.key = key;
         set.stage = &stage;
         set.count = 0;
         set.generation = ~0ull;
-        std::copy_n(prepared->image_hashes, count, set.hashes.begin());
+        std::copy_n(hashes, count, set.hashes.begin());
         return false;
     }
     // Every image still has the backing its view belongs to and needs no refresh.
@@ -2638,11 +2673,15 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
             (upscaler->Enabled() && upscaler->RedirectsSampled(entry.id))) {
             ++texture_set_why[2];
             ++texture_set_misses;
+            if (BbStats::enabled) BbStats::texture_set_misses.fetch_add(1,std::memory_order_relaxed);
             set.generation = ~0ull;
             return false;
         }
     }
     ++texture_set_hits;
+    if (revalidated && BbStats::enabled)
+        BbStats::texture_set_revalidated.fetch_add(1,std::memory_order_relaxed);
+    if (BbStats::enabled) BbStats::texture_set_hits.fetch_add(1,std::memory_order_relaxed);
     slot = nullptr;
     for (u32 i = 0; i < count; ++i) {
         const auto& entry = set.entries[i];

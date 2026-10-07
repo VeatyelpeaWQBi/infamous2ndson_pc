@@ -24,6 +24,8 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/motion_history.h"
 #include "video_core/renderer_vulkan/vk_draw_prep.h"
+#include "video_core/renderer_vulkan/vk_driver_cache.h"
+#include "common/elf_info.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -345,65 +347,16 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
     };
-    WarmUp();
-
-    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
-    ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
-               vk::to_string(cache_result));
-    pipeline_cache = std::move(cache);
+    const auto cache_path=EmulatorSettings.IsPipelineCacheEnabled()
+        ? Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / Common::ElfInfo::Instance().GameSerial() / "driver.vkc"
+        : std::filesystem::path{};
+    pipeline_cache=std::make_unique<DriverPipelineCache>(instance,cache_path);
+    std::printf("GPU: Vulkan driver cache loaded %zu bytes\n",pipeline_cache->LoadedBytes());
+    WarmUp(); // The driver cache must exist before any preload creates a pipeline.
+    pipeline_cache->Dirty(); pipeline_cache->Start();
 }
 
 PipelineCache::~PipelineCache() = default;
-
-bool PipelineCache::MatchesGraphicsSelectionMemo(const DrawIndirectParams params) const {
-    const auto& memo = graphics_selection_memo;
-    if (!memo.valid || memo.reg_checksum != liverpool->gfx_reg_checksum ||
-        memo.params.vertex_sgpr_offset != params.vertex_sgpr_offset ||
-        memo.params.instance_sgpr_offset != params.instance_sgpr_offset ||
-        memo.motion_positions_address != Shader::MotionVectors::positions_address) {
-        return false;
-    }
-
-    const auto& regs = liverpool->regs;
-    // gfx_reg_checksum covers register writes.  Recheck the embedded shader hashes as well so a
-    // guest binary rewritten in place cannot reuse an old pipeline merely because its address
-    // and registers stayed the same.
-    for (u32 stage = 0; stage <= static_cast<u32>(Shader::HwStage::Local); ++stage) {
-        const bool enabled = regs.stage_enable.IsStageEnabled(stage);
-        const auto expected = memo.program_hashes[stage];
-        if (!enabled) {
-            if (expected != 0) {
-                return false;
-            }
-            continue;
-        }
-        const auto* program = regs.ProgramForStage(stage);
-        if (!program || !program->Address<u32*>()) {
-            return false;
-        }
-        if (AmdGpu::GetParams(*program).hash != expected) {
-            return false;
-        }
-    }
-    return memo.pipeline != nullptr;
-}
-
-void PipelineCache::RememberGraphicsSelection(const DrawIndirectParams params,
-                                              const GraphicsPipeline* pipeline,
-                                              const PipelineSelection& selection) {
-    auto& memo = graphics_selection_memo;
-    memo.valid = pipeline != nullptr;
-    memo.reg_checksum = liverpool->gfx_reg_checksum;
-    memo.params = params;
-    memo.motion_positions_address = Shader::MotionVectors::positions_address;
-    memo.program_hashes.fill(0);
-    for (const auto* info : selection.infos) {
-        if (info) {
-            memo.program_hashes[static_cast<u32>(info->hw_stage)] = info->pgm_hash;
-        }
-    }
-    memo.pipeline = pipeline;
-}
 
 // bbport: shader/pipeline compile time on the GPU thread, reported by BB_FRAME_STATS.
 std::atomic<u64> g_bb_compile_ns;
@@ -476,12 +429,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             return pipeline;
         }
     }
-    if (!prepared && MatchesGraphicsSelectionMemo(params)) {
-        return graphics_selection_memo.pipeline;
-    }
+    // A register checksum/hash alone cannot validate specialization: resource tables may be
+    // rewritten without register packets. Always refresh tables on the non-prepared path.
     sel.draw_indirect_params = params;
     if (!RefreshGraphicsKey(sel)) {
-        graphics_selection_memo.valid = false;
         return nullptr;
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(sel.graphics_key);
@@ -491,9 +442,11 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         CompileTimer timer;
 
         GraphicsPipeline::SerializationSupport sdata{};
+        auto cache_guard=pipeline_cache->Lock();
         it.value() = std::make_unique<GraphicsPipeline>(
-            instance, scheduler, desc_heap, profile, sel.graphics_key, *pipeline_cache, sel.infos,
+            instance, scheduler, desc_heap, profile, sel.graphics_key, pipeline_cache->Handle(), sel.infos,
             sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, false);
+        pipeline_cache->Dirty();
 
         RegisterPipelineData(sel.graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
@@ -508,7 +461,6 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         }
         sel.fetch_shader.reset();
     }
-    RememberGraphicsSelection(params, it->second.get(), sel);
     return it->second.get();
 }
 
@@ -523,9 +475,11 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         CompileTimer timer;
 
         ComputePipeline::SerializationSupport sdata{};
+        auto cache_guard=pipeline_cache->Lock();
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
-                                                       *pipeline_cache, compute_key, *sel.infos[0],
+                                                       pipeline_cache->Handle(), compute_key, *sel.infos[0],
                                                        sel.modules[0], sdata, false);
+        pipeline_cache->Dirty();
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
 
@@ -995,7 +949,6 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,
                                                              std::span<const u32> spv_code) {
-    graphics_selection_memo.valid = false;
     std::optional<vk::ShaderModule> new_module{};
     for (const auto& [_, program] : program_cache) {
         for (auto& m : program->modules) {

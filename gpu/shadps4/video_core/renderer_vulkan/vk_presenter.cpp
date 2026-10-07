@@ -15,6 +15,7 @@
 #include "bbport_overlay.h"
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/renderer_vulkan/vk_frame_snapshot.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/image.h"
 
@@ -159,6 +160,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
 }
 
 Presenter::~Presenter() {
+    snapshot_writer.reset(); // Drain while the timeline semaphore and allocator are alive.
 
     draw_scheduler.Finish();
     present_scheduler.Finish();
@@ -403,6 +405,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // the post process pass still sRGB encoded and has to be decoded there instead.
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
+    frame->diagnostic_color=pp_settings;
+    frame->diagnostic_source_format=u32(attribute.attrib.pixel_format);
     pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
 
 
@@ -509,7 +513,7 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
-    // Optional bounded diagnostic: overwrite one BMP with actual presented pixels.
+    // Optional bounded diagnostics: asynchronously save a ring of post-processed game frames.
     // No desktop capture, user profile changes, or readback on normal launches.
     const char* capture_path = std::getenv("BB_CAPTURE_FRAME");
     const bool fresh = !is_reusing_frame && is_game_frame;
@@ -527,7 +531,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         return value && value[0]=='1';
     }();
     const bool manual_capture=!capture_request.empty() && GetFileAttributesA(capture_request.c_str())!=INVALID_FILE_ATTRIBUTES;
-    const bool capture_due=manual_capture || (!manual_only && (capture_interval ?
+    const bool followup=capture_followups && capture_tick-diagnostic_capture_tick>=1000;
+    const bool capture_due=manual_capture || followup || (!manual_only && (capture_interval ?
         !diagnostic_capture_tick || capture_tick-diagnostic_capture_tick>=capture_interval :
         diagnostic_frames==1 || diagnostic_frames%60==0));
     const auto capture_format = swapchain.GetSurfaceFormat().format;
@@ -539,7 +544,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     VmaAllocation capture_allocation{};
     VmaAllocationInfo capture_mapping{};
     if (capture_path && *capture_path && fresh && capture_due &&
-        (bgra || rgba) && frame->width && frame->height && frame->width <= 1920 && frame->height <= 1080) {
+        (bgra || rgba) && frame->width && frame->height && frame->width <= 4096 && frame->height <= 2160) {
+        if(!snapshot_writer) snapshot_writer=std::make_unique<FrameSnapshotWriter>(instance.GetDevice(),instance.GetAllocator());
+        if(!snapshot_writer->Full()) {
         const VkBufferCreateInfo ci{.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             .size=VkDeviceSize(frame->width)*frame->height*4,.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT};
         const VmaAllocationCreateInfo ai{.flags=VMA_ALLOCATION_CREATE_MAPPED_BIT |
@@ -549,7 +556,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             capture_buffer=VK_NULL_HANDLE;
         else {
             diagnostic_capture_tick=capture_tick;
-            if (manual_capture) DeleteFileA(capture_request.c_str());
+            if (manual_capture) { DeleteFileA(capture_request.c_str()); capture_followups=3; }
+            else if (followup) --capture_followups;
+        }
         }
     }
     // Free the frame for reuse
@@ -710,6 +719,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
+    const u64 snapshot_gpu_tick=scheduler.CurrentTick();
     scheduler.Flush(info);
 
     // Present to swapchain.
@@ -721,26 +731,12 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     }
 
     if (capture_buffer) {
-        // Wait before recycling this frame; the copy shares its presentation fence.
-        const auto wait=instance.GetDevice().waitForFences(frame->present_done,true,UINT64_MAX);
-        if (wait==vk::Result::eSuccess) {
-            const u32 stride=(frame->width*3+3)&~3u, bytes=stride*frame->height;
-            std::vector<u8> bmp(54+bytes,0);
-            auto put32=[&](size_t at,u32 value) { std::memcpy(bmp.data()+at,&value,4); };
-            bmp[0]='B'; bmp[1]='M'; put32(2,u32(bmp.size())); put32(10,54); put32(14,40);
-            put32(18,frame->width); put32(22,0u-frame->height); bmp[26]=1; bmp[28]=24; put32(34,bytes);
-            const auto* pixels=static_cast<const u8*>(capture_mapping.pMappedData);
-            for (u32 y=0;y<frame->height;++y) for (u32 x=0;x<frame->width;++x) {
-                const auto* src=pixels+(size_t(y)*frame->width+x)*4;
-                auto* dst=bmp.data()+54+size_t(y)*stride+x*3;
-                dst[0]=src[bgra?0:2]; dst[1]=src[1]; dst[2]=src[bgra?2:0];
-            }
-            std::ofstream output(capture_path,std::ios::binary|std::ios::trunc);
-            output.write(reinterpret_cast<const char*>(bmp.data()),bmp.size());
-            LOG_INFO(Render_Vulkan,"Diagnostic presented frame {}: {}x{} -> {} (written={})",
-                diagnostic_frames,frame->width,frame->height,capture_path,output.good());
-        }
-        vmaDestroyBuffer(instance.GetAllocator(),capture_buffer,capture_allocation);
+        const auto color=frame->diagnostic_color;
+        snapshot_writer->Submit({.buffer=capture_buffer,.allocation=capture_allocation,
+            .pixels=capture_mapping.pMappedData,.semaphore=scheduler.GetWorkSemaphore()->Handle(),
+            .gpu_tick=snapshot_gpu_tick,.tick=capture_tick,.width=frame->width,.height=frame->height,
+            .source_format=frame->diagnostic_source_format,.bgra=bgra,.hdr=bool(color.hdr),
+            .srgb=bool(color.srgb_input),.manual=manual_capture,.gamma=color.gamma,.directory=std::filesystem::path(capture_path).parent_path()});
     }
     if (!is_reusing_frame && is_game_frame) {
         BbDiagnostics::Presented(frame->width,frame->height);

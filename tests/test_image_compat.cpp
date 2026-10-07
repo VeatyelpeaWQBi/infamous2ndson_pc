@@ -23,6 +23,384 @@
 #include <thread>
 #include <atomic>
 #include "bbport_mouse_motion.h"
+#include "video_core/vk_shader_bundle.h"
+#include "video_core/renderer_vulkan/vk_driver_cache.h"
+#include "common/serdes.h"
+#include "video_core/renderer_vulkan/vk_draw_prep.h"
+#include "core/emulator.h"
+#include "common/hash.h"
+#include "video_core/cache_storage.h"
+#include "video_core/amdgpu/liverpool.h"
+#include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
+#include "video_core/texture_cache/registry_changes.h"
+#include "video_core/renderer_vulkan/vk_frame_snapshot.h"
+#include "video_core/renderer_vulkan/vk_texture_set_key.h"
+#include "video_core/renderer_vulkan/vk_flat_data_memo.h"
+#include "video_core/buffer_cache/buffer.h"
+
+static void flat_visibility() {
+    Vulkan::Instance instance(0,false); Vulkan::Scheduler scheduler(instance);
+    VideoCore::StreamBuffer stream(instance,scheduler,VideoCore::MemoryType::Stream,512);
+    VideoCore::Buffer readback(instance,0,128,VideoCore::MemoryType::HostCached);
+    auto memo=std::make_unique<Vulkan::FlatDataMemo>(); std::array<u8,128> source{};
+    const auto upload=[&] {
+        return memo->Upload(16,source,
+            [&]{return Vulkan::FlatDataMemo::Epoch{scheduler.CurrentTick(),stream.WrapGeneration()};},
+            [&]{return stream.Copy(source.data(),source.size(),16);});
+    };
+    assert(!upload().reused && upload().reused);
+    for(u32 i=0;i<8;++i) {source[127]=u8(i+1); assert(!upload().reused);}
+    assert(stream.WrapGeneration()>0);
+    auto saved=upload();
+    for(u32 i=0;i<128 && !saved.reused;++i) saved=upload();
+    assert(saved.reused); // Stable data must recover after the changing-data cooldown.
+    const auto cmd=scheduler.CommandBuffer();
+    const vk::MemoryBarrier2 host_write{.srcStageMask=vk::PipelineStageFlagBits2::eHost,
+        .srcAccessMask=vk::AccessFlagBits2::eHostWrite,.dstStageMask=vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask=vk::AccessFlagBits2::eTransferRead};
+    cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount=1,.pMemoryBarriers=&host_write});
+    const vk::BufferCopy copy{saved.offset,0,source.size()};
+    cmd.copyBuffer(stream.Handle(),readback.Handle(),copy);
+    const vk::MemoryBarrier2 readable{.srcStageMask=vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask=vk::AccessFlagBits2::eTransferWrite,.dstStageMask=vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask=vk::AccessFlagBits2::eHostRead};
+    cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount=1,.pMemoryBarriers=&readable});
+    scheduler.Finish(); readback.Invalidate(0,source.size());
+    assert(std::memcmp(readback.mapped_data.data(),source.data(),source.size())==0);
+    assert(!upload().reused); // A completed submission cannot reuse an unpinned old offset.
+    std::puts("Flat memo real GPU transfer visibility / ring wrap / submitted tick invalidation PASS");
+}
+
+static void flat_memo() {
+    auto memo=std::make_unique<Vulkan::FlatDataMemo>();
+    std::array<u8,16> bytes{};
+    Vulkan::FlatDataMemo::Epoch epoch{1,0}; u64 copies=0;
+    const auto upload=[&](u64 stage=16) {
+        return memo->Upload(stage,bytes,[&]{return epoch;},[&]{return ++copies;});
+    };
+    assert(!upload().reused); assert(upload().reused && copies==1);
+    bytes[15]=9; assert(!upload().reused && copies==2);
+    assert(upload().reused); ++epoch.tick; assert(!upload().reused);
+    ++epoch.wrap; assert(!upload().reused);
+    assert(!upload(16+16*Vulkan::FlatDataMemo::Capacity).reused); // slot collision
+    assert(!upload().reused && upload().reused);
+    // Changes during copy must stamp the new epoch, not the request's old one.
+    bytes[0]=7;
+    const auto changed=memo->Upload(16,bytes,[&]{return epoch;},[&]{++epoch.wrap; return ++copies;});
+    assert(!changed.reused && upload().reused);
+    for(u32 i=0;i<200;++i) {bytes[0]=u8(i); assert(!upload().reused);}
+    bool eventually=false;
+    for(u32 i=0;i<200;++i) eventually|=upload().reused;
+    assert(eventually); // Adaptive cooldown must recover for a stable workload.
+    std::puts("Flat readonly memo: exact bytes, tick/wrap/collision invalidation, post-copy epoch and adaptive recovery PASS");
+}
+
+static void texture_set_distribution() {
+    std::array<bool,32768> old_slots{},new_slots{};
+    std::array<u64,32768> old_cache{},new_cache{};
+    std::vector<u64> keys;
+    for(u64 i=0;i<50000;++i) {
+        const std::array hashes{i,i*17+3};
+        const auto key=Vulkan::TextureSetKey(hashes,0x1234);
+        assert(key); keys.push_back(key);
+        old_slots[(key|1)%old_slots.size()]=true;
+        new_slots[key%new_slots.size()]=true;
+    }
+    const auto old_count=std::count(old_slots.begin(),old_slots.end(),true);
+    const auto new_count=std::count(new_slots.begin(),new_slots.end(),true);
+    assert(old_count<=16384 && new_count>24000);
+    u64 old_hits=0,new_hits=0;
+    for(unsigned pass=0;pass<2;++pass) for(auto key:keys) {
+        auto& a=old_cache[(key|1)%old_cache.size()];
+        auto& b=new_cache[key%new_cache.size()];
+        if(a==key) ++old_hits; if(b==key) ++new_hits;
+        a=key;b=key;
+    }
+    assert(new_hits>old_hits);
+    std::printf("Texture cache slot distribution PASS: old %zu, fixed %zu; repeated workload hits old %llu, fixed %llu\n",
+        size_t(old_count),size_t(new_count),static_cast<unsigned long long>(old_hits),static_cast<unsigned long long>(new_hits));
+}
+
+static void snapshot_pixels(const std::filesystem::path& directory) {
+    Vulkan::FrameSnapshotWriter::Slots slots;
+    for(u32 mark=0;mark<4;++mark) {
+        assert(slots.Next(true)==mark);
+        for(u32 followup=0;followup<3;++followup) assert(slots.Next(false)>=4);
+    }
+    assert(slots.Next(true)==0);
+    std::filesystem::create_directories(directory);
+    std::vector<u8> pixels(3840*4*4);
+    for(size_t i=0;i<pixels.size();i+=4) {pixels[i]=10;pixels[i+1]=20;pixels[i+2]=30;pixels[i+3]=255;}
+    Vulkan::FrameSnapshotWriter::Job job{.pixels=pixels.data(),.tick=123,.width=3840,.height=4,
+        .bgra=true,.gamma=.8f,.directory=directory};
+    assert(Vulkan::FrameSnapshotWriter::Save(job,0));
+    const auto path=directory/"frame-snapshot-0.bmp";
+    std::vector<u8> data(std::filesystem::file_size(path));
+    std::ifstream input(path,std::ios::binary);assert(input.read(reinterpret_cast<char*>(data.data()),data.size()));
+    u32 width,height;std::memcpy(&width,data.data()+18,4);std::memcpy(&height,data.data()+22,4);
+    assert(width==1920 && height==u32(-2));
+    assert(data[54]==10 && data[55]==20 && data[56]==30);
+    std::ifstream metadata(directory/"frame-snapshot-0.json");
+    const std::string text{std::istreambuf_iterator<char>{metadata},std::istreambuf_iterator<char>{}};
+    for(const char* field:{"\"tick_ms\":123","\"source_width\":3840","\"width\":1920",
+                          "\"gamma\":0.8","\"hdr\":false","\"srgb_input\":false","\"mean_encoded_luma\":"})
+        assert(text.find(field)!=std::string::npos);
+    job.bgra=false;assert(Vulkan::FrameSnapshotWriter::Save(job,1));
+    std::ifstream other(directory/"frame-snapshot-1.bmp",std::ios::binary);
+    other.seekg(54);std::array<u8,3> color;assert(other.read(reinterpret_cast<char*>(color.data()),3));
+    assert((color==std::array<u8,3>{30,20,10}));
+    job.width=4097;assert(!Vulkan::FrameSnapshotWriter::Save(job,2));
+    std::puts("4K source snapshot bound/downscale/BGRA-RGBA conversion/color metadata PASS");
+}
+
+static void snapshot_worker(const std::filesystem::path& directory) {
+    using namespace Vulkan;
+    std::filesystem::create_directories(directory);
+    const auto bmp=directory/"frame-snapshot-0.bmp";std::filesystem::remove(bmp);
+    Instance instance(0,false);
+    vk::SemaphoreTypeCreateInfo timeline{.semaphoreType=vk::SemaphoreType::eTimeline};
+    auto [result,semaphore]=instance.GetDevice().createSemaphoreUnique({.pNext=&timeline});
+    assert(result==vk::Result::eSuccess);
+    VkBuffer buffer{};VmaAllocation allocation{};VmaAllocationInfo mapping{};
+    const VkBufferCreateInfo bi{.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=32,.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    const VmaAllocationCreateInfo ai{.flags=VMA_ALLOCATION_CREATE_MAPPED_BIT|VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+        .usage=VMA_MEMORY_USAGE_AUTO,.requiredFlags=VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+    assert(vmaCreateBuffer(instance.GetAllocator(),&bi,&ai,&buffer,&allocation,&mapping)==VK_SUCCESS);
+    std::memset(mapping.pMappedData,127,32);
+    {
+        FrameSnapshotWriter writer(instance.GetDevice(),instance.GetAllocator());
+        const auto start=std::chrono::steady_clock::now();
+        writer.Submit({.buffer=buffer,.allocation=allocation,.pixels=mapping.pMappedData,
+            .semaphore=*semaphore,.gpu_tick=1,.tick=456,.width=4,.height=2,.bgra=true,.directory=directory});
+        assert(std::chrono::steady_clock::now()-start<std::chrono::milliseconds(100));
+        assert(!std::filesystem::exists(bmp)); // Worker cannot read before timeline completion.
+        assert(instance.GetDevice().signalSemaphore({.semaphore=*semaphore,.value=1})==vk::Result::eSuccess);
+    }
+    assert(std::filesystem::exists(bmp));
+    std::puts("Asynchronous screenshot timeline wait / producer returns before GPU / drain ownership PASS");
+}
+
+static void registry_changes() {
+    using namespace VideoCore;
+    RegistryChanges journal;
+    const std::array ranges{RegistryRange{100,200},RegistryRange{400,500}};
+    u64 generation=0;
+    assert(journal.Unchanged(generation,ranges));
+    journal.Record({200,400}); // Adjacent surfaces do not invalidate either texture.
+    assert(journal.Unchanged(generation,ranges) && generation==1);
+    journal.Record({1000,2000});
+    assert(journal.Unchanged(generation,ranges) && generation==2);
+    journal.Record({199,201}); // Registration or removal touching a cached surface misses.
+    assert(!journal.Unchanged(generation,ranges) && generation==2);
+    generation=journal.Generation();
+    for(size_t i=0;i<RegistryChanges::Capacity;++i) journal.Record({1000,2000});
+    const auto before=generation;
+    assert(journal.Unchanged(generation,ranges));
+    journal.Record({1000,2000});
+    u64 expired=before;
+    assert(!journal.Unchanged(expired,ranges) && expired==before);
+    u64 invalid=~u64(0); assert(!journal.Unchanged(invalid,ranges));
+    assert(!RegistryRange{}.Overlaps(ranges[0]));
+    // Compare the bounded algorithm to a conservative complete change history.
+    RegistryChanges checked; std::vector<RegistryRange> history;
+    for(u64 i=0;i<256;++i) {
+        const auto change=RegistryRange::FromSize((i*73)%1500,1+i%32);
+        checked.Record(change); history.push_back(change);
+        for(u64 distance=0;distance<=65 && distance<=history.size();++distance) {
+            u64 token=checked.Generation()-distance;
+            bool expected=distance<=RegistryChanges::Capacity;
+            for(size_t j=token;j<history.size();++j)
+                for(const auto& range:ranges) if(history[j].Overlaps(range)) expected=false;
+            const bool actual=checked.Unchanged(token,ranges);
+            assert(actual==expected);
+            if(actual) assert(token==checked.Generation());
+        }
+    }
+    // Texture alias lookups must include both the requested and backing regions.
+    RegistryChanges aliases;
+    const std::array alias_ranges{RegistryRange{100,1200}};
+    u64 token=0; aliases.Record({1100,1200});
+    assert(!aliases.Unchanged(token,alias_ranges));
+    std::puts("Scoped texture registry reuse: unrelated/overlap/alias/history overflow PASS");
+}
+
+static void runtime_cache(const std::filesystem::path& directory) {
+    using namespace Vulkan;
+    std::filesystem::create_directories(directory);
+    const auto source=directory/"all_shaders.xpps";
+    const std::vector<u8> original{'K','C','A','P',1,2,3,4};
+    { std::ofstream file(source,std::ios::binary); file.write(reinterpret_cast<const char*>(original.data()),original.size()); }
+    _putenv_s("BB_GAME_PROFILE","infamous"); _putenv_s("BB_SHADER_SOURCE",source.string().c_str());
+    BbGpuConfig config{}; config.serial="TEST-BUNDLE"; Core::Emulator::FillElfInfo(config);
+    Instance instance(0,false); Scheduler scheduler(instance); AmdGpu::Liverpool liverpool;
+    auto& database=Storage::DataBase::Instance();
+    constexpr u64 pgm_hash=0x1234;
+    const ComputePipelineKey key{HashCombine(pgm_hash,size_t{0})};
+    {
+        PipelineCache cache(instance,scheduler,&liverpool,0);
+        database.Clear(); // Only the synthetic TEST-BUNDLE title cache.
+        std::vector<u8> profile(sizeof(Shader::Profile));
+        std::memcpy(profile.data(),&cache.GetProfile(),profile.size());
+        assert(database.Save(Storage::BlobType::ShaderProfile,"profile",std::move(profile)));
+        Shader::Info info{}; info.hw_stage=Shader::HwStage::Compute; info.sw_stage=Shader::SwStage::Compute;
+        info.pgm_hash=pgm_hash;
+        Shader::RuntimeInfo runtime{}; runtime.Initialize(info.hw_stage,info.sw_stage);
+        runtime.hw.cs.workgroup_size={1,1,1};
+        Common::ObjectPool<Shader::IR::Inst> pool; Shader::IR::Block block(pool);
+        Shader::IR::IREmitter ir(block); ir.Epilogue();
+        Shader::IR::Program program(info); program.blocks.push_back(&block);
+        program.syntax_list.push_back({.data={.block=&block},.type=Shader::IR::AbstractSyntaxNode::Type::Block});
+        program.syntax_list.push_back({.type=Shader::IR::AbstractSyntaxNode::Type::Return});
+        Shader::Backend::Bindings bindings{};
+        auto spv=Shader::Backend::SPIRV::EmitSPIRV(cache.GetProfile(),runtime,program,bindings);
+        // A nonempty SRT walker is generated by real resource-table shaders.
+        // Exercise its serialization, unlike the previous empty-table fixture.
+        const std::array<u8,1> walker{0xc3}; // x86-64 ret; does not touch guest memory.
+        info.srt_info.walker_func=Shader::RegisterWalkerCode(walker.data(),walker.size());
+        info.srt_info.walker_func_size=walker.size();
+        Shader::StageSpecialization spec{}; spec.info=&info; spec.runtime_info=runtime;
+        RegisterShaderMeta(info,{},spec,key.value,0);
+        RegisterShaderBinary(std::move(spv),pgm_hash,0);
+        ComputePipeline::SerializationSupport sdata{}; RegisterPipelineData(key,sdata);
+        // Close must drain, not discard, the just-enqueued writes.
+        cache.Sync();
+    }
+    {
+        PipelineCache restored(instance,scheduler,&liverpool,0);
+        assert(restored.NumCachedPrograms()==1 && restored.NumCachedComputePipelines()==1);
+        restored.Sync();
+    }
+    // The synthetic source was read-only throughout caching/preload.
+    std::vector<u8> after(original.size()); std::ifstream input(source,std::ios::binary);
+    assert(input.read(reinterpret_cast<char*>(after.data()),after.size()) && after==original);
+    std::puts("Engine runtime compile-output packaging / drained close / real Vulkan startup prewarm / source read-only PASS");
+}
+
+static void cache_guards() {
+    // SysV ABI walker: load one user-data word and write the flattened table.
+    const std::array<u8,5> code{0x8b,0x07,0x89,0x06,0xc3};
+    Shader::PersistentSrtInfo original_srt{};
+    original_srt.walker_func=Shader::RegisterWalkerCode(code.data(),code.size());
+    original_srt.walker_func_size=code.size();
+    Serialization::Archive srt_ar; original_srt.Serialize(srt_ar);
+    const auto saved_srt=srt_ar.TakeOff();
+    assert(saved_srt.size()==sizeof(original_srt)+code.size());
+    Serialization::Archive valid_srt{std::vector<u8>(saved_srt)};
+    Shader::PersistentSrtInfo restored{}; assert(restored.Deserialize(valid_srt));
+    assert(restored.walker_func_size==code.size() && restored.walker_func!=original_srt.walker_func);
+    std::array<u32,16> user{},flat{}; user[0]=0x12345678;
+    restored.walker_func(user.data(),flat.data()); assert(flat[0]==user[0]);
+    Serialization::Archive truncated_srt{std::vector<u8>(saved_srt.begin(),saved_srt.end()-1)};
+    bool invalid_srt=false;
+    try { Shader::PersistentSrtInfo broken{}; broken.Deserialize(truncated_srt); }
+    catch(const std::runtime_error&) { invalid_srt=true; }
+    assert(invalid_srt);
+    // Corrupt legacy cache blobs must reject before any read/allocation.
+    for(size_t size=0;size<sizeof(u64);++size) {
+        Serialization::Archive ar{std::vector<u8>(size)}; Serialization::Reader reader(ar);
+        u64 value; bool rejected=false;
+        try { reader.Read(value); } catch(const std::runtime_error&) { rejected=true; }
+        assert(rejected);
+    }
+    Serialization::Archive ar;
+    Serialization::Writer writer(ar); writer.Write(std::numeric_limits<size_t>::max());
+    Serialization::Reader reader(ar);
+    std::string value; bool rejected=false;
+    try { reader.Read(value); } catch(const std::runtime_error&) { rejected=true; }
+    assert(rejected && value.empty());
+    Serialization::Archive vector_ar;
+    Serialization::Writer vector_writer(vector_ar); vector_writer.Write(std::numeric_limits<size_t>::max());
+    Serialization::Reader vector_reader(vector_ar); std::vector<u32> values; rejected=false;
+    try { vector_reader.Read(values); } catch(const std::runtime_error&) { rejected=true; }
+    assert(rejected && values.empty());
+    // Regular and prepared paths hash the same current table. In-place T#
+    // rewrites without register packets must invalidate the binding key.
+    Shader::Info info{}; Shader::ImageResource resource{};
+    resource.sharp_fetch.load_mask=255;
+    for(u32 i=0;i<8;++i) resource.sharp_fetch.offsets[i]=i;
+    auto image=AmdGpu::Image::Null(false); image.width=127;
+    info.flattened_ud_buf.resize(8);
+    std::memcpy(info.flattened_ud_buf.data(),&image,sizeof(image));
+    const auto original=Vulkan::ImageDescHash(resource.GetSharp(info),resource);
+    assert(original==Vulkan::ImageDescHash(image,resource));
+    image.width=255; std::memcpy(info.flattened_ud_buf.data(),&image,sizeof(image));
+    assert(original!=Vulkan::ImageDescHash(resource.GetSharp(info),resource));
+    resource.is_array=true;
+    assert(Vulkan::ImageDescHash(image,resource)!=Vulkan::ImageDescHash(image,Shader::ImageResource{}));
+    std::puts("Truncated/oversized cache rejection and mutable resource-table key invalidation PASS");
+}
+
+static void shader_bundle(const std::filesystem::path& directory) {
+    using Storage::ShaderBundle;
+    const ShaderBundle::Blobs blobs{{"0xabc_0.spv",{3,2,35,7}}, {"profile.bin",{1,2}},
+                                   {"0xabc_0.meta",{8}}, {"0xabc.key",{9}}};
+    const auto data=ShaderBundle::Encode(123,blobs);
+    ShaderBundle::Blobs decoded;
+    assert(!data.empty() && ShaderBundle::Decode(data,123,decoded) && decoded==blobs);
+    for(size_t i=0;i<data.size();++i) {
+        auto damaged=data; damaged[i]^=128;
+        assert(!ShaderBundle::Decode(damaged,123,decoded));
+        assert(decoded==blobs); // Rejection is transactional.
+        assert(!ShaderBundle::Decode(std::span{data}.first(i),123,decoded));
+    }
+    assert(!ShaderBundle::Decode(data,456,decoded));
+    assert(ShaderBundle::Encode(123,{{"../game.xpps",{1}}}).empty());
+    std::filesystem::create_directories(directory);
+    const auto path=directory/"bundle.vkpack";
+    {
+        ShaderBundle bundle(path,123); bundle.Clear();
+        for(const auto& [name,blob]:blobs) assert(bundle.Put(name,blob));
+        assert(bundle.Put("empty.spv",{}));
+        assert(!bundle.Put("../../eboot.bin",{ }));
+        const std::vector<u8> oversized(ShaderBundle::Limit);
+        assert(!bundle.Put("oversized.spv",oversized));
+        assert(bundle.Save());
+        bundle.Start();
+        std::thread producer([&] { for(unsigned i=0;i<100;++i) {
+            const std::array<u8,1> bytes{u8(i)}; assert(bundle.Put("live.meta",bytes));
+        }});
+        for(unsigned i=0;i<10;++i) assert(bundle.Save());
+        producer.join(); bundle.Stop();
+    }
+    {
+        ShaderBundle bundle(path,123); assert(bundle.Load());
+        std::vector<u8> blob; assert(bundle.Get("live.meta",blob) && blob==std::vector<u8>{99});
+        assert(bundle.Get("empty.spv",blob) && blob.empty());
+        bundle.Clear(); assert(bundle.Save()); assert(!bundle.Get("0xabc_0.spv",blob));
+    }
+    ShaderBundle empty(path,123); assert(empty.Load() && empty.Snapshot().empty());
+    ShaderBundle wrong_source(path,456); assert(!wrong_source.Load());
+    std::puts("Runtime shader package round-trip/corruption/source isolation/capacity/concurrent save PASS");
+}
+
+static void driver_cache(const std::filesystem::path& directory) {
+    using namespace Vulkan;
+    Instance instance(0,false);
+    std::filesystem::create_directories(directory);
+    const auto path=directory/"driver.vkc";
+    { DriverPipelineCache cache(instance,path); cache.Dirty(); assert(cache.Save()); }
+    const auto size=std::filesystem::file_size(path);
+    assert(size>=56);
+    std::vector<u8> bytes(size); std::ifstream file(path,std::ios::binary);
+    assert(file.read(reinterpret_cast<char*>(bytes.data()),size)); file.close();
+    const auto valid=[&](const std::vector<u8>& data) {
+        return DriverPipelineCache::Compatible(data,instance.GetVendorID(),instance.GetDeviceID(),
+                    instance.GetDriverVersion(),instance.GetPipelineCacheUUID());
+    };
+    assert(valid(bytes));
+    assert(!DriverPipelineCache::Compatible(bytes,instance.GetVendorID()+1,instance.GetDeviceID(),
+                    instance.GetDriverVersion(),instance.GetPipelineCacheUUID()));
+    assert(!DriverPipelineCache::Compatible(bytes,instance.GetVendorID(),instance.GetDeviceID(),
+                    instance.GetDriverVersion()+1,instance.GetPipelineCacheUUID()));
+    { DriverPipelineCache restored(instance,path); assert(restored.LoadedBytes()==size); }
+    bytes.back()^=1; assert(!valid(bytes));
+    { std::ofstream corrupt(path,std::ios::binary|std::ios::trunc);
+      corrupt.write(reinterpret_cast<const char*>(bytes.data()),bytes.size()); }
+    { DriverPipelineCache fallback(instance,path); assert(fallback.LoadedBytes()==0);
+      fallback.Dirty(); assert(fallback.Save()); }
+    { DriverPipelineCache restored(instance,path); assert(restored.LoadedBytes()>=56); }
+    std::puts("Real Vulkan driver cache persistence/device-driver validation/corruption fallback PASS");
+}
 
 static void mouse_motion_input() {
     BbMouseMotionInput input;
@@ -45,7 +423,61 @@ static void mouse_motion_input() {
     event.key.key=SDLK_F7; input.Event(event,42,true); input.Read(&sample);
     assert(sample.active && sample.reset==generation+1);
     event.key.key=SDLK_ESCAPE; input.Event(event,42,true); assert(!input.Active());
+    const auto key = [&](SDL_Keycode code) {
+        SDL_Event e{}; e.type=SDL_EVENT_KEY_DOWN; e.key.windowID=42; e.key.key=code;
+        input.Event(e,42,true);
+    };
+    const auto button = [&](bool down, Uint8 which) {
+        SDL_Event e{}; e.type=down ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
+        e.button.windowID=42; e.button.button=which; input.Event(e,42,true);
+    };
+    const auto move = [&](float dx, float dy) {
+        SDL_Event e{}; e.type=SDL_EVENT_MOUSE_MOTION; e.motion.windowID=42;
+        e.motion.xrel=dx; e.motion.yrel=dy; input.Event(e,42,true);
+    };
+    key(SDLK_F8); assert(input.TouchActive() && input.Captured() && !input.Active());
+    event={}; event.type=SDL_EVENT_KEY_DOWN; event.key.windowID=42; event.key.key=SDLK_F8;
+    event.key.repeat=true; input.Event(event,42,true); assert(input.TouchActive());
+    // Entire swipe occurs before the guest polls. Contact origin, endpoint and release survive.
+    button(true,SDL_BUTTON_LEFT); move(100,-50); move(50,-25); button(false,SDL_BUTTON_LEFT);
+    input.Read(&sample); const auto first_id=sample.touch_id;
+    assert(sample.touch_active && sample.touch_down && !sample.touch_click && !sample.left && !sample.active);
+    assert(sample.touch_x==960 && sample.touch_y==471);
+    input.Read(&sample); assert(sample.touch_down && sample.touch_x==1260 && sample.touch_y==321 && sample.touch_id==first_id);
+    input.Read(&sample); assert(!sample.touch_down && !sample.touch_click);
+    input.Read(&sample); assert(!sample.touch_down);
+    // A click has a distinct contact identifier, and is independent of touching the surface.
+    button(true,SDL_BUTTON_RIGHT); button(false,SDL_BUTTON_RIGHT);
+    input.Read(&sample); assert(sample.touch_down && sample.touch_click && sample.touch_id!=first_id);
+    input.Read(&sample); assert(!sample.touch_down && !sample.touch_click);
+    for (const auto delta : std::array<std::array<float,2>,4>{{{200,0},{-200,0},{0,100},{0,-100}}}) {
+        key(SDLK_F7); button(true,SDL_BUTTON_LEFT); move(delta[0],delta[1]);
+        input.Read(&sample); const auto id=sample.touch_id;
+        input.Read(&sample); assert(sample.touch_down && sample.touch_id==id);
+        assert(sample.touch_x==static_cast<unsigned>(960+delta[0]*2));
+        assert(sample.touch_y==static_cast<unsigned>(471+delta[1]*2));
+        button(false,SDL_BUTTON_LEFT); input.Read(&sample); assert(!sample.touch_down);
+    }
+    key(SDLK_F7); button(true,SDL_BUTTON_LEFT); move(1e6f,-1e6f); move(NAN,INFINITY);
+    input.Read(&sample); input.Read(&sample); assert(sample.touch_x==1919 && sample.touch_y==0);
+    // Coalescing thousands of mouse events keeps the gesture bounded and avoids long input lag.
+    for (unsigned i=0;i<10000;++i) move(-.01f,.01f);
+    button(false,SDL_BUTTON_LEFT); input.Read(&sample); assert(sample.touch_down);
+    input.Read(&sample); assert(!sample.touch_down);
+    key(SDLK_F6); assert(input.Active() && !input.TouchActive());
+    key(SDLK_F8); assert(input.TouchActive() && !input.Active());
+    button(true,SDL_BUTTON_LEFT); input.Release(); input.Read(&sample);
+    assert(!sample.touch_active && !sample.touch_down && !sample.touch_click && !input.Captured());
+    key(SDLK_F8); button(true,SDL_BUTTON_RIGHT); input.Event(event,42,false); input.Read(&sample);
+    assert(!sample.touch_active && !sample.touch_down && !sample.touch_click);
+    key(SDLK_F8); button(true,SDL_BUTTON_LEFT); key(SDLK_ESCAPE); input.Read(&sample);
+    assert(!sample.touch_active && !sample.touch_down);
+    key(SDLK_F8); event={}; event.type=SDL_EVENT_MOUSE_BUTTON_DOWN;
+    event.button.windowID=99; event.button.button=SDL_BUTTON_LEFT; input.Event(event,42,true);
+    input.Read(&sample); assert(!sample.touch_down);
+    key(SDLK_F8); assert(!input.TouchActive() && !input.Captured());
     std::puts("Mouse motion: toggle, repeat suppression, window isolation, deltas, buttons, focus/menu release PASS");
+    std::puts("Mouse touchpad: taps, four-way swipe, short gesture edges, click separation, IDs, bounds, mode isolation PASS");
 }
 
 static void stencil_reference() {
@@ -127,6 +559,12 @@ static void frame_capture(const std::filesystem::path& directory) {
     float constants[256]{};
     for(unsigned i=0;i<300;++i) FrameCapture::Buffer(0x123,i,0x400000,constants,sizeof(constants));
     FrameCapture::Draw(0x123,0x456,3,1);
+    // Discarded geometry draws must not starve the following compute constants.
+    for(u32 i=0;i<200;++i) {
+        FrameCapture::Buffer(0x123,0,0x400000,constants,sizeof(constants));
+        FrameCapture::Draw(0x123,0x456,3,1);
+    }
+    FrameCapture::Buffer(0x789,0,0x900000,constants,16);
     FrameCapture::Dispatch(0x789,4,2,1);
     FrameCapture::BeginPass(&display_ptr,1,nullptr);
     assert(!FrameCapture::Active());
@@ -137,8 +575,9 @@ static void frame_capture(const std::filesystem::path& directory) {
     std::ifstream input(report); const std::string text((std::istreambuf_iterator<char>(input)),{});
     assert(text.find("DEBUG_FRAME_BEGIN")!=std::string::npos);
     assert(text.find("truncated=1")!=std::string::npos);
-    assert(text.find("PASS draws 2 (indices 75)")!=std::string::npos);
+    assert(text.find("PASS draws 202 (indices 675)")!=std::string::npos);
     assert(text.find("COMPUTE dispatches 1")!=std::string::npos);
+    assert(text.find("buffer stage 0000000000000789 slot 0 at 0x900000 size 16")!=std::string::npos);
     assert(text.find("samples 0x100000")!=std::string::npos);
     assert(text.find("DEBUG_FRAME_END passes=3")!=std::string::npos);
     assert(text.size()<2*1024*1024);
@@ -191,7 +630,8 @@ static void diagnostic_ring(const std::filesystem::path& directory) {
     const auto io_elapsed=std::chrono::steady_clock::now()-io_start;
     release=true; io_holder.join();
     assert(io_elapsed<std::chrono::milliseconds(500));
-    BbFrameMetrics::History history;
+    const auto history_storage=std::make_unique<BbFrameMetrics::History>();
+    auto& history=*history_storage;
     BbFrameMetrics::Counters values{}; values[0]=10;
     history.Push(1000000000,1000,values);
     values[0]=17; history.Push(1016000000,1016,values);
@@ -345,8 +785,65 @@ static void textures() {
     }
     vmaDestroyBuffer(instance.GetAllocator(),staging,allocation);
 }
+static void image_read_memo() {
+    using namespace Vulkan;
+    Instance instance(0,false); Scheduler scheduler(instance); Runtime runtime(instance,scheduler);
+    Common::SlotVector<VideoCore::ImageView> views;
+    VideoCore::ImageInfo info; info.type=AmdGpu::ImageType::Color2DArray;
+    info.pixel_format=vk::Format::eR8G8B8A8Unorm; info.size={32,32,1};
+    info.resources={6,64}; info.num_bits=32;
+    VideoCore::Image cached(instance,runtime,views,info), reference(instance,runtime,views,info);
+    using Layout=vk::ImageLayout; using Access=vk::AccessFlagBits2; using Stage=vk::PipelineStageFlagBits2;
+    const VideoCore::SubresourceRange range{{1,0},{5,64}};
+    VideoCore::Image::Barriers actual,expected;
+    const auto check=[&](Layout layout,vk::AccessFlags2 access,vk::PipelineStageFlags2 stage,
+                         std::optional<VideoCore::SubresourceRange> subset) {
+        actual.clear(); expected.clear();
+        cached.GetBarriers(actual,layout,access,stage,subset);
+        reference.GetBarriers(expected,layout,access,stage,subset,false);
+        assert(actual.size()==expected.size());
+        for(size_t i=0;i<actual.size();++i) {
+            auto a=actual[i],b=expected[i]; a.image=b.image;
+            assert(a==b);
+        }
+    };
+    check(Layout::eShaderReadOnlyOptimal,Access::eShaderRead,Stage::eAllCommands,range);
+    assert(!actual.empty());
+    check(Layout::eShaderReadOnlyOptimal,Access::eShaderRead,Stage::eAllCommands,range);
+    assert(actual.empty());
+    check(Layout::eGeneral,Access::eShaderWrite,Stage::eComputeShader,range);
+    check(Layout::eShaderReadOnlyOptimal,Access::eShaderRead,Stage::eAllCommands,range);
+    assert(!actual.empty()); // First read after write must still synchronize.
+    check(Layout::eShaderReadOnlyOptimal,Access::eShaderRead,Stage::eFragmentShader,range);
+    check(Layout::eTransferDstOptimal,Access::eTransferWrite,Stage::eTransfer,{});
+    check(Layout::eShaderReadOnlyOptimal,Access::eShaderRead,Stage::eAllCommands,range);
+    check(Layout::eShaderReadOnlyOptimal,Access::eShaderRead,Stage::eAllCommands,VideoCore::SubresourceRange{{0,0},{1,1}});
+    check(Layout::eShaderReadOnlyOptimal,Access::eShaderRead,Stage::eAllCommands,{});
+    check(Layout::eShaderReadOnlyOptimal,Access::eShaderRead,Stage::eAllCommands,range);
+    const auto bench=[&](bool memo) {
+        const auto begin=std::chrono::steady_clock::now();
+        for(unsigned i=0;i<10000;++i) {
+            cached.GetBarriers(actual,Layout::eShaderReadOnlyOptimal,Access::eShaderRead,
+                               Stage::eAllCommands,range,memo);
+        }
+        return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
+    };
+    const double baseline=bench(false), optimized=bench(true);
+    std::printf("Image partial-read barrier equivalence PASS; 10000 repeated reads: baseline %.3f ms, memo %.3f ms\n",baseline,optimized);
+}
 int main(int argc,char** argv) {
-    if (argc==2 && !std::strcmp(argv[1],"--irq")) irq_controller();
+    if (argc==2 && !std::strcmp(argv[1],"--flat-data-visibility")) flat_visibility();
+    else if (argc==2 && !std::strcmp(argv[1],"--flat-data-memo")) flat_memo();
+    else if (argc==2 && !std::strcmp(argv[1],"--texture-set-distribution")) texture_set_distribution();
+    else if (argc==3 && !std::strcmp(argv[1],"--snapshot-pixels")) snapshot_pixels(argv[2]);
+    else if (argc==3 && !std::strcmp(argv[1],"--snapshot-worker")) snapshot_worker(argv[2]);
+    else if (argc==2 && !std::strcmp(argv[1],"--image-read-memo")) image_read_memo();
+    else if (argc==2 && !std::strcmp(argv[1],"--registry-changes")) registry_changes();
+    else if (argc==3 && !std::strcmp(argv[1],"--runtime-cache")) runtime_cache(argv[2]);
+    else if (argc==2 && !std::strcmp(argv[1],"--cache-guards")) cache_guards();
+    else if (argc==3 && !std::strcmp(argv[1],"--shader-bundle")) shader_bundle(argv[2]);
+    else if (argc==3 && !std::strcmp(argv[1],"--driver-cache")) driver_cache(argv[2]);
+    else if (argc==2 && !std::strcmp(argv[1],"--irq")) irq_controller();
     else if (argc==2 && !std::strcmp(argv[1],"--stencil")) stencil_reference();
     else if (argc==2 && !std::strcmp(argv[1],"--mouse-motion")) mouse_motion_input();
     else if (argc==3 && !std::strcmp(argv[1],"--shaders")) shaders(argv[2]);

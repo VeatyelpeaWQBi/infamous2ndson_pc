@@ -91,9 +91,13 @@ inline void Flush(bool force=false) {
     std::unique_lock writer{s.writer_mutex,std::try_to_lock}; if (!writer.owns_lock()) return;
     const u64 now=GetTickCount64();
     if (!force && now-s.last_flush<1000) return;
+    // Allocate off the producer lock; copying the bounded history is the only shared work.
+    const auto frames_storage=std::make_unique<BbFrameMetrics::History>();
     std::unique_lock lock{s.mutex,std::try_to_lock}; if (!lock.owns_lock()) return;
     const auto events=s.events;
-    const auto frames=s.frames;
+    // Expanded numeric histories must not consume a Windows thread's small stack.
+    *frames_storage=s.frames;
+    const auto& frames=*frames_storage;
     std::unique_ptr<BbFrameMetrics::RecordingHistory> recording_frames;
     const auto sequence=s.sequence,presents=s.presents,last_present=s.last_present;
     const auto width=s.width,height=s.height;

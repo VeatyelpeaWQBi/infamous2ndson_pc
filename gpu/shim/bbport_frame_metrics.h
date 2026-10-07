@@ -9,8 +9,9 @@ inline constexpr const char* Columns =
     "draws,dispatches,submissions,command_cpu_ns,compile_count,compile_ns,"
     "image_bytes,buffer_bytes,protect_ns,refresh_ns,staging_ns,"
     "recorder_wait_ns,host_copy_wait_ns,copy_thread_wait_ns,gpu_tick_wait_ns,"
-    "bind_ns,pipeline_select_ns";
-using Counters = std::array<std::uint64_t,17>;
+    "bind_ns,pipeline_select_ns,buffer_bind_ns,texture_bind_ns,sampler_bind_ns,"
+    "texture_set_hits,texture_set_misses,texture_set_revalidated,image_read_memo_hits,image_subresource_checks,flat_data_memo_hits,flat_data_bytes_saved";
+using Counters = std::array<std::uint64_t,27>;
 struct Frame {
     std::uint64_t sequence{}, tick_ms{}, interval_ns{};
     Counters delta{};

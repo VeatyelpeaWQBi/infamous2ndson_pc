@@ -26,6 +26,8 @@ def chunk_fixture(count=71):
 class InfamousNativeTests(unittest.TestCase):
     def test_traditional_chinese_hong_kong_console_parameters(self):
         self.run_case('--console-locale')
+    def test_save_dialog_result_resolves_and_preserves_caller_buffers(self):
+        self.run_case('--save-dialog')
     def run_case(self,*args):
         result=subprocess.run([str(EXE.resolve()),*args],capture_output=True,text=True,timeout=15)
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)

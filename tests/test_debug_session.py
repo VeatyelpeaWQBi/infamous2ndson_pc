@@ -122,7 +122,7 @@ class NativeDiagnosticsTests(unittest.TestCase):
             self.assertEqual(log.count('DEBUG_MARK'),3)
             self.assertEqual(log.count('F10 performance mark saved'),3)
             self.assertNotIn('F10 thread snapshot signaled',log)
-            self.assertFalse((session/'capture-next').exists())
+            self.assertTrue((session/'capture-next').exists())
             self.assertFalse((session/'render-frame-request').exists())
 
     def test_explicit_deep_f10_retains_threads_and_render_capture(self):
@@ -157,3 +157,7 @@ class NativeDiagnosticsTests(unittest.TestCase):
             samples=[list(map(int,line.split())) for line in lines if not line.startswith('#')]
             self.assertTrue(all(len(sample)==10 for sample in samples))
             self.assertTrue(any(sample[2] for sample in samples))
+            touch=[line for line in lines if line.startswith('# TOUCH ')]
+            self.assertTrue(any('down=1 click=0' in line and 'x=1234 y=567' in line for line in touch))
+            self.assertTrue(any('down=1 click=1' in line for line in touch))
+            self.assertTrue(any('down=0 click=0' in line for line in touch))

@@ -39,22 +39,37 @@ struct Entry {
 // GPU thread only.
 std::vector<Entry> entries;
 std::vector<std::pair<Target, bool>> pending_sampled;
-std::vector<std::string> pending_buffers;
+struct PendingBuffer {
+    u64 stage{},address{},size{},captured{}; u32 slot{};
+    std::array<float,256> words{};
+};
+std::vector<PendingBuffer> pending_buffers;
+size_t buffer_bytes = 0;
+size_t geometry_buffer_bytes = 0;
+bool truncated = false;
+constexpr size_t MaxEntries = 256, MaxBufferBytes = 128 * 1024;
 
-void AddBuffers(Entry& entry) {
+void AddBuffers(Entry& entry,bool priority=false) {
     // Constants of full-screen passes (post-processing: camera matrices) and of the first draw
     // of each geometry pass.
     if (entry.draws <= 4) {
-        for (auto& b : pending_buffers) {
-            entry.buffers.push_back(std::move(b));
+        for (const auto& b : pending_buffers) {
+            std::string out=std::format("  buffer stage {:016x} slot {} at {:#x} size {}:",b.stage,b.slot,b.address,b.size);
+            for(u64 i=0;i<b.captured/4;++i) {
+                if(i%8==0) out+=std::format("\n    [{:3}]",i);
+                out+=std::format(" {:12.6g}",b.words[i]);
+            }
+            if(out.size()>MaxBufferBytes-buffer_bytes) {truncated=true; break;}
+            // Reserve most of the existing bounded budget for compute/fullscreen
+            // constants so geometry cannot hide exposure/tone-map parameters.
+            if(!priority && out.size()>32*1024-geometry_buffer_bytes) {truncated=true; break;}
+            if(!priority) geometry_buffer_bytes+=out.size();
+            buffer_bytes+=out.size(); entry.buffers.push_back(std::move(out));
         }
     }
     pending_buffers.clear();
 }
 bool pass_open = false;
-bool truncated = false;
-size_t buffer_bytes = 0;
-constexpr size_t MaxEntries = 256, MaxBufferBytes = 128 * 1024;
 std::mutex display_mutex;
 std::vector<VAddr> display_buffers;
 // bbport: read on every draw; the game registers a handful of display buffers once.
@@ -206,6 +221,7 @@ void FrameCapture::BeginPass(const VideoCore::ImageInfo* const* colors, u32 num_
         pending_buffers.clear();
         pass_open = false;
         buffer_bytes = 0;
+        geometry_buffer_bytes = 0;
         truncated = false;
         state.store(Recording, std::memory_order_release);
     }
@@ -237,7 +253,7 @@ void FrameCapture::Draw(u64 vs_hash, u64 ps_hash, u32 num_indices, u32 num_insta
     AddShader(e, vs_hash);
     AddShader(e, ps_hash);
     AddSampled(e);
-    AddBuffers(e);
+    AddBuffers(e,num_indices<=6 && num_instances==1);
 }
 
 void FrameCapture::Dispatch(u64 cs_hash, u32 x, u32 y, u32 z) {
@@ -257,27 +273,20 @@ void FrameCapture::Dispatch(u64 cs_hash, u32 x, u32 y, u32 z) {
         entries.back().note = std::format("groups {}x{}x{}", x, y, z);
     }
     AddSampled(entries.back());
-    AddBuffers(entries.back());
+    AddBuffers(entries.back(),true);
     pass_open = false;
 }
 
 void FrameCapture::Buffer(u64 stage_hash, u32 slot, VAddr address, const void* data, u64 size) {
-    if (pending_buffers.size() >= 16 || buffer_bytes >= MaxBufferBytes) {
+    if (pending_buffers.size() >= 16) {
         truncated = true; return;
     }
     const u64 bytes = std::min<u64>(size, 1024) & ~u64(3);
-    std::string out = std::format("  buffer stage {:016x} slot {} at {:#x} size {}:", stage_hash,
-                                  slot, address, size);
-    const auto* words = static_cast<const float*>(data);
-    for (u64 i = 0; i < bytes / 4; ++i) {
-        if (i % 8 == 0) {
-            out += std::format("\n    [{:3}]", i);
-        }
-        out += std::format(" {:12.6g}", words[i]);
-    }
-    if (out.size() > MaxBufferBytes - buffer_bytes) { truncated = true; return; }
-    buffer_bytes += out.size();
-    pending_buffers.push_back(std::move(out));
+    // Formatting/discarded geometry constants used to exhaust the budget before
+    // late post-processing passes. Snapshot bytes now; format only retained draws.
+    PendingBuffer pending{.stage=stage_hash,.address=address,.size=size,.captured=bytes,.slot=slot};
+    if(bytes) std::memcpy(pending.words.data(),data,bytes);
+    pending_buffers.push_back(std::move(pending));
 }
 
 void FrameCapture::Sampled(const VideoCore::ImageInfo& info, bool storage) {

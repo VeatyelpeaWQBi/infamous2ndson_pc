@@ -39,6 +39,9 @@ int bbgpu_overlay_captures_input(void);
 typedef struct {
     float dx, dy;
     uint32_t active, left, reset;
+    uint32_t touch_active, touch_down, touch_click;
+    uint16_t touch_x, touch_y;
+    uint8_t touch_id;
 } BbMouseMotion;
 void bbgpu_mouse_motion_read(BbMouseMotion *state);
 /* Number of symbols registered by the vendored libraries (diagnostics). */

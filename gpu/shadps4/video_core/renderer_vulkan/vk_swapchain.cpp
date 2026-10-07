@@ -218,6 +218,8 @@ void Swapchain::FindPresentMode() {
                     vk::to_string(present_mode), vk::to_string(fallback));
         present_mode = fallback;
     }
+    std::fprintf(stderr,"PRESENT_MODE mode=%s synchronized=%d\n",vk::to_string(present_mode).c_str(),
+        present_mode==vk::PresentModeKHR::eMailbox || present_mode==vk::PresentModeKHR::eFifo);
 }
 
 void Swapchain::SetSurfaceProperties() {

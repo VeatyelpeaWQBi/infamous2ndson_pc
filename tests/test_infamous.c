@@ -314,6 +314,39 @@ static void np_subscriptions(void) {
     assert((uint32_t)account(1,NULL)==0x80550003);
     puts("PASS: NP A subscription identity and explicit signed-out account state");
 }
+static void save_dialog_contract(void) {
+    typedef struct {
+        uint64_t base_size; uint8_t base_reserved[36]; uint32_t magic;
+        int32_t size; uint32_t mode,display,padding;
+        const void *animation,*items,*user_message,*system_message,*error,*progress;
+        void *user_data; const void *option; uint8_t reserved[24];
+    } Param;
+    typedef struct { uint32_t mode,result,button,padding; void *directory,*param,*user_data; uint8_t reserved[32]; } Result;
+    typedef int32_t (ABI *Action)(void);
+    typedef int32_t (ABI *Open)(const Param *);
+    typedef int32_t (ABI *GetResult)(Result *);
+    #define SD(n) n "#libSceSaveDataDialog:1#libSceSaveDataDialog:257#F"
+    Action init=GET(Action,SD("s9e3+YpRnzw")),status=GET(Action,SD("KK3Bdg1RWK0")),term=GET(Action,SD("YuH2FA7azqQ"));
+    Open open=GET(Open,SD("4tPhsP6FpDI")); GetResult result=GET(GetResult,SD("yEiJ-qqr6Cg"));
+    assert(init && open && status && term && result);
+    assert((uint32_t)result(NULL)==0x80B80005);
+    assert(init()==0 && status()==1 && (uint32_t)init()==0x80B80004);
+    assert((uint32_t)open(NULL)==0x80B8000d);
+    Param p={.base_size=48,.size=sizeof(Param),.mode=4,.user_data=(void *)0x1234};
+    struct { Result result; uint64_t guard; } box;
+    memset(&box,0xcc,sizeof(box)); box.result.directory=(void *)0x1111; box.result.param=(void *)0x2222;
+    assert(open(&p)==0 && status()==3 && (uint32_t)result(NULL)==0x80B8000d);
+    assert(result(&box.result)==0 && box.result.mode==4 && box.result.result==0 && box.result.button==1);
+    assert(box.result.user_data==p.user_data && box.result.directory==(void *)0x1111 && box.result.param==(void *)0x2222);
+    assert(box.guard==UINT64_C(0xcccccccccccccccc) && box.result.reserved[0]==0xcc);
+    uint32_t overwrite=3; p.mode=3; p.system_message=&overwrite;
+    assert(open(&p)==0 && result(&box.result)==0 && box.result.result==1 && box.result.button==2);
+    p.mode=1; assert((uint32_t)open(&p)==0x80B8000f);
+    assert(term()==0 && status()==0 && (uint32_t)result(&box.result)==0x80B80005);
+    assert((uint32_t)term()==0x80B80003 && init()==0); p.mode=5;
+    assert(open(&p)==0 && result(&box.result)==0 && box.result.mode==5 && term()==0);
+    puts("PASS: SaveDataDialog GetResult identity, ABI, lifecycle and non-destructive acknowledgement");
+}
 int main(int argc,char **argv) {
     runtime_start(1);
     if (argc>1 && !strcmp(argv[1],"--identities")) identities();
@@ -330,6 +363,7 @@ int main(int argc,char **argv) {
     else if (argc>1 && !strcmp(argv[1],"--thread-priority")) thread_priority_attribute();
     else if (argc>1 && !strcmp(argv[1],"--http-timeouts")) http_timeouts();
     else if (argc>1 && !strcmp(argv[1],"--np-subscriptions")) np_subscriptions();
+    else if (argc>1 && !strcmp(argv[1],"--save-dialog")) save_dialog_contract();
     else if (argc>1 && !strcmp(argv[1],"--bad-heap-trace")) {
         TraceInfo info={.size=31}; GET(GetTrace,TRACE)(&info); return 3;
     }

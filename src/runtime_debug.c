@@ -77,15 +77,20 @@ void runtime_debug_mark(void) {
     }
     LeaveCriticalSection(&debug_lock);
     fprintf(stderr,"DEBUG_MARK tick_ms=%llu: F10 received on window event thread\n",(unsigned long long)tick);
+    char capture[32768]; const char *directory=getenv("BB_DEBUG_DIR");
+    if (directory && strlen(directory)<sizeof(capture)-32) {
+        snprintf(capture,sizeof(capture),"%s/capture-next",directory);
+        FILE *request=fopen(capture,"w");
+        if (request) { fprintf(request,"%llu\n",(unsigned long long)tick); fclose(request); }
+    }
     /* Keep performance marks out of the expensive frame analyzer and thread
      * suspension path. Explicit debug-control snapshot retains deep capture. */
     const char *deep=getenv("BB_F10_DEEP");
-    if (!deep || deep[0]!='1') {
+    if ((!deep || deep[0]!='1') && !(GetAsyncKeyState(VK_CONTROL)&0x8000)) {
         fprintf(stderr,"DEBUG: F10 performance mark saved tick_ms=%llu; see frames.csv\n",(unsigned long long)tick);
         fflush(stderr);
         return;
     }
-    char capture[32768]; const char *directory=getenv("BB_DEBUG_DIR");
     if (directory && strlen(directory)<sizeof(capture)-32) {
         snprintf(capture,sizeof(capture),"%s/capture-next",directory);
         FILE *request=fopen(capture,"w"); if (request) fclose(request);
@@ -113,6 +118,23 @@ void runtime_debug_motion(int active,const float q[4],const float a[3],const flo
         snprintf(line,sizeof(line),"# MOTION %llu %d q=%.6g,%.6g,%.6g,%.6g a=%.6g,%.6g,%.6g w=%.6g,%.6g,%.6g\n",
             (unsigned long long)tick,active,q[0],q[1],q[2],q[3],a[0],a[1],a[2],w[0],w[1],w[2]);
         input_write(line); last_motion=tick; was_active=active;
+    }
+    LeaveCriticalSection(&debug_lock);
+}
+void runtime_debug_touch(int active,int down,int click,uint8_t id,uint16_t x,uint16_t y) {
+    if (!debug_ready()) return;
+    static uint64_t last_touch;
+    static int was_active,was_down,was_click;
+    static uint8_t last_id;
+    const uint64_t tick=GetTickCount64();
+    EnterCriticalSection(&debug_lock);
+    if (enabled && (active!=was_active || down!=was_down || click!=was_click ||
+                    (down && id!=last_id) || (active && tick-last_touch>=50))) {
+        char line[192];
+        snprintf(line,sizeof(line),"# TOUCH %llu active=%d down=%d click=%d id=%u x=%u y=%u\n",
+            (unsigned long long)tick,active,down,click,(unsigned)id,(unsigned)x,(unsigned)y);
+        input_write(line); last_touch=tick;
+        was_active=active; was_down=down; was_click=click; last_id=id;
     }
     LeaveCriticalSection(&debug_lock);
 }

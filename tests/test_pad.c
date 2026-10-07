@@ -141,6 +141,17 @@ int main(int argc,char **argv) {
     assert(pad_motion_state(1,1)==0);
     mouse.active=mouse.left=0;
     assert(pad_read_state(1,&data)==0 && data.buttons==0 && data.r2==0);
+    mouse=(BbMouseMotion){.touch_active=1,.touch_down=1,.touch_x=1234,.touch_y=567,.touch_id=7};
+    assert(pad_read_state(1,&data)==0 && data.touch_count==1 && data.buttons==0 && data.r2==0);
+    assert(data.touches[0].x==1234 && data.touches[0].y==567 && data.touches[0].id==7);
+    assert(pad_read_state(1,&data)==0 && data.touches[0].id==7);
+    mouse.touch_click=1;
+    assert(pad_read_state(1,&data)==0 && data.touch_count==1 && data.buttons==BTN_TOUCHPAD && data.r2==0);
+    mouse.touch_x=65535; mouse.touch_y=65535; mouse.touch_id=255;
+    assert(pad_read_state(1,&data)==0 && data.touches[0].x==1919 && data.touches[0].y==942 && data.touches[0].id==127);
+    mouse.touch_down=mouse.touch_click=0;
+    assert(pad_read_state(1,&data)==0 && data.touch_count==0 && data.buttons==0);
+    mouse=(BbMouseMotion){0};
     char replay_path[MAX_PATH]; test_temp_file(replay_path,sizeof(replay_path));
     FILE *recording=fopen(replay_path,"w"); assert(recording);
     fputs("0 0 128 128 128 128 0 0\n"
@@ -181,9 +192,18 @@ int main(int argc,char **argv) {
     assert(gamepad && data.touch_count==2 && (data.buttons & BTN_TOUCHPAD));
     assert(data.touches[0].x==1439 && data.touches[0].y==471 && data.touches[0].id==0);
     assert(data.touches[1].x==480 && data.touches[1].y==942 && data.touches[1].id==1);
+    assert(SDL_SetJoystickVirtualButton(joystick,SDL_GAMEPAD_BUTTON_TOUCHPAD,false));
+    assert(SDL_SetJoystickVirtualButton(joystick,SDL_GAMEPAD_BUTTON_SOUTH,true));
+    SDL_UpdateJoysticks(); SDL_UpdateGamepads();
+    mouse=(BbMouseMotion){.touch_active=1,.touch_down=1,.touch_x=1000,.touch_y=400,.touch_id=9};
+    assert(pad_read_state(1,&data)==0 && data.touch_count==1 && data.touches[0].id==9 && data.touches[0].x==1000);
+    assert(data.buttons==BTN_CROSS && data.r2==0);
     capture=1;
     assert(pad_read_state(1,&data)==0 && data.touch_count==0 && data.buttons==0);
     capture=0;
+    mouse=(BbMouseMotion){0};
+    assert(SDL_SetJoystickVirtualButton(joystick,SDL_GAMEPAD_BUTTON_SOUTH,false));
+    assert(SDL_SetJoystickVirtualButton(joystick,SDL_GAMEPAD_BUTTON_TOUCHPAD,true));
     assert(SDL_SetJoystickVirtualTouchpad(joystick,0,0,false,0,0,0));
     assert(SDL_SetJoystickVirtualTouchpad(joystick,0,1,false,0,0,0));
     SDL_UpdateJoysticks();

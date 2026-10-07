@@ -20,6 +20,13 @@ def sfo_fixture(title):
 
 
 class GameProfiles(unittest.TestCase):
+    def test_infamous_presentation_is_synchronized_and_memo_override_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for mode in ('Immediate','Mailbox','Fifo','unknown'):
+                env={'BB_PRESENT_MODE':mode,'BB_FLAT_DATA_MEMO':'0'}
+                game_profiles.native_environment({'id':'infamous','title_id':'CUSA00309'},tmp,env)
+                self.assertEqual(env['BB_PRESENT_MODE'],mode if mode in ('Mailbox','Fifo') else 'Mailbox')
+                self.assertEqual(env['BB_FLAT_DATA_MEMO'],'0')
     def test_locale_configuration_is_loaded_and_invalid_values_are_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             path=Path(tmp)/'infamous-locale.json'
@@ -94,6 +101,7 @@ class GameProfiles(unittest.TestCase):
                 self.assertEqual(os.environ['BB_GAME_PROFILE'],'infamous')
                 self.assertEqual(os.environ['BB_DRAW_PIPE'],'0')
                 self.assertEqual(os.environ['BB_PREP_PRIORITY'],'low')
+                self.assertEqual(os.environ['BB_SHADER_SOURCE'],str(data/'art/cache/all_shaders.xpps'))
                 self.assertEqual(os.environ['BB_LANGUAGE'],'10')
                 self.assertEqual(os.environ['BB_REGION'],'HK')
                 self.assertEqual(os.environ['BB_TIMEZONE_MINUTES'],'480')

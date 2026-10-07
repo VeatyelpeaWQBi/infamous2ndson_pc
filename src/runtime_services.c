@@ -304,7 +304,71 @@ static int32_t dialog_term(int i) {
     static ABI int32_t tag##_open(const void *p) { (void)p; return dialog_open(i); } \
     static ABI int32_t tag##_status(void) { return dialog_status(i); } \
     static ABI int32_t tag##_term(void) { return dialog_term(i); }
-DIALOG(msg,1) DIALOG(save,2) DIALOG(profile,3) DIALOG(commerce,4)
+DIALOG(msg,1) DIALOG(profile,3) DIALOG(commerce,4)
+/* SaveDataDialog ABI verified against shadPS4 save_data/dialog/savedatadialog_ui.h.
+ * Headless acknowledgements never perform a save/delete or clear caller-owned result pointers. */
+typedef struct {
+    uint64_t base_size; uint8_t base_reserved[36]; uint32_t magic;
+    int32_t size; uint32_t mode,display_type,padding;
+    const void *animation,*items,*user_message,*system_message,*error_code,*progress;
+    void *user_data; const void *option; uint8_t reserved[24];
+} SaveDialogParam;
+typedef struct {
+    uint32_t mode,result,button,padding;
+    void *directory,*param,*user_data; uint8_t reserved[32];
+} SaveDialogResult;
+_Static_assert(sizeof(SaveDialogParam)==152 && offsetof(SaveDialogParam,user_data)==112,"SaveDataDialog param ABI");
+_Static_assert(sizeof(SaveDialogResult)==72 && offsetof(SaveDialogResult,directory)==16,"SaveDataDialog result ABI");
+static HostMutex save_dialog_lock=HOST_MUTEX_INIT;
+static struct { int status; uint32_t mode,result,button; void *user_data; } save_dialog;
+static ABI int32_t save_init(void) {
+    host_lock(&save_dialog_lock);
+    int32_t error=save_dialog.status ? (int32_t)0x80B80004 : 0;
+    if (!error) save_dialog.status=1;
+    host_unlock(&save_dialog_lock); return error;
+}
+static ABI int32_t save_open(const SaveDialogParam *p) {
+    host_lock(&save_dialog_lock);
+    int32_t error=0;
+    if (save_dialog.status!=1 && save_dialog.status!=3) error=(int32_t)0x80B80006;
+    else if (!p) error=(int32_t)0x80B8000d;
+    else if (p->size!=sizeof(*p) || p->base_size!=48 || p->mode<1 || p->mode>5)
+        error=(int32_t)0x80B8000a;
+    else if (p->mode==1) error=(int32_t)0x80B8000f; /* list selection needs UI; don't invent a save */
+    if (!error) {
+        save_dialog.mode=p->mode; save_dialog.user_data=p->user_data;
+        save_dialog.result=0; save_dialog.button=1;
+        /* An unattended YES/NO prompt must not approve overwrites or deletes. */
+        if ((p->mode==2 && p->user_message && *(const uint32_t *)p->user_message!=0) ||
+            (p->mode==3 && p->system_message &&
+             (*(const uint32_t *)p->system_message==2 || *(const uint32_t *)p->system_message==3))) {
+            save_dialog.result=1; save_dialog.button=2;
+        }
+        save_dialog.status=3;
+        printf("Runtime: SaveDataDialog completed mode=%u result=%u button=%u\n",
+            save_dialog.mode,save_dialog.result,save_dialog.button);
+    }
+    host_unlock(&save_dialog_lock); return error;
+}
+static ABI int32_t save_status(void) {
+    host_lock(&save_dialog_lock); int status=save_dialog.status;
+    host_unlock(&save_dialog_lock); return status;
+}
+static ABI int32_t save_result(SaveDialogResult *out) {
+    host_lock(&save_dialog_lock); int32_t error=0;
+    if (save_dialog.status!=3) error=(int32_t)0x80B80005;
+    else if (!out) error=(int32_t)0x80B8000d;
+    else {
+        out->mode=save_dialog.mode; out->result=save_dialog.result;
+        out->button=save_dialog.button; out->user_data=save_dialog.user_data;
+    }
+    host_unlock(&save_dialog_lock); return error;
+}
+static ABI int32_t save_term(void) {
+    host_lock(&save_dialog_lock);
+    int32_t error=save_dialog.status ? 0 : (int32_t)0x80B80003;
+    memset(&save_dialog,0,sizeof(save_dialog)); host_unlock(&save_dialog_lock); return error;
+}
 static ABI int32_t profile_result(void *result) { if (result) memset(result,0,4); return 0; }
 /* ImeDialog: text typed on the keyboard into the game window (title bar shows it).
  * OrbisImeDialogParam: user, type, languages(8), enter label, method, filter,
@@ -546,6 +610,7 @@ static const RuntimeExport exports[]={
     {"sceMsgDialogUpdateStatus",msg_status}, {"sceMsgDialogTerminate",msg_term},
     {"sceSaveDataDialogInitialize",save_init}, {"sceSaveDataDialogOpen",save_open},
     {"sceSaveDataDialogUpdateStatus",save_status}, {"sceSaveDataDialogTerminate",save_term},
+    {"sceSaveDataDialogGetResult",save_result},
     {"sceNpProfileDialogInitialize",profile_init}, {"sceNpProfileDialogOpen",profile_open},
     {"sceNpProfileDialogUpdateStatus",profile_status}, {"sceNpProfileDialogTerminate",profile_term},
     {"sceNpProfileDialogGetResult",profile_result},

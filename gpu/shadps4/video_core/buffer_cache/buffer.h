@@ -146,6 +146,7 @@ struct StreamBuffer : public Buffer {
     [[nodiscard]] u64 LastTick() const noexcept {
         return last_tick;
     }
+    [[nodiscard]] u64 WrapGeneration() const noexcept { return wrap_generation; }
 
     /// Maps and commits a memory region with user provided data
     u64 Copy(auto src, size_t size, size_t alignment = 0) {
@@ -181,6 +182,7 @@ private:
     u64 offset{};
     u64 mapped_size{};
     u64 last_tick{};
+    u64 wrap_generation{};
     std::vector<Watch> current_watches;
     std::size_t current_watch_cursor{};
     std::optional<size_t> invalidation_mark;

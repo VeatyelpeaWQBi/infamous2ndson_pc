@@ -227,7 +227,23 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
 
 void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                         vk::PipelineStageFlags2 dst_stage,
-                        std::optional<SubresourceRange> subres_range) {
+                        std::optional<SubresourceRange> subres_range, bool allow_read_memo) {
+    auto& memo=backing->read_memo;
+    static const bool enabled=[] {
+        const char* value=std::getenv("BB_IMAGE_READ_MEMO");
+        return !value || value[0]!='0';
+    }();
+    const bool sampled_read=dst_mask==vk::AccessFlagBits2::eShaderRead;
+    // A one-mip/one-layer view is cheaper to check than to compare a memo key.
+    // The independent view-switch benchmark exercises this negative control.
+    const bool memo_worthy=sampled_read && subres_range &&
+        u64(subres_range->extent.levels)*subres_range->extent.layers>=8;
+    if (memo_worthy && enabled && allow_read_memo && memo.valid &&
+        memo.range==subres_range && memo.layout==dst_layout && memo.stage==dst_stage) {
+        if(BbStats::enabled) BbStats::image_read_memo_hits.fetch_add(1,std::memory_order_relaxed);
+        return;
+    }
+    memo.valid=false;
     auto& last_state = backing->state;
     auto& subresource_states = backing->subresource_states;
 
@@ -256,6 +272,8 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                                            subres_range->base.layer + subres_range->extent.layers)
                 : std::views::iota(0u, info.resources.layers);
 
+        if(BbStats::enabled) BbStats::image_subresource_checks.fetch_add(
+            u64(mips.size())*layers.size(),std::memory_order_relaxed);
         for (u32 mip : mips) {
             for (u32 layer : layers) {
                 // NOTE: these loops may produce a lot of small barriers.
@@ -329,6 +347,11 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
     last_state.layout = dst_layout;
     last_state.access_mask = dst_mask;
     last_state.pl_stage = dst_stage;
+    // Full-resource reads already have a constant-time fast path. Cache only
+    // partial state after the normal barrier logic has completed successfully.
+    if (memo_worthy && !subresource_states.empty()) {
+        memo.valid=true; memo.range=subres_range; memo.layout=dst_layout; memo.stage=dst_stage;
+    }
 }
 
 } // namespace VideoCore

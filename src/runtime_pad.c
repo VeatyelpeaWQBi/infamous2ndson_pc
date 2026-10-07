@@ -6,7 +6,8 @@
  *   E Square, Q Triangle, 1 L1, 3 R1, R L2, F R2, Z L3, C R3,
  *   Enter Options, Tab left touchpad, Backspace right touchpad,
  *   IJKL d-pad (I up, K down, J left, L right).
- * F6 mouse motion, F7 center, Esc release, mouse left R2 (window thread). */
+ * F6 mouse motion, F8 touchpad, F7 center, Esc release; motion left R2,
+ * touchpad left drag / right click (window thread). */
 #define _GNU_SOURCE
 #include "runtime.h"
 #include "gpu/bbgpu.h"
@@ -244,6 +245,14 @@ static void sample_mouse_motion(PadData *d) {
         for (int i=0;i<3;++i) if (fabsf(d->angular_velocity[i])<0.001f) d->angular_velocity[i]=0;
     }
     if (input.active && input.left) { d->buttons|=BTN_R2; d->r2=255; }
+    if (input.touch_active && input.touch_down) {
+        d->touch_count=1;
+        d->touches[0]=(PadTouch){.x=input.touch_x>1919 ? 1919 : input.touch_x,
+            .y=input.touch_y>942 ? 942 : input.touch_y,.id=(uint8_t)(input.touch_id&127)};
+        memset(&d->touches[1],0,sizeof(d->touches[1]));
+        if (input.touch_click) d->buttons|=BTN_TOUCHPAD;
+    }
+    runtime_debug_touch(input.touch_active,input.touch_down,input.touch_click,input.touch_id,input.touch_x,input.touch_y);
     if (was_active!=(int)input.active) {
         printf("Runtime: mouse motion %s (F6 toggle, F7 center, Esc release, left click R2)\n",
                input.active ? "enabled" : "disabled");
