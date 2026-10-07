@@ -16,6 +16,44 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include <vk_mem_alloc.h>
+#include "bbport_diagnostics.h"
+#include <thread>
+#include <atomic>
+
+static void diagnostic_ring(const std::filesystem::path& directory) {
+    std::filesystem::create_directories(directory);
+    _putenv_s("BB_DEBUG_DIR",directory.string().c_str());
+    assert(BbDiagnostics::Enabled());
+    std::thread first([] { for (unsigned i=0;i<1500;++i) BbDiagnostics::Record("draw",i,1); });
+    std::thread second([] { for (unsigned i=0;i<1500;++i) BbDiagnostics::Record("dispatch",i,2); });
+    first.join(); second.join();
+    BbDiagnostics::Presented(1920,1080);
+    std::ifstream input(directory/"gpu-recent.txt");
+    std::string line; std::getline(input,line);
+    unsigned count=0; u64 previous=0;
+    while (std::getline(input,line)) {
+        unsigned long long tick,sequence;
+        assert(std::sscanf(line.c_str(),"%llu %llu",&tick,&sequence)==2);
+        assert(sequence>previous); previous=sequence; ++count;
+    }
+    assert(count==512 && previous==3001);
+    std::ifstream heartbeat(directory/"gpu-heartbeat.json");
+    std::getline(heartbeat,line);
+    assert(line.find("\"presents\":1")!=std::string::npos);
+    assert(line.find("\"operations\":3001")!=std::string::npos);
+    // Fault-time flush must not wait on another producer's held mutex.
+    std::atomic<bool> locked=false,release=false;
+    std::thread holder([&] {
+        std::scoped_lock lock{BbDiagnostics::Get().mutex}; locked=true;
+        while (!release) std::this_thread::yield();
+    });
+    while (!locked) std::this_thread::yield();
+    const auto start=std::chrono::steady_clock::now(); BbDiagnostics::Flush(true);
+    const auto elapsed=std::chrono::steady_clock::now()-start;
+    release=true; holder.join();
+    assert(elapsed<std::chrono::milliseconds(500));
+    std::puts("Bounded recent GPU operations / telemetry / fault flush PASS");
+}
 
 static void shaders(const std::filesystem::path& directory) {
     using namespace Shader;
@@ -75,6 +113,24 @@ static void textures() {
     d.init(loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
     d.init(instance.GetInstance()); d.init(instance.GetDevice());
     Scheduler scheduler(instance); Runtime runtime(instance,scheduler);
+    {
+        Scheduler deferred(instance,true);
+        // Oversized copy-region arrays must remain owned until the recording
+        // worker executes them, even after the caller changes its input.
+        std::vector<u64> source(40000);
+        for (size_t i=0;i<source.size();++i) source[i]=i*17+3;
+        const auto captured=deferred.RecordData(std::span<const u64>{source});
+        std::fill(source.begin(),source.end(),0);
+        bool executed=false;
+        deferred.Record([captured,&executed](vk::CommandBuffer) {
+            for (size_t i=0;i<captured.size();++i) assert(captured[i]==i*17+3);
+            executed=true;
+        });
+        deferred.SyncRecording();
+        assert(executed);
+        deferred.Finish();
+        std::puts("Oversized deferred recording data ownership PASS");
+    }
     Common::SlotVector<VideoCore::ImageView> views;
     VkBuffer staging{}; VmaAllocation allocation{}; VmaAllocationInfo mapped{};
     const VkBufferCreateInfo bi{.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=128,
@@ -121,5 +177,6 @@ static void textures() {
 }
 int main(int argc,char** argv) {
     if (argc==3 && !std::strcmp(argv[1],"--shaders")) shaders(argv[2]);
+    else if (argc==3 && !std::strcmp(argv[1],"--diagnostics")) diagnostic_ring(argv[2]);
     else textures();
 }

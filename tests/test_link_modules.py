@@ -11,9 +11,20 @@ from test_probe import package
 
 
 class ScopedModuleTests(unittest.TestCase):
+    def test_thread_pointer_rewrite_preserves_all_registers_and_ignores_other_operands(self):
+        loads=[bytes([0x64,0x48|(4 if reg>=8 else 0),0x8b,4|((reg&7)<<3),0x25,0,0,0,0]) for reg in range(16)]
+        nonzero=bytes.fromhex('64488b0c2510000000')
+        store=bytes.fromhex('644889042500000000')
+        code=b''.join(loads)+nonzero+store
+        image=bytearray(code+code)
+        self.assertEqual(link_modules.patch_fs_loads(image,[dict(type=1,flags=5,vaddr=0,filesz=len(code)),
+            dict(type=1,flags=4,vaddr=len(code),filesz=len(code))],0),16)
+        self.assertEqual(image[:len(code)],b''.join(b'\x65'+load[1:] for load in loads)+nonzero+store)
+        self.assertEqual(image[len(code):],code)
+
     def fixture(self, export_type=2, version=1):
         identity=('188x57JYp0g',('libkernel',1),('libkernel',257))
-        main=dict(identity=lambda name:identity,libraries={'b':('libkernel',1)},
+        main=dict(sha256='fixture',identity=lambda name:identity,libraries={'b':('libkernel',1)},
             modules={'T':('libkernel',257)},ph=[dict(type=0x61000001,vaddr=256)])
         exported=('188x57JYp0g',('libkernel',version),('libkernel',257))
         native=dict(elf=b'\x31\xc0\xc3'+bytes(13)+b'\xc3',

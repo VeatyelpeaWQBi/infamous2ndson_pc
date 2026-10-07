@@ -15,6 +15,8 @@ int main(int argc,char **argv) {
     Init init=GET(Init,"R9lA82OraNs#c#d");
     Param param=GET(Param,"99b82IKXpH4#c#d");
     List list=GET(List,"xnd8BJzAxmk#c#d");
+    typedef int32_t (ABI *Info)(uint32_t,const void *,void *);
+    Info info=GET(Info,"m47juOmH0VE#libSceAppContent"); assert(info);
     assert(load && loaded && unload && init && param && list);
     assert(!runtime_content_resolve("g8cM39EUZ6o#I#J"));
     if (argc>1 && !strcmp(argv[1],"--missing")) { load(0xb4); return 99; }
@@ -53,6 +55,10 @@ int main(int argc,char **argv) {
     assert(list(0,NULL,0,&h.hits)==0 && h.hits==0 && h.canary==0xabcdef);
     assert(list(0,entries,2,&h.hits)==0 && h.hits==0);
     for (unsigned i=0;i<sizeof(entries);++i) assert(entries[i]==0xaa);
+    const char label[17]="absent-addon";
+    assert((uint32_t)info(0,label,entries)==0x80d90007);
+    for (unsigned i=0;i<sizeof(entries);++i) assert(entries[i]==0xaa);
+    assert((uint32_t)info(0,NULL,entries)==0x80d90002);
     assert((uint32_t)list(0,NULL,0,NULL)==0x80d90002);
     assert(unload(0xb4)==0 && loaded(0xb4)==0);
     assert((uint32_t)init(initial,b.boot)==0x80d90003);

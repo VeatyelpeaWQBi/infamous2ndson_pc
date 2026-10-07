@@ -13,6 +13,7 @@ Output: out/boot-linked.bin (format BBPROBE5) and out/link.json.
 import collections
 import hashlib
 import json
+import re
 from pathlib import Path
 import struct
 from prepare import parse_self, span, unpack
@@ -20,6 +21,7 @@ from link_libc import encode_id
 
 DEFAULT_MODULES = ('libc.prx', 'libSceFios2.prx')
 FS_LOAD = bytes.fromhex('64488b042500000000')  # mov rax, fs:[0]
+THREAD_POINTER_LOAD = re.compile(rb'\x64[\x48\x4c]\x8b[\x04\x0c\x14\x1c\x24\x2c\x34\x3c]\x25\x00{4}')
 
 
 def module(path):
@@ -75,17 +77,15 @@ def module(path):
 
 
 def patch_fs_loads(image, ph, base):
-    """Rewrite initial-exec `mov rax, fs:[0]` to GS: glibc owns FS on Linux."""
+    """Rewrite initial-exec thread-pointer reads into any register for Windows."""
     patched = 0
     for p in ph:
         if p['type'] != 1 or not p['flags'] & 1:
             continue
         start, end = base + p['vaddr'], base + p['vaddr'] + p['filesz']
-        at = image.find(FS_LOAD, start, end)
-        while at >= 0:
-            image[at] = 0x65
+        for match in THREAD_POINTER_LOAD.finditer(image,start,end):
+            image[match.start()] = 0x65
             patched += 1
-            at = image.find(FS_LOAD, at + len(FS_LOAD), end)
     return patched
 
 
@@ -237,6 +237,12 @@ def link(game, out, module_names=DEFAULT_MODULES, scoped_imports=False):
                      or main_tls['vaddr'] + main_tls['filesz'] > size):
         raise ValueError('unsupported eboot TLS layout')
     procparam = next(p for p in main['ph'] if p['type'] == 0x61000001)
+    from infamous_cpu import protect_text_leaf, EBOOT_SHA256
+    if main['sha256'] == EBOOT_SHA256:
+        from game_profiles import select_profile
+        if select_profile(game)['title_id'] != 'CUSA00309':
+            raise ValueError('Second Son CPU patch title mismatch')
+    red_zone_operands = protect_text_leaf(image, segments, main['sha256'])
     with (out / 'boot-linked.bin').open('wb') as f:
         f.write(struct.pack('<8s6Q', b'BBPROBE5', len(image), entry, len(segments), len(relocs), len(names), flags))
         f.write(struct.pack('<Q', procparam['vaddr']))
@@ -259,6 +265,7 @@ def link(game, out, module_names=DEFAULT_MODULES, scoped_imports=False):
         f.write(image)
     report = dict(modules=[{k: (hex(v) if k in ('base', 'init', 'tls_address') else v) for k, v in t.items()} for t in table],
                   bindings=len(bindings), imports=len(names), fs_loads_patched=fs_patched,
+                  windows_red_zone_operands=red_zone_operands,
                   main_tls=dict(zip(('vaddr', 'filesz', 'memsz', 'align'), main_tls_values)),
                   unresolved_imports=unresolved, scoped_imports=scoped_imports,
                   main_original_imports=original_names,

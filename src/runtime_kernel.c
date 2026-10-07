@@ -153,6 +153,8 @@ static ABI int64_t posix_time(int64_t *out) { int64_t t=(int64_t)time(NULL); if 
 
 /* ---- process ---- */
 static ABI int32_t get_pagesize(void) { return PAGE; }
+/* The GPU shim also advertises base PS4. Keep guest selection consistent. */
+static ABI int32_t is_neo_mode(void) { return 0; }
 static ABI int32_t get_pid(void) { return 1000; }
 static ABI int32_t yield(void) { host_yield(); return 0; }
 static ABI __attribute__((noreturn)) void hard_exit(int status) {
@@ -305,6 +307,7 @@ static const RuntimeExport exports[]={
     {"sceKernelGettimeofday",kernel_gettimeofday},
     {"time",posix_time},
     {"getpagesize",get_pagesize}, {"getpid",get_pid}, {"sched_yield",yield},
+    {"sceKernelIsNeoMode",is_neo_mode},
     {"_exit",hard_exit},
     {"sceKernelDebugRaiseException",raise_exception},
     {"sceKernelDebugRaiseExceptionOnReleaseMode",raise_exception},

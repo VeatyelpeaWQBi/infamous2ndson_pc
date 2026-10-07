@@ -16,3 +16,19 @@ Second Son compatibility backport (2026-10-06):
 Also: src/core/libraries/videodec/videodec.h, upstream ABI declarations retrieved
   2026-10-06 (GPL-2.0-or-later). gpu/shim/bbport_videodec.cpp is the local FFmpeg
   implementation; it is not a copy of upstream's decoder implementation.
+
+Local Second Son startup fixes (2026-10-06): vk_scheduler.h grows recording
+  blocks for copy data above 128 KiB while keeping command/data ownership;
+  cache_storage.cpp publishes completed blobs via .pending files and
+  vk_pipeline_serialization.cpp rejects truncated key headers. vk_presenter
+  has an opt-in BB_CAPTURE_FRAME readback for verifying actual game frames.
+  These are local changes, not wholesale replacements from newer upstream.
+  Continue-transition follow-up: vk_rasterizer.cpp prevents the additional
+  DrawPipe producer for the infamous profile. Captured host faults occurred in
+  RecordChunk::Push with a null chunk and in the driver at EndRendering;
+  serialized draw production passes the same transition while keeping the
+  Vulkan recorder enabled. The shared DrawPipe remains available to other titles.
+  Local opt-in diagnostics: bbport_diagnostics.h retains 512 GPU operations;
+  scheduler/rasterizer/presenter record executed command context and present
+  counters, and assert.cpp attempts a fault-time flush. Presenter readback is
+  interval-limited, overwrites one BMP, and caps diagnostic images at 1080p.

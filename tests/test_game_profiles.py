@@ -1,6 +1,7 @@
 """Fingerprint, title isolation and launcher routing with synthetic game files."""
 from paths import ROOT
 import hashlib
+import json
 import os
 from pathlib import Path
 import struct
@@ -19,6 +20,35 @@ def sfo_fixture(title):
 
 
 class GameProfiles(unittest.TestCase):
+    def test_locale_configuration_is_loaded_and_invalid_values_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'infamous-locale.json'
+            self.assertEqual(game_profiles.console_locale(tmp)['system_language'],10)
+            path.write_text(json.dumps({'system_language':1,'confirm_button':'cross'}))
+            self.assertEqual(game_profiles.console_locale(tmp)['confirm_button'],'cross')
+            for key,value in (('system_language',True),('system_language',99),('timezone_minutes',841),
+                              ('timezone_minutes','480'),('confirm_button','invalid'),('region','invalid')):
+                path.write_text(json.dumps({key:value}))
+                with self.assertRaises(ValueError): game_profiles.console_locale(tmp)
+    def test_launcher_debug_route_uses_collector_without_launching_second_process(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data=Path(tmp); digest=self.game(data)
+            env=dict(os.environ,BB_PREBUILT='1',BB_DEBUG_SESSION='1',BB_DATA_DIR=str(data),BB_GAME_DIR=str(data))
+            with patch.dict(os.environ,env,clear=True),patch.object(sys,'argv',['run_windows.py']), \
+                 patch.object(game_profiles,'SECOND_SON_SHA256',digest),patch.object(run_windows,'run',return_value=0), \
+                 patch('debug_session.collect',return_value=139) as collector, \
+                 patch.object(run_windows.subprocess,'call') as direct:
+                self.assertEqual(run_windows.main(),139)
+                self.assertEqual(collector.call_count,1); direct.assert_not_called()
+                command,cwd,base,profile=collector.call_args.args
+                self.assertEqual(Path(command[0]),ROOT/'out/bb-probe.exe')
+                self.assertEqual(base,data/'out/CUSA00309/debug')
+                self.assertEqual(profile['title_id'],'CUSA00309')
+    def test_prepare_child_output_preserves_unicode_under_gbk_environment(self):
+        with patch.dict(os.environ, {'PYTHONIOENCODING': 'gbk'}):
+            title=run_windows.run([sys.executable, '-c', "print('inFAMOUS Second Son\\u2122')"], capture=True)
+        self.assertEqual(title, 'inFAMOUS Second Son\u2122')
+
     def game(self, root, title='CUSA00309'):
         (root/'sce_sys').mkdir(); (root/'sce_sys/param.sfo').write_bytes(sfo_fixture(title))
         (root/'art').mkdir(); (root/'eboot.bin').write_bytes(b'audited executable fixture')
@@ -56,13 +86,19 @@ class GameProfiles(unittest.TestCase):
                 commands.append([str(a) for a in arguments])
                 self.assertEqual(os.environ['BB_UPSCALER'],'none')
                 self.assertEqual(os.environ['BB_GAME_PROFILE'],'infamous')
+                self.assertEqual(os.environ['BB_DRAW_PIPE'],'0')
+                self.assertEqual(os.environ['BB_LANGUAGE'],'10')
+                self.assertEqual(os.environ['BB_REGION'],'HK')
+                self.assertEqual(os.environ['BB_TIMEZONE_MINUTES'],'480')
+                self.assertEqual(os.environ['BB_ENTER_BUTTON'],'0')
                 self.assertEqual(os.environ['BB_USER_DIR'],str(data/'profiles/CUSA00309/user'))
                 self.assertNotIn('BB_RENDER_RES',os.environ)
                 self.assertNotIn('BB_PATCHES',os.environ)
                 return 0
             env=dict(os.environ,BB_PREBUILT='1',BB_DATA_DIR=str(data),BB_GAME_DIR=str(data),
                      BB_CONFIG=str(ROOT/'bbport.ini'),BB_USER_DIR='user',BB_RENDER_RES='800x450',
-                     BB_PATCHES='Uncap FPS++',BB_MODS_ENABLED='1',BB_UPSCALER='dlss',BB_FPS='uncap')
+                     BB_PATCHES='Uncap FPS++',BB_MODS_ENABLED='1',BB_UPSCALER='dlss',BB_FPS='uncap',BB_DRAW_PIPE='1',
+                     BB_LANGUAGE='1',BB_REGION='US',BB_TIMEZONE_MINUTES='-480',BB_ENTER_BUTTON='1')
             with patch.dict(os.environ,env,clear=True), patch.object(sys,'argv',['run_windows.py','--timeout','180']), \
                  patch.object(game_profiles,'SECOND_SON_SHA256',digest), \
                  patch.object(run_windows,'run',side_effect=prepare), \

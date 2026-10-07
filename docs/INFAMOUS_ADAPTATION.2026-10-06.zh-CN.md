@@ -2,6 +2,12 @@
 
 日期：2026-10-06。平台：Windows x86-64；目标：CUSA00309。
 
+**最新进展：** 实际 Windows/Vulkan 启动已到达 `inFAMOUS SECOND SON / ○ Continue` 标题画面，渲染输出为 1920×1080。50 秒、60 秒两轮限时启动均由诊断时限结束；60 秒运行中直接读回实际呈现图像，未发生致命错误。详见 [启动画面验证记录](INFAMOUS_STARTUP.2026-10-06.zh-CN.md)。这证明当前程序能打开标题画面；继续按钮之后的菜单、关卡和可玩性尚未验证。下文是首轮适配历史记录，旧停止点和测试数量不代表最新状态。
+
+**Continue 后续修复：** 用户测试暴露的图形宿主崩溃已通过标题专用顺序绘制配置消除。
+已构建版本自动按 Continue 后运行至 120 秒、剧情文字正常滚动；全部回归测试通过。
+详细限制及日志见 [Continue 闪退修复记录](INFAMOUS_CONTINUE.2026-10-06.zh-CN.md)。
+
 ## 本轮结论
 
 适配代码和 Windows 主程序已构建，本轮全部单元及 Vulkan 合成检查通过。下一步是用户进行首次实际游戏测试，确认真实模块初始化、片头、菜单和首个场景的最早阻塞。
@@ -33,6 +39,8 @@ Videodec ABI/资源布局参考官方 [videodec.h / videodec.cpp](https://github
 | Vulkan 集成测试 | 4 / 4，RTX 4090 Laptop 实际执行 |
 
 记录：`out/infamous-tests-final.log`。Linux/AppImage 打包模块按本项目 Windows 原则不在验收范围内。
+
+首次用户启动反馈（同日）：`out/CUSA00309/game-test.log` 在准备阶段报告 GBK 无法编码标题中的 `™`；原生游戏程序尚未启动。现已让分析 JSON 明确使用 UTF-8，Windows Python 入口及准备子进程日志使用 UTF-8，并补充 GBK 环境下标题写出/输出的回归测试。修复后再次执行 `test.bat --gpu`：94 项 Python/原生、2 项独立原生、13 项单元/着色器验证、4 项 Vulkan 集成测试全部通过，无失败或跳过。新记录：`out/infamous-tests-encoding.log`。尚未重新启动真实游戏。
 
 新增用例覆盖指纹拒绝、继承血源环境隔离、库版本/函数数据类型、原生模块导出类型、事件标志取消/删除阻塞线程、71 chunk 大小/越界元数据、H.264 真正帧输出（合成素材）、PTS/附加数据、短缓冲重试、重复删除/过期句柄、1D/数组/cube SPIR-V，以及 BC1 UNORM/sRGB、BC4、BC5 的 1D/数组分配、视图、上传与压缩块读回。
 

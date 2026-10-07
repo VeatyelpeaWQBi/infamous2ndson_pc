@@ -354,6 +354,12 @@ void PipelineCache::WarmUp() {
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
             ++num_total_pipelines;
+            // bbport: an interrupted cache write may leave an empty/header-only
+            // key. It is rebuildable data, not a fatal guest startup error.
+            if (data.size() < sizeof(u32) * 2 + sizeof(u64)) {
+                LOG_WARNING(Render, "Ignoring truncated pipeline cache key ({} bytes)", data.size());
+                return;
+            }
 
             Serialization::Archive ar{std::move(data)};
             Serialization::Reader pldata{ar};

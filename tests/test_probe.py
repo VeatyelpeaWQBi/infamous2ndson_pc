@@ -35,6 +35,51 @@ def native_package(name='fixture-native', binding_address=4112, binding_kind=1,
 
 @unittest.skipUnless(EXE.exists(), 'run build.bat --build-tests first')
 class LoaderTests(unittest.TestCase):
+    def test_sse4a_extract_register_and_immediate_forms(self):
+        def movq_to_xmm(reg, value):
+            return (b'\x48\xb8'+struct.pack('<Q',value)+
+                    bytes([0x66,0x48|(4 if reg>=8 else 0),0x0f,0x6e,0xc0|((reg&7)<<3)]))
+        for dst in range(16):
+            for immediate in (False,True):
+                for length,index in ((8,12),(0,0),(1,63),(63,1),(32,48),(0,8)):
+                    with self.subTest(dst=dst,immediate=immediate,length=length,index=index):
+                        src=(dst+1)%16
+                        value=0xfedcba9876543210
+                        expected=(value>>index)&((1<<(length or 64))-1)
+                        code=movq_to_xmm(dst,value)
+                        if not immediate: code+=movq_to_xmm(src,length|(index<<8))
+                        code+=b'\xf9' # stc: extraction must preserve flags
+                        rex=0x40|((1 if dst>=8 else 0) if immediate else
+                                  (4 if dst>=8 else 0)|(1 if src>=8 else 0))
+                        code+=b'\x66'+(bytes([rex]) if rex!=0x40 else b'')+b'\x0f'
+                        if immediate: code+=bytes([0x78,0xc0|(dst&7),length,index])
+                        else: code+=bytes([0x79,0xc0|((dst&7)<<3)|(src&7)])
+                        # Capture carry before any flag-changing comparisons.
+                        code+=b'\x0f\x93\xc1' # setnc cl
+                        code+=bytes([0x66,0x48|(4 if dst>=8 else 0),0x0f,0x7e,0xc0|((dst&7)<<3)])
+                        code+=b'\x48\xba'+struct.pack('<Q',expected)
+                        code+=bytes.fromhex('4839d00f95c008c80fb6c0c3')
+                        r=self.run_image(native_package(init=code,binding_address=4096+len(code)))
+                        self.assertEqual(r.returncode,20,r.stdout+r.stderr)
+                        self.assertIn('Module 0 initializer returned 0',r.stdout)
+
+    def test_guest_thread_pointer_reads_preserve_each_destination_register(self):
+        for reg in range(16):
+            with self.subTest(register=reg):
+                # Preserve SysV nonvolatile registers, and save/restore RSP when
+                # deliberately using it as the TLS load's destination.
+                pushes=bytes.fromhex('53554154415541564157')
+                pops=bytes.fromhex('415f415e415d415c5d5b')
+                code=pushes
+                if reg==4: code+=bytes.fromhex('4989e3') # mov r11,rsp
+                code+=bytes([0x65,0x48|(4 if reg>=8 else 0),0x8b,4|((reg&7)<<3),0x25,0,0,0,0])
+                code+=bytes([0x48|(4 if reg>=8 else 0),0x89,0xc0|((reg&7)<<3)]) # mov rax,destination
+                if reg==4: code+=bytes.fromhex('4c89dc') # mov rsp,r11
+                code+=bytes.fromhex('483b000f95c00fb6c0')+pops+b'\xc3' # TCB self equals pointer -> zero
+                result=self.run_image(native_package(init=code,binding_address=4096+max(16,len(code))))
+                self.assertEqual(result.returncode,20,result.stdout+result.stderr)
+                self.assertIn('Module 0 initializer returned 0',result.stdout)
+
     def test_invalid_content_profile_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             path=Path(tmp)/'content.bin'

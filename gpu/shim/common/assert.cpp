@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "bbport_diagnostics.h"
 
 // bbport_write_log.cpp: with BB_WRITE_LOG, the latest guest memory writes (no-op otherwise).
 extern "C" void bbgpu_dump_guest_writes(void* ucontext);
@@ -11,6 +12,7 @@ extern "C" void bbgpu_dump_guest_writes(void* ucontext);
 void assert_fail_impl() {
     std::fflush(stdout);
     bbgpu_dump_guest_writes(nullptr);
+    BbDiagnostics::Flush(true);
     std::fputs("STOP: GPU library assertion failed (see GPU log above)\n", stderr);
     std::_Exit(23);
 }

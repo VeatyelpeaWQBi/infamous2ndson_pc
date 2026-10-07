@@ -302,6 +302,9 @@ if (BB_BUILD_TESTS)
     add_test(NAME image-compat-shaders COMMAND $<TARGET_FILE:image-compat-test>
         --shaders "${CMAKE_CURRENT_BINARY_DIR}/test-image-shaders")
     set_tests_properties(image-compat-shaders PROPERTIES LABELS "unit" TIMEOUT 30 FIXTURES_SETUP image_spirv)
+    add_test(NAME diagnostics-ring COMMAND $<TARGET_FILE:image-compat-test>
+        --diagnostics "${CMAKE_CURRENT_BINARY_DIR}/test-diagnostics")
+    set_tests_properties(diagnostics-ring PROPERTIES LABELS "unit" TIMEOUT 30)
     find_program(SPIRV_VALIDATOR NAMES spirv-val)
     if (SPIRV_VALIDATOR)
         foreach(image IN ITEMS 0 1 2)

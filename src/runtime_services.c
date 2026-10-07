@@ -73,6 +73,23 @@ static ABI int32_t user_event(int32_t *event) {
 
 /* ---- SystemService ---- */
 static int language(void) { const char *v=getenv("BB_LANGUAGE"); return v ? atoi(v) : 1; }
+/* Parameter 6 is the console name (OpenOrbis sys_service.h). Audited guest
+ * passes id, char buffer and byte capacity; the buffer is 65 bytes. */
+static ABI int32_t system_param_string(int32_t id,char *value,uint64_t capacity) {
+    if (id!=6 || !value) return SYSTEM_PARAMETER;
+    const char *name=getenv("BB_SYSTEM_NAME");
+    if (!name) name="Windows PS4";
+    const size_t length=strlen(name);
+    if (length>64 || capacity<=length) return SYSTEM_PARAMETER;
+    memcpy(value,name,length+1);
+    return 0;
+}
+/* A desktop window has no TV overscan. Only the ratio field is an output;
+ * leave the 128 reserved bytes untouched, as in upstream SystemService. */
+static ABI int32_t display_safe_area(float *ratio) {
+    if (!ratio) return SYSTEM_PARAMETER;
+    *ratio=1.0f; return 0;
+}
 static ABI int32_t system_param(int32_t id,int32_t *value) {
     if (!value) return SYSTEM_PARAMETER;
     switch (id) {
@@ -80,13 +97,26 @@ static ABI int32_t system_param(int32_t id,int32_t *value) {
     case 2: *value=1; break;                    /* date format DD/MM/YYYY */
     case 3: *value=1; break;                    /* 24-hour clock */
 #ifdef _WIN32
-    case 4: *value=(int32_t)(runtime_utc_offset(time(NULL))/60); break;
+    case 4: {
+        const char *zone=getenv("BB_TIMEZONE_MINUTES");
+        if (zone && *zone) {
+            char *end; long minutes=strtol(zone,&end,10);
+            if (*end || minutes < -720 || minutes > 840) return SYSTEM_PARAMETER;
+            *value=(int32_t)minutes;
+        } else *value=(int32_t)(runtime_utc_offset(time(NULL))/60);
+        break;
+    }
 #else
     case 4: { time_t now=time(NULL); struct tm t; localtime_r(&now,&t); *value=(int32_t)(t.tm_gmtoff/60); break; }
 #endif
     case 5: *value=0; break;                    /* summer time */
     case 7: *value=0; break;                    /* parental level off */
-    case 1000: *value=1; break;                 /* enter button = cross */
+    case 1000: {
+        const char *button=getenv("BB_ENTER_BUTTON");
+        if (button && *button && strcmp(button,"0") && strcmp(button,"1")) return SYSTEM_PARAMETER;
+        *value=button && *button ? atoi(button) : 1; /* 0=circle, 1=cross */
+        break;
+    }
     default: fprintf(stderr,"STOP: unsupported system parameter %d\n",id); exit(21);
     }
     return 0;
@@ -146,7 +176,43 @@ static ABI int32_t lib_init_id(void) { return new_id(); }
 static ABI int32_t ok_void(void) { return 0; }
 static ABI int32_t http_fail(void) { return HTTP_NETWORK; }
 /* Objects are created so setup code proceeds; any transfer fails as unplugged. */
-static ABI int32_t http_object(void) { return new_id(); }
+static struct { int32_t id; uint32_t timeout[3]; } http_objects[128];
+static ABI int32_t http_object(void) {
+    const int32_t id=new_id();
+    host_lock(&lock);
+    for (size_t i=0;i<128;++i) if (!http_objects[i].id) {
+        http_objects[i].id=id; memset(http_objects[i].timeout,0,sizeof(http_objects[i].timeout));
+        host_unlock(&lock); return id;
+    }
+    host_unlock(&lock); return (int32_t)0x80431022;
+}
+static ABI int32_t http_delete(int32_t id) {
+    host_lock(&lock);
+    for (size_t i=0;i<128;++i) if (http_objects[i].id==id && id>0) {
+        http_objects[i].id=0; host_unlock(&lock); return 0;
+    }
+    host_unlock(&lock); return (int32_t)0x80431100;
+}
+static int32_t http_timeout(int32_t id,uint32_t usec,unsigned kind) {
+    host_lock(&lock);
+    for (size_t i=0;i<128;++i) if (http_objects[i].id==id && id>0) {
+        http_objects[i].timeout[kind]=usec; host_unlock(&lock); return 0;
+    }
+    host_unlock(&lock); return (int32_t)0x80431100;
+}
+static ABI int32_t http_recv_timeout(int32_t id,uint32_t usec) { return http_timeout(id,usec,0); }
+static ABI int32_t http_send_timeout(int32_t id,uint32_t usec) { return http_timeout(id,usec,1); }
+static ABI int32_t http_connect_timeout(int32_t id,uint32_t usec) { return http_timeout(id,usec,2); }
+/* This runtime is offline and has no guest TLS certificate store. Do not
+ * claim that supplied private CAs were parsed or bypass host verification. */
+static ABI int32_t https_load_cert(int32_t context,int32_t count,const void **cas,
+        const void *cert,const void *key) {
+    (void)cert; (void)key;
+    if (context<=0) return (int32_t)0x80431100;
+    if (count<0 || (count && !cas)) return (int32_t)0x804311fe;
+    note("HTTPS certificate loading unavailable in offline runtime");
+    return (int32_t)0x80431075;
+}
 static ABI int32_t http_epoll(int32_t ctx,void **handle) {
     (void)ctx;
     if (!handle) return (int32_t)0x80431077; /* HTTP INVALID_VALUE */
@@ -166,6 +232,33 @@ static ABI int32_t np_state(int32_t user,int32_t *state) {
 }
 static ABI int32_t np_signed_out(void) { return NP_SIGNED_OUT; }
 static ABI int32_t np_register(void *cb,void *arg) { (void)cb; (void)arg; return new_id(); }
+/* A callbacks return a slot ID. Offline state never changes to SignedIn;
+ * retain subscriptions without manufacturing a login callback. */
+typedef struct { void *callback,*argument; } NpSubscription;
+static NpSubscription np_state_a[8],np_presence_a[8];
+static int32_t np_subscribe(NpSubscription *table,void *callback,void *argument) {
+    if (!callback) return NP_INVALID_ARGUMENT;
+    host_lock(&lock);
+    for (size_t i=0;i<8;++i) if (table[i].callback==callback) {
+        host_unlock(&lock); return (int32_t)0x80550008;
+    }
+    for (size_t i=0;i<8;++i) if (!table[i].callback) {
+        table[i]=(NpSubscription){callback,argument}; host_unlock(&lock); return (int32_t)i+1;
+    }
+    host_unlock(&lock); return (int32_t)0x8055001d;
+}
+static ABI int32_t np_state_register_a(void *callback,void *argument) { return np_subscribe(np_state_a,callback,argument); }
+static ABI int32_t np_presence_register_a(void *callback,void *argument) { return np_subscribe(np_presence_a,callback,argument); }
+static ABI int32_t np_state_unregister_a(int32_t id) {
+    if (id<1 || id>8) return NP_INVALID_ARGUMENT;
+    host_lock(&lock);
+    if (!np_state_a[id-1].callback) { host_unlock(&lock); return (int32_t)0x80550009; }
+    np_state_a[id-1]=(NpSubscription){0}; host_unlock(&lock); return 0;
+}
+static ABI int32_t np_account_a(int32_t user,uint64_t *account) {
+    if (user!=USER_ID || !account) return NP_INVALID_ARGUMENT;
+    *account=0; return NP_SIGNED_OUT;
+}
 static ABI void np_register_void(void *cb,void *arg) { (void)cb; (void)arg; }
 static ABI int32_t np_request(const void *param) { (void)param; return new_id(); }
 static ABI int32_t np_request_ctx(int32_t ctx,const void *param) { (void)ctx; (void)param; return new_id(); }
@@ -307,9 +400,27 @@ static ABI int32_t trophy_game_info(int32_t ctx,int32_t handle,void *details,voi
 static ABI int32_t trophy_info(int32_t ctx,int32_t handle,int32_t id,void *details,void *data) {
     (void)id; return trophy_game_info(ctx,handle,details,data);
 }
+/* Trophy XML/progress registration is not implemented for this dump. Report
+ * NOT_REGISTERED, rather than inventing trophy counts or claiming unlocks.
+ * The caller can disable this optional service while continuing startup. */
+static ABI int32_t trophy_unlock_state(int32_t ctx,int32_t handle,uint32_t *flags,uint32_t *count) {
+    if (!flags || !count || ctx<=0 || handle<=0) return TROPHY_INVALID;
+    note("Trophy progress unavailable: local metadata is not registered");
+    return (int32_t)0x8055160f;
+}
 
 /* ---- DiscMap: the game is fully installed, no disc bitmap exists ---- */
 #define DISC_MAP_NO_BITMAP ((int32_t)0x81100004)
+/* The Fios2 query for optical-disc placement. For a fully installed package,
+ * no optical-placement flags/regions are supplied. ABI matches upstream's
+ * Func_7C980FFB0AA27E7A; the audited Fios2 caller initializes all three outputs. */
+static ABI int32_t discmap_7c98(const char *path,int64_t offset,int64_t size,
+        int32_t *flags,int32_t *r1,int32_t *r2) {
+    if (!path || !*path || offset<0 || size<0 || size>INT64_MAX-offset || !flags || !r1 || !r2)
+        return (int32_t)0x81100001;
+    *flags=0; *r1=0; *r2=0;
+    return 0;
+}
 static ABI int32_t discmap_on_hdd(const char *path,int64_t offset,int64_t size,int32_t *result) {
     (void)path; (void)offset; (void)size; (void)result; return DISC_MAP_NO_BITMAP;
 }
@@ -334,6 +445,8 @@ static const RuntimeExport exports[]={
     {"sceUserServiceGetInitialUser",user_initial}, {"sceUserServiceGetLoginUserIdList",user_list},
     {"sceUserServiceGetUserName",user_name}, {"sceUserServiceGetEvent",user_event},
     {"sceSystemServiceParamGetInt",system_param}, {"sceSystemServiceGetStatus",system_status},
+    {"sceSystemServiceParamGetString",system_param_string},
+    {"sceSystemServiceGetDisplaySafeAreaInfo",display_safe_area},
     {"sceSystemServiceReceiveEvent",system_event}, {"sceSystemServiceHideSplashScreen",hide_splash},
     {"sceSystemServiceLaunchWebBrowser",launch_browser},
     {"sceNetInit",net_init}, {"sceNetTerm",net_term}, {"sceNetErrnoLoc",net_errno_loc},
@@ -351,23 +464,29 @@ static const RuntimeExport exports[]={
     {"sceNetEpollControl",net_unreachable}, {"sceNetEpollWait",net_unreachable}, {"sceNetEpollAbort",net_unreachable},
     {"sceNetResolverStartNtoa",net_unreachable}, {"sceNetResolverStartAton",net_unreachable},
     {"sceNetCtlGetState",netctl_state}, {"sceNetCtlGetInfo",netctl_info},
+    /* NetCtl's offline bootstrap needs no host network service or socket. */
+    {"sceNetCtlInit",net_init}, {"sceNetCtlTerm",net_term},
     {"sceNetCtlRegisterCallback",netctl_register}, {"sceNetCtlCheckCallback",netctl_check},
     {"sceNetCtlUnregisterCallback",netctl_unregister}, {"sceNetCtlGetNatInfo",netctl_nat},
     {"sceSslInit",lib_init_id}, {"sceSslTerm",ok_void},
     {"sceHttpInit",lib_init_id}, {"sceHttpTerm",ok_void},
-    {"sceHttpCreateTemplate",http_object}, {"sceHttpDeleteTemplate",ok_void},
+    {"sceHttpCreateTemplate",http_object}, {"sceHttpDeleteTemplate",http_delete},
     {"sceHttpCreateConnectionWithURL",http_object}, {"sceHttpCreateRequestWithURL",http_object},
     {"sceHttpSendRequest",http_fail}, {"sceHttpCreateEpoll",http_epoll},
-    {"sceHttpSetNonblock",ok_void}, {"sceHttpSetConnectTimeOut",ok_void},
+    {"sceHttpSetNonblock",ok_void}, {"sceHttpSetConnectTimeOut",http_connect_timeout},
+    {"sceHttpSetRecvTimeOut",http_recv_timeout}, {"sceHttpSetSendTimeOut",http_send_timeout},
+    {"sceHttpsLoadCert",https_load_cert},
     {"sceHttpsEnableOption",ok_void}, {"sceHttpsDisableOption",ok_void},
     {"sceHttpAddRequestHeader",ok_void}, {"sceHttpSetRequestContentLength",ok_void},
-    {"sceHttpDeleteConnection",ok_void}, {"sceHttpDeleteRequest",ok_void},
+    {"sceHttpDeleteConnection",http_delete}, {"sceHttpDeleteRequest",http_delete},
     {"sceHttpAbortWaitRequest",ok_void}, {"sceHttpDestroyEpoll",ok_void},
     {"sceHttpSetEpoll",ok_void}, {"sceHttpUnsetEpoll",ok_void}, {"sceHttpWaitRequest",http_wait},
     {"sceHttpGetStatusCode",http_fail}, {"sceHttpGetResponseContentLength",http_fail},
     {"sceHttpReadData",http_fail},
     {"sceNpGetState",np_state}, {"sceNpGetOnlineId",np_signed_out}, {"sceNpGetNpId",np_signed_out},
     {"sceNpRegisterStateCallback",np_register}, {"sceNpUnregisterStateCallback",ok_void},
+    {"sceNpRegisterStateCallbackA",np_state_register_a}, {"sceNpUnregisterStateCallbackA",np_state_unregister_a},
+    {"sceNpRegisterGamePresenceCallbackA",np_presence_register_a}, {"sceNpGetAccountIdA",np_account_a},
     {"sceNpRegisterGamePresenceCallback",np_register_void}, {"sceNpRegisterPlusEventCallback",np_register},
     {"sceNpUnregisterPlusEventCallback",ok_void}, {"sceNpCheckCallback",ok_void},
     {"sceNpSetNpTitleId",ok_void}, {"sceNpNotifyPlusFeature",ok_void}, {"sceNpSetContentRestriction",ok_void},
@@ -437,9 +556,11 @@ static const RuntimeExport exports[]={
     {"sceNpTrophyCreateContext",trophy_context}, {"sceNpTrophyCreateHandle",trophy_handle},
     {"sceNpTrophyRegisterContext",trophy_register}, {"sceNpTrophyUnlockTrophy",trophy_unlock},
     {"sceNpTrophyGetGameInfo",trophy_game_info}, {"sceNpTrophyGetTrophyInfo",trophy_info},
+    {"sceNpTrophyGetTrophyUnlockState",trophy_unlock_state},
     {"sceMouseInit",ok_void}, {"sceMouseOpen",mouse_open}, {"sceMouseRead",mouse_read}, {"sceMouseClose",mouse_close},
     {"sceAudioInOpen",audio_in_open},
     {"sceDiscMapIsRequestOnHDD",discmap_on_hdd}, {"sceDiscMap_8A828CAEE7EDD5E9",discmap_8a82},
+    {"sceDiscMap_7C980FFB0AA27E7A",discmap_7c98},
     {"sceVoiceInit",ok_void}, {"sceVoiceEnd",ok_void},
 };
 uintptr_t runtime_services_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }

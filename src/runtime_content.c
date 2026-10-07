@@ -77,6 +77,13 @@ static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint
     if (hits) *hits=0;
     ++lists; return 0;
 }
+static ABI int32_t addon_info(uint32_t service,const void *label,void *info) {
+    require_initialized();
+    if (service || !label || !info) return PARAMETER;
+    /* The configured base-game provider contains no add-ons. Do not invent
+     * an entitlement or overwrite the caller's output on a failed query. */
+    return (int32_t)0x80d90007;
+}
 uintptr_t runtime_content_resolve(const char *name) {
     if (!strcmp(name,"g8cM39EUZ6o#M#N")) return (uintptr_t)module_load;
     if (!strcmp(name,"fMP5NHUOaMk#M#N")) return (uintptr_t)module_loaded;
@@ -84,6 +91,7 @@ uintptr_t runtime_content_resolve(const char *name) {
     if (!strcmp(name,"R9lA82OraNs#c#d")) return (uintptr_t)content_init;
     if (!strcmp(name,"99b82IKXpH4#c#d")) return (uintptr_t)param_int;
     if (!strcmp(name,"xnd8BJzAxmk#c#d")) return (uintptr_t)addon_list;
+    if (!strcmp(name,"m47juOmH0VE#libSceAppContent")) return (uintptr_t)addon_info;
     return 0;
 }
 void runtime_content_report(void) {

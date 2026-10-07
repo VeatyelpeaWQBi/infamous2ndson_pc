@@ -152,8 +152,20 @@ bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector
                 }
             } else {
                 using namespace Common::FS;
-                const auto file = IOFile{path, FileAccessMode::Create};
-                file.Write(v);
+                // bbport: publish only a closed, complete cache blob. A killed
+                // diagnostic run must not expose an empty .key on next boot.
+                auto pending = path;
+                pending += ".pending";
+                {
+                    const auto file = IOFile{pending, FileAccessMode::Create};
+                    if (file.Write(v) != v.size()) {
+                        LOG_ERROR(Render, "Failed to write cache blob {}", path.string());
+                        return;
+                    }
+                }
+                std::error_code ec;
+                std::filesystem::rename(pending, path, ec);
+                if (ec) LOG_ERROR(Render, "Failed to publish cache blob {}: {}", path.string(), ec.message());
             }
         }};
         std::scoped_lock lock{m_request};

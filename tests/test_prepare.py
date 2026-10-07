@@ -1,9 +1,12 @@
 from paths import ROOT
+import io
+import json
 import struct
 import unittest
 import tempfile
 from pathlib import Path
-from prepare import parse_self, inspect_libc, nid
+from unittest.mock import patch
+from prepare import parse_self, inspect_libc, nid, prepare
 
 
 def fixture():
@@ -19,6 +22,33 @@ def fixture():
 
 
 class SelfTests(unittest.TestCase):
+    def test_unicode_game_report_is_utf8_even_with_gbk_default(self):
+        # Exercise the production report writer with a tiny parsed executable.
+        # Windows GBK cannot encode the real title's trademark character.
+        title = 'inFAMOUS Second Son\u2122'
+        tags = [(0x61000035, 0), (0x61000037, 1), (0x61000039, 0),
+                (0x6100003f, 0), (0x61000029, 0), (0x6100002d, 0),
+                (0x6100002f, 0), (0x61000031, 0), (0, 0)]
+        elf = b'\xc3\0' + b''.join(struct.pack('<QQ', *tag) for tag in tags)
+        headers = [dict(type=1, offset=0, vaddr=0, filesz=1, memsz=16, flags=5),
+                   dict(type=0x61000000, offset=1, filesz=1),
+                   dict(type=2, offset=2, filesz=16*len(tags))]
+        original_write = Path.write_text
+        def gbk_default(path, data, encoding=None, **kwargs):
+            return original_write(path, data, encoding=encoding or 'gbk', **kwargs)
+        with tempfile.TemporaryDirectory() as tmp:
+            game=Path(tmp)/'game'; game.mkdir()
+            (game/'eboot.bin').write_bytes(b'fixture')
+            (game/'sce_sys').mkdir(); (game/'sce_sys/param.sfo').write_bytes(b'fixture')
+            (game/'sce_module').mkdir(); (game/'art').mkdir()
+            out=Path(tmp)/'out'
+            with patch('prepare.parse_self', return_value=(elf, [0,0,0,0,0], headers, [], [])), \
+                 patch('prepare.inspect_libc', return_value=dict(init_env_is_ret=True)), \
+                 patch('prepare.sfo', return_value=dict(TITLE_ID='CUSA00309', TITLE=title)), \
+                 patch.object(Path, 'write_text', gbk_default), patch('sys.stdout', io.StringIO()):
+                prepare(game, out)
+            self.assertEqual(json.loads((out/'analysis.json').read_text(encoding='utf-8'))['sfo']['TITLE'], title)
+
     def test_libc_ret_contract_is_verified_from_symbol_and_code(self):
         def libc(instruction):
             data=bytearray(0x320)

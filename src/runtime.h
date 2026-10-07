@@ -42,6 +42,7 @@ void runtime_set_libc_tls(const void *data, uint64_t filesz, uint64_t memsz);
 void runtime_set_module_tls(uint64_t module, const void *data, uint64_t filesz, uint64_t memsz);
 void runtime_set_procparam(void *param);
 void **runtime_application_heap_api(void);
+uintptr_t runtime_libc_internal_resolve(const char *name);
 uintptr_t runtime_thread_resolve(const char *name);
 void runtime_thread_report(void);
 void runtime_set_main_tls(const void *data, uint64_t filesz, uint64_t memsz, uint64_t align);
@@ -87,6 +88,9 @@ void runtime_ajm_report(void);
 uintptr_t runtime_audio_resolve(const char *name);
 void runtime_audio_report(void);
 uintptr_t runtime_pad_resolve(const char *name);
+void runtime_debug_input(uint32_t buttons,uint8_t lx,uint8_t ly,uint8_t rx,uint8_t ry,
+                         uint8_t l2,uint8_t r2,uint8_t touches);
+void runtime_debug_mark(void);
 void runtime_pad_report(void);
 uintptr_t runtime_rtc_resolve(const char *name);
 const char *runtime_file_user_dir(void);

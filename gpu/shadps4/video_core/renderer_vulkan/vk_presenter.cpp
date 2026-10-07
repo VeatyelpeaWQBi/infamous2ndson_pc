@@ -29,9 +29,11 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include "bbport_diagnostics.h"
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <fstream>
 #include <span>
 #include <sstream>
 #include <system_error>
@@ -507,6 +509,45 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+    // Optional bounded diagnostic: overwrite one BMP with actual presented pixels.
+    // No desktop capture, user profile changes, or readback on normal launches.
+    const char* capture_path = std::getenv("BB_CAPTURE_FRAME");
+    const bool fresh = !is_reusing_frame && is_game_frame;
+    if (fresh) ++diagnostic_frames;
+    static const u64 capture_interval=[] {
+        const char* value=std::getenv("BB_CAPTURE_INTERVAL_MS");
+        return value ? std::clamp<u64>(std::strtoull(value,nullptr,10),1000,60000) : 0;
+    }();
+    static const std::string capture_request=[] {
+        const char* dir=std::getenv("BB_DEBUG_DIR"); return dir ? std::string(dir)+"/capture-next" : std::string{};
+    }();
+    const u64 capture_tick=GetTickCount64();
+    const bool manual_capture=!capture_request.empty() && GetFileAttributesA(capture_request.c_str())!=INVALID_FILE_ATTRIBUTES;
+    const bool capture_due=manual_capture || (capture_interval ?
+        !diagnostic_capture_tick || capture_tick-diagnostic_capture_tick>=capture_interval :
+        diagnostic_frames==1 || diagnostic_frames%60==0);
+    const auto capture_format = swapchain.GetSurfaceFormat().format;
+    const bool bgra = capture_format == vk::Format::eB8G8R8A8Unorm ||
+                      capture_format == vk::Format::eB8G8R8A8Srgb;
+    const bool rgba = capture_format == vk::Format::eR8G8B8A8Unorm ||
+                      capture_format == vk::Format::eR8G8B8A8Srgb;
+    VkBuffer capture_buffer{};
+    VmaAllocation capture_allocation{};
+    VmaAllocationInfo capture_mapping{};
+    if (capture_path && *capture_path && fresh && capture_due &&
+        (bgra || rgba) && frame->width && frame->height && frame->width <= 1920 && frame->height <= 1080) {
+        const VkBufferCreateInfo ci{.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size=VkDeviceSize(frame->width)*frame->height*4,.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        const VmaAllocationCreateInfo ai{.flags=VMA_ALLOCATION_CREATE_MAPPED_BIT |
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,.usage=VMA_MEMORY_USAGE_AUTO,
+            .requiredFlags=VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        if (vmaCreateBuffer(instance.GetAllocator(),&ci,&ai,&capture_buffer,&capture_allocation,&capture_mapping)!=VK_SUCCESS)
+            capture_buffer=VK_NULL_HANDLE;
+        else {
+            diagnostic_capture_tick=capture_tick;
+            if (manual_capture) DeleteFileA(capture_request.c_str());
+        }
+    }
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {
@@ -527,6 +568,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         if (!swapchain.AcquireNextImage()) {
             // User resizes the window too fast and GPU can't keep up. Skip this frame.
             LOG_WARNING(Render_Vulkan, "Skipping frame!");
+            if (capture_buffer) vmaDestroyBuffer(instance.GetAllocator(),capture_buffer,capture_allocation);
             free_frame();
             return;
         }
@@ -597,6 +639,15 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                          vk::ImageLayout::eTransferDstOptimal,
                          MakeImageBlitFit(frame->width, frame->height, extent.width, extent.height),
                          vk::Filter::eLinear);
+        if (capture_buffer) {
+            const vk::BufferImageCopy region{.imageSubresource=MakeImageSubresourceLayers(),
+                .imageExtent={frame->width,frame->height,1}};
+            cmdbuf.copyImageToBuffer(frame->image,vk::ImageLayout::eTransferSrcOptimal,capture_buffer,region);
+            const vk::MemoryBarrier readable{.srcAccessMask=vk::AccessFlagBits::eTransferWrite,
+                .dstAccessMask=vk::AccessFlagBits::eHostRead};
+            cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,vk::PipelineStageFlagBits::eHost,
+                {},readable,{},{});
+        }
         // bbport: the settings menu / FPS counter over the frame, at display resolution.
         const bool overlay = BbOverlay::Visible();
         const std::array post_barriers{
@@ -665,10 +716,33 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         }
     }
 
-    free_frame();
+    if (capture_buffer) {
+        // Wait before recycling this frame; the copy shares its presentation fence.
+        const auto wait=instance.GetDevice().waitForFences(frame->present_done,true,UINT64_MAX);
+        if (wait==vk::Result::eSuccess) {
+            const u32 stride=(frame->width*3+3)&~3u, bytes=stride*frame->height;
+            std::vector<u8> bmp(54+bytes,0);
+            auto put32=[&](size_t at,u32 value) { std::memcpy(bmp.data()+at,&value,4); };
+            bmp[0]='B'; bmp[1]='M'; put32(2,u32(bmp.size())); put32(10,54); put32(14,40);
+            put32(18,frame->width); put32(22,0u-frame->height); bmp[26]=1; bmp[28]=24; put32(34,bytes);
+            const auto* pixels=static_cast<const u8*>(capture_mapping.pMappedData);
+            for (u32 y=0;y<frame->height;++y) for (u32 x=0;x<frame->width;++x) {
+                const auto* src=pixels+(size_t(y)*frame->width+x)*4;
+                auto* dst=bmp.data()+54+size_t(y)*stride+x*3;
+                dst[0]=src[bgra?0:2]; dst[1]=src[1]; dst[2]=src[bgra?2:0];
+            }
+            std::ofstream output(capture_path,std::ios::binary|std::ios::trunc);
+            output.write(reinterpret_cast<const char*>(bmp.data()),bmp.size());
+            LOG_INFO(Render_Vulkan,"Diagnostic presented frame {}: {}x{} -> {} (written={})",
+                diagnostic_frames,frame->width,frame->height,capture_path,output.good());
+        }
+        vmaDestroyBuffer(instance.GetAllocator(),capture_buffer,capture_allocation);
+    }
     if (!is_reusing_frame && is_game_frame) {
+        BbDiagnostics::Presented(frame->width,frame->height);
         DebugState.IncFlipFrameNum();
     }
+    free_frame();
 }
 
 Frame* Presenter::GetRenderFrame() {

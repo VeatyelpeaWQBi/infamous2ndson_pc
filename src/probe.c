@@ -176,11 +176,20 @@ static __attribute__((noreturn)) void terminate(unsigned code) {
     TerminateProcess(GetCurrentProcess(), code);
     _exit((int)code);
 }
+static HANDLE debug_dump_request,debug_dump_complete;
+static void request_crash_snapshot(void) {
+    if (!getenv("BB_DEBUG_DIR") || !debug_dump_request || !debug_dump_complete) return;
+    ResetEvent(debug_dump_complete);
+    SetEvent(debug_dump_request);
+    if (WaitForSingleObject(debug_dump_complete,1500)!=WAIT_OBJECT_0)
+        fprintf(stderr,"DEBUG: crash thread snapshot incomplete (1500 ms limit)\n");
+}
 static void report_exception(EXCEPTION_POINTERS *e) {
     static volatile LONG reporting;
     if (InterlockedExchange(&reporting, 1)) { Sleep(INFINITE); }
     EXCEPTION_RECORD *r = e->ExceptionRecord;
     CONTEXT *c = e->ContextRecord;
+    fprintf(stderr,"DEBUG_CRASH tick_ms=%llu\n",(unsigned long long)GetTickCount64());
     char where[512];
     describe(where, sizeof(where), (uintptr_t)c->Rip);
     fprintf(stderr, "%s fault 0x%08lx at %s", guest_address((uintptr_t)c->Rip) ? "Guest" : "Host", r->ExceptionCode, where);
@@ -196,6 +205,13 @@ static void report_exception(EXCEPTION_POINTERS *e) {
     fprintf(stderr, " (thread %lu %s)\n", GetCurrentThreadId(), thread_name);
     fprintf(stderr, "  rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n  rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n",
             c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->Rbp, c->Rsp);
+    if (getenv("BB_DEBUG_DIR")) {
+        fprintf(stderr,"  r8=%016llx r9=%016llx r10=%016llx r11=%016llx\n  r12=%016llx r13=%016llx r14=%016llx r15=%016llx flags=%08lx\n",
+            c->R8,c->R9,c->R10,c->R11,c->R12,c->R13,c->R14,c->R15,c->EFlags);
+        const M128A* xmm=&c->Xmm0;
+        for (unsigned i=0;i<16;++i)
+            fprintf(stderr,"  xmm%u=%016llx%016llx\n",i,(unsigned long long)xmm[i].High,(unsigned long long)xmm[i].Low);
+    }
     /* rbp frame chain; ReadProcessMemory so a bad frame cannot fault again. */
     uintptr_t rbp = c->Rbp;
     for (int depth = 0; depth < 24 && rbp; ++depth) {
@@ -214,7 +230,9 @@ static void report_exception(EXCEPTION_POINTERS *e) {
         fprintf(stderr, "  host #%u %s\n", i, where);
     }
     if (gpu_enabled && r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) bbgpu_dump_guest_writes(e);
+    if (gpu_enabled) bbgpu_debug_flush();
     fflush(NULL);
+    request_crash_snapshot();
 }
 /* Thread dump on request: SetEvent on "Local\bbport-dump-<pid>" prints every thread's call
  * chain. Threads are suspended only to copy their registers (a suspended thread may hold the
@@ -282,6 +300,7 @@ static unsigned __stdcall dump_thread(void *event) {
         }
         fprintf(stderr, "Thread dump end\n");
         fflush(NULL);
+        if (debug_dump_complete) SetEvent(debug_dump_complete);
     }
     return 0;
 }
@@ -289,6 +308,8 @@ static void start_dump_thread(void) {
     wchar_t name[64];
     swprintf(name, 64, L"Local\\bbport-dump-%lu", GetCurrentProcessId());
     HANDLE event = CreateEventW(NULL, FALSE, FALSE, name);
+    debug_dump_request=event;
+    debug_dump_complete=CreateEventW(NULL,TRUE,FALSE,NULL);
     if (event) CloseHandle((HANDLE)_beginthreadex(NULL, 0, dump_thread, event, 0, NULL));
 }
 /* BB_HW_WATCH=<file holding a hex address, "r" first for reads too>: a hardware watchpoint (DR0, 4 bytes) on every
@@ -378,8 +399,47 @@ static int fatal(DWORD code) {
         return 0;
     }
 }
+/* AMD SSE4a EXTRQ is used by Second Son's job code even on Intel hosts.
+ * AMD APM vol. 4: descriptor bits 5:0 are length (0 means 64), 13:8
+ * are index. Upper XMM bits are undefined; preserve them and all flags.
+ * Decode only register forms; unrelated illegal instructions remain fatal. */
+static int emulate_extrq(CONTEXT *c) {
+    const unsigned char *p = (const unsigned char *)(uintptr_t)c->Rip;
+    unsigned n = 0, rex = 0;
+    if (p[n++] != 0x66) return 0;
+    if ((p[n] & 0xf0) == 0x40) rex = p[n++];
+    if (p[n++] != 0x0f) return 0;
+    unsigned op = p[n++];
+    if (op != 0x78 && op != 0x79) return 0;
+    unsigned modrm = p[n++];
+    if ((modrm & 0xc0) != 0xc0) return 0;
+    M128A *xmm = &c->Xmm0;
+    unsigned dst, length, index;
+    if (op == 0x78) {
+        if (modrm & 0x38) return 0;
+        dst = (modrm & 7) | ((rex & 1) << 3);
+        length = p[n++] & 63;
+        index = p[n++] & 63;
+    } else {
+        dst = ((modrm >> 3) & 7) | ((rex & 4) << 1);
+        unsigned src = (modrm & 7) | ((rex & 1) << 3);
+        length = xmm[src].Low & 63;
+        index = (xmm[src].Low >> 8) & 63;
+    }
+    if (!length) length = 64;
+    /* AMD leaves index+length>64 undefined. Use the same bounded shift/mask
+     * operation for these descriptors; no C shift reaches 64 bits. Games use
+     * such descriptors while decoding the last packed element of a block. */
+    uint64_t mask = length == 64 ? UINT64_MAX : (UINT64_C(1) << length) - 1;
+    xmm[dst].Low = (xmm[dst].Low >> index) & mask;
+    c->Rip += n;
+    return 1;
+}
 static LONG CALLBACK vectored_handler(EXCEPTION_POINTERS *e) {
     EXCEPTION_RECORD *r = e->ExceptionRecord;
+    if (r->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION &&
+        guest_address((uintptr_t)e->ContextRecord->Rip) && emulate_extrq(e->ContextRecord))
+        return EXCEPTION_CONTINUE_EXECUTION;
     if (r->ExceptionCode == EXCEPTION_SINGLE_STEP && hw_watch_file && (e->ContextRecord->Dr6 & 1)) {
         /* A thread may still hold the previous address (or a cleared watch) until the watch
          * thread updates it: report only hits on the current address. */
@@ -415,28 +475,30 @@ static LONG WINAPI unhandled_filter(EXCEPTION_POINTERS *e) {
  * before main took the first 64) needs two loads, through TEB.TlsExpansionSlots: the site
  * jumps to a stub of its own (no call: the guest may keep data below rsp) and back. */
 static uint64_t patch_tls_reads(const Segment *segments, uint64_t count) {
-    static const unsigned char gs_load[9] = {0x65, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0};
+    enum { LOAD_SIZE=9 };
     const uint32_t slot = runtime_win_tls_slot();
     unsigned char **sites = NULL;
     size_t found = 0, capacity = 0;
     for (uint64_t i = 0; i < count; ++i) {
-        if (!(segments[i].flags & 1) || segments[i].size < sizeof(gs_load)) continue;
-        unsigned char *at = image + segments[i].address, *last = at + segments[i].size - sizeof(gs_load);
+        if (!(segments[i].flags & 1) || segments[i].size < LOAD_SIZE) continue;
+        unsigned char *at = image + segments[i].address, *last = at + segments[i].size - LOAD_SIZE;
         while (at <= last && (at = memchr(at, 0x65, (size_t)(last - at) + 1))) {
-            if (memcmp(at, gs_load, sizeof(gs_load))) { ++at; continue; }
+            /* mov r64, gs:[0], including R8-R15. Preserve the destination. */
+            if ((at[1]!=0x48 && at[1]!=0x4c) || at[2]!=0x8b || (at[3]&0xc7)!=4 ||
+                at[4]!=0x25 || at[5] || at[6] || at[7] || at[8]) { ++at; continue; }
             if (found == capacity) {
                 capacity = capacity ? capacity * 2 : 4096;
                 if (!(sites = realloc(sites, capacity * sizeof(*sites)))) fail("allocation failed");
             }
             sites[found++] = at;
-            at += sizeof(gs_load);
+            at += LOAD_SIZE;
         }
     }
     if (slot < 64) {
         uint32_t displacement = 0x1480 + slot * 8;
         for (size_t i = 0; i < found; ++i) memcpy(sites[i] + 5, &displacement, 4);
     } else if (found) {
-        enum { STUB = 21 };
+        enum { STUB = 22 };
         static const unsigned char expansion[9] = {0x65, 0x48, 0x8b, 0x04, 0x25, 0x80, 0x17, 0, 0}; /* mov rax, gs:[0x1780] */
         size_t bytes = round_page(found * STUB);
         unsigned char *stubs = allocate(bytes);
@@ -446,9 +508,16 @@ static uint64_t patch_tls_reads(const Segment *segments, uint64_t count) {
             int64_t back = (site + 9) - (stub + STUB), there = stub - (site + 5);
             if (back != (int32_t)back || there != (int32_t)there) fail("TLS stub out of jump range");
             int32_t back32 = (int32_t)back, there32 = (int32_t)there;
+            const unsigned reg=((site[3]>>3)&7)|((site[1]&4)<<1), low=reg&7;
+            memset(stub,0x90,STUB);
             memcpy(stub, expansion, 9);
-            stub[9] = 0x48; stub[10] = 0x8b; stub[11] = 0x80; memcpy(stub + 12, &index, 4); /* mov rax, [rax + index] */
-            stub[16] = 0xe9; memcpy(stub + 17, &back32, 4);                                 /* jmp site + 9 */
+            stub[1]=site[1]; stub[3]=site[3]; /* mov destination, gs:[0x1780] */
+            stub[9]=0x48|(reg>=8 ? 5 : 0); stub[10]=0x8b;
+            stub[11]=(unsigned char)(0x80|(low<<3)|low); /* mov destination, [destination + index] */
+            unsigned pos=12;
+            if (low==4) stub[pos++]=0x24; /* RSP/R12 bases require a SIB byte. */
+            memcpy(stub+pos,&index,4);
+            stub[17]=0xe9; memcpy(stub+18,&back32,4); /* jmp site + 9 */
             site[0] = 0xe9; memcpy(site + 1, &there32, 4); memset(site + 5, 0x90, 4);         /* jmp stub */
         }
         protect(stubs, bytes, 5);
@@ -605,6 +674,8 @@ static int main_argc;
 static char **main_argv;
 static unsigned __stdcall loader_thread(void *unused) { (void)unused; return (unsigned)loader_main(main_argc, main_argv); }
 int main(int argc, char **argv) {
+    /* Diagnostic supervisor timestamps each flushed line as it arrives. */
+    if (getenv("BB_DEBUG_DIR")) { setvbuf(stdout,NULL,_IONBF,0); setvbuf(stderr,NULL,_IONBF,0); }
     timeBeginPeriod(1); /* 1 ms waits for timed locks and sleeps outside runtime_sleep_ns */
     /* No EcoQoS: Windows 11 otherwise moves the threads of an unfocused window to efficiency
      * cores (hybrid CPUs), and the GPU command thread sets the frame rate. */

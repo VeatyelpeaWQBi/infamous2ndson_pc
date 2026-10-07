@@ -279,10 +279,16 @@ static void sample(PadData *d) {
     d->buttons|=injected.buttons;
     if (injected.touch_side>=0) touch_click(d,injected.touch_side);
     else if ((d->buttons & BTN_TOUCHPAD) && !d->touch_count) touch_click(d,0);
+    static int f10_was_down;
+    const bool *keys=SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(NULL) : NULL;
+    const int f10=keys && keys[SDL_SCANCODE_F10];
+    if (f10 && !f10_was_down) runtime_debug_mark();
+    f10_was_down=f10;
     if (injected.buttons & BTN_L2) d->l2=255;
     if (injected.buttons & BTN_R2) d->r2=255;
     uint8_t *axes[4]={&d->left_x,&d->left_y,&d->right_x,&d->right_y};
     for (int i=0;i<4;++i) if (injected.stick[i]>=0) *axes[i]=(uint8_t)injected.stick[i];
+    runtime_debug_input(d->buttons,d->left_x,d->left_y,d->right_x,d->right_y,d->l2,d->r2,d->touch_count);
 }
 
 static ABI int32_t pad_init(void) { host_lock(&lock); initialized=1; host_unlock(&lock); return 0; }

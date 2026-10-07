@@ -4,6 +4,7 @@
 #include <xxhash.h>
 #include "video_core/renderer_vulkan/ui_composition.h"
 #include "bbport_toggles.h"
+#include "bbport_diagnostics.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "common/debug.h"
 #include "core/debug_state.h"
@@ -379,6 +380,14 @@ u32 VerifyInterval() {
 } // namespace
 
 bool Rasterizer::DrawPipeWanted() {
+    // bbport: Second Son's Continue transition exposes concurrent scheduler
+    // producers in the additional DrawPipe stage (null recording chunk and
+    // invalid rendering scope). Keep one draw producer; the Vulkan recording
+    // worker can still run. An inherited Bloodborne switch must not reenable it.
+    if (const char* profile = std::getenv("BB_GAME_PROFILE");
+        profile && std::strcmp(profile, "infamous") == 0) {
+        return false;
+    }
     const char* env = std::getenv("BB_DRAW_PIPE");
     if (env && env[0]) {
         return env[0] == '1';
@@ -1123,8 +1132,13 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     const u32 num_instances = regs.num_instances.NumInstances();
     const u32 first_vertex = vertex_offset;
     const u32 first_instance = instance_offset;
+    const auto* diagnostic_ps=pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+    const u64 diagnostic_vs_hash=vs_info.pgm_hash;
+    const u64 diagnostic_ps_hash=diagnostic_ps ? diagnostic_ps->pgm_hash : 0;
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        BbDiagnostics::Record("draw",num_indices,num_instances,is_indexed,u64(VkPipeline(handle)));
+        BbDiagnostics::Record("shaders",diagnostic_vs_hash,diagnostic_ps_hash);
         if (is_indexed) {
             cmdbuf.drawIndexed(num_indices, num_instances, 0, s32(first_vertex), first_instance);
         } else {
@@ -1332,6 +1346,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     }
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        BbDiagnostics::Record("dispatch",dim_x,dim_y,dim_z,u64(VkPipeline(handle)));
         cmdbuf.dispatch(dim_x, dim_y, dim_z);
     });
     DebugState.IncDispatch();

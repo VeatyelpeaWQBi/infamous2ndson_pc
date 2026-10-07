@@ -1,4 +1,5 @@
 #include "bbport_write_log.h"
+#include "bbport_diagnostics.h"
 // bbport: glue between the C loader and the vendored shadPS4 video core.
 #include "bbport_overlay.h"
 #include "bbport_settings.h"
@@ -287,6 +288,7 @@ extern "C" uintptr_t bbgpu_resolve_identity(const char* nid, const char* library
     return 0;
 }
 
+extern "C" void bbgpu_debug_flush(void) { BbDiagnostics::Flush(true); }
 extern "C" int bbgpu_handle_fault(void* ucontext, void* address) {
     return Core::Signals::Instance()->DispatchAccessViolation(ucontext, address) ? 1 : 0;
 }

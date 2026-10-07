@@ -22,6 +22,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "bbport_threads.h"
+#include "bbport_diagnostics.h"
 
 namespace Vulkan {
 
@@ -123,6 +124,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         if (info.pStencilAttachment) {
             info.pStencilAttachment = &stencil_attachment;
         }
+        BbDiagnostics::Record("begin-render",info.renderArea.extent.width,info.renderArea.extent.height,info.colorAttachmentCount,info.layerCount);
         cmdbuf.beginRendering(info);
     });
 }
@@ -132,7 +134,11 @@ void Scheduler::EndRendering() {
         return;
     }
     is_rendering = false;
-    Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
+    Record([](vk::CommandBuffer cmdbuf) {
+        BbDiagnostics::Record("end-render-start");
+        cmdbuf.endRendering();
+        BbDiagnostics::Record("end-render-done");
+    });
 }
 
 void Scheduler::TraceDirectRecording(void* caller) {

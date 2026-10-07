@@ -180,9 +180,12 @@ static ABI __attribute__((noreturn)) void guest_libc_exit(int status) {
 }
 uintptr_t runtime_resolve(const char *name, int is_data) {
     if (!(capabilities & 1)) return 0;
+    RuntimeImportIdentity scoped_identity;
+    int scoped=0;
     if (strchr(name, ':')) {
         RuntimeImportIdentity identity;
         if (!runtime_identity_parse(name,&identity) || identity.is_data!=is_data) return 0;
+        scoped_identity=identity; scoped=1;
         const char *alias=runtime_identity_alias(name,is_data);
         if (alias) name=alias;
         else return bbgpu_resolve_identity(identity.nid,identity.library,identity.library_version,
@@ -215,6 +218,8 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     if (!strcmp(name, "vNe1w4diLCs#p#J")) return (uintptr_t)guest_tls_get_addr;
     if (!strcmp(name, "959qrazPIrg#p#J")) return (uintptr_t)guest_procparam;
     if (!strcmp(name, "p5EcQeEeJAE#p#J")) return (uintptr_t)guest_set_heap_api;
+    uintptr_t libc_internal=runtime_libc_internal_resolve(name);
+    if (libc_internal) return libc_internal;
     uintptr_t mutex = runtime_mutex_resolve(name);
     if (mutex) return mutex;
     uintptr_t thread = runtime_thread_resolve(name);
@@ -249,6 +254,8 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     if (save) return save;
     uintptr_t file = runtime_file_resolve(name);
     if (file) return file;
+    if (scoped) return bbgpu_resolve_identity(scoped_identity.nid,scoped_identity.library,
+        scoped_identity.library_version,scoped_identity.module,scoped_identity.module_version,is_data);
     return bbgpu_resolve(name);
 }
 static const struct { const char *nid, *symbol; } import_names[]={

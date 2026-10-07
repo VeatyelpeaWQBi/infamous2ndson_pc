@@ -1,6 +1,8 @@
 @echo off
 rem Reuse Windows Python first; MSYS2 Python is only a fallback.
 setlocal
+rem Redirected Windows logs must preserve Unicode game titles such as Second Son's TM.
+set "PYTHONIOENCODING=utf-8"
 if defined BB_PYTHON goto configured
 where python >nul 2>nul
 if not errorlevel 1 goto path_python

@@ -378,7 +378,10 @@ uintptr_t runtime_thread_resolve(const char *name) {
     };
     for (size_t i=0;i<sizeof(table)/sizeof(*table);++i)
         if (!strcmp(name,table[i].nid)) return (uintptr_t)table[i].fn;
-    return 0;
+    static const RuntimeExport named[]={
+        {"scePthreadAttrGetschedparam",(GuestCallback)attr_get_param},
+    };
+    return RUNTIME_LOOKUP(named,name);
 }
 void runtime_thread_report(void) {
     host_lock(&lock);

@@ -37,6 +37,7 @@ int bbgpu_text_input_poll(char *out_utf8, uint64_t size);
 int bbgpu_overlay_captures_input(void);
 /* Number of symbols registered by the vendored libraries (diagnostics). */
 unsigned bbgpu_symbol_count(void);
+void bbgpu_debug_flush(void);
 #ifdef __cplusplus
 }
 #endif

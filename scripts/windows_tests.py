@@ -8,6 +8,7 @@ from windows_tools import require_windows
 
 ROOT = Path(__file__).resolve().parent.parent
 NATIVE_CLASSES = ('test_probe.LoaderTests.', 'test_runtime.RuntimeTests.',
+                  'test_debug_session.NativeDiagnosticsTests.',
                   'test_infamous.InfamousNativeTests.',
                   'test_sema.SemaphoreTests.', 'test_content.ContentTests.')
 

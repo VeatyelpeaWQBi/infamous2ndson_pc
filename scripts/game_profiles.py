@@ -1,10 +1,22 @@
 """Title isolation and executable fingerprint checks for Windows launch preparation."""
 import hashlib
+import json
 from pathlib import Path
 from prepare import sfo
 
 BLOODBORNE_IDS = frozenset(('CUSA00207', 'CUSA00208', 'CUSA00900', 'CUSA01363', 'CUSA03173', 'CUSA03023'))
 SECOND_SON_SHA256 = '2d1ca79630d7bbe6fa29575f59aa7996d43071d74ac8e4f7d40137967d9039ab'
+SECOND_SON_LOCALE = dict(region='HK',system_language=10,timezone_minutes=480,confirm_button='circle')
+
+def console_locale(data):
+    path=Path(data)/'infamous-locale.json'
+    locale=dict(SECOND_SON_LOCALE)
+    if path.is_file(): locale.update(json.loads(path.read_text(encoding='utf-8')))
+    if (locale['region']!='HK' or type(locale['system_language']) is not int or
+        not 0<=locale['system_language']<=29 or type(locale['timezone_minutes']) is not int or
+        not -720<=locale['timezone_minutes']<=840 or locale['confirm_button'] not in ('circle','cross')):
+        raise ValueError(f'Invalid Second Son console locale: {path}')
+    return locale
 
 
 def select_profile(game):
@@ -35,7 +47,12 @@ def native_environment(profile, data, env):
                 'BB_UPSCALE_BEFORE_CS', 'BB_PATCHES', 'BB_PRESET_FILE', 'BB_TOGGLE_FILE', 'BB_DMEM_MB'):
         env.pop(key, None)
     state = Path(data) / 'profiles' / profile['title_id']
+    locale=console_locale(data)
     env.update(BB_GAME_PROFILE='infamous', BB_UPSCALER='none', BB_DEBUG_MOTION='0',
+               BB_REGION=locale['region'], BB_LANGUAGE=str(locale['system_language']),
+               BB_TIMEZONE_MINUTES=str(locale['timezone_minutes']),
+               BB_ENTER_BUTTON='0' if locale['confirm_button']=='circle' else '1',
+               BB_DRAW_PIPE='0',
                BB_LIVE_RES='0', BB_FPS='30', BB_VBLANK_HZ='60',
                BB_USER_DIR=str(state / 'user'), BB_GPU_USER_DIR=str(state / 'gpu'),
                BB_CONFIG=str(state / 'settings.ini'), BB_USER_NAME='Delsin')

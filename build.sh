@@ -101,8 +101,8 @@ else
 fi
 if [[ $build_tests == 1 ]]; then
     # All runtime tests use the same Win32 source set and flags as the executable.
-    "$CC" "${cflags[@]}" "${includes[@]}" -I. -Isrc tests/test_pad.c src/runtime_host.c \
-        "${libraries[@]}" -o out/pad-test.exe
+    "$CC" "${cflags[@]}" "${includes[@]}" -I. -Isrc tests/test_pad.c src/runtime_host.c src/runtime_debug.c src/win32_compat.c \
+        "${libraries[@]}" -lws2_32 -o out/pad-test.exe
     for name in runtime sema infamous; do
         "$CC" "${cflags[@]}" "${includes[@]}" -I. -Isrc "tests/test_$name.c" "${runtime[@]}" \
             out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" "${link[@]}" -o "out/$name-test.exe"

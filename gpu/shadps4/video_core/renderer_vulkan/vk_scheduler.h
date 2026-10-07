@@ -581,6 +581,9 @@ using SubmitFunc = Common::UniqueFunction<void, SubmitInfo&>;
 class RecordChunk {
 public:
     static constexpr size_t Capacity = 128 * 1024;
+    explicit RecordChunk(size_t capacity = Capacity)
+        : capacity{capacity}, storage{std::make_unique<StorageBlock[]>((capacity + 63) / 64)} {}
+    [[nodiscard]] size_t StorageCapacity() const noexcept { return capacity; }
 
     /// Returns false (and leaves `func` untouched) when the chunk has no room.
     template <typename Func>
@@ -588,10 +591,10 @@ public:
         using Command = TypedCommand<std::decay_t<Func>>;
         static_assert(sizeof(Command) <= Capacity, "recorded command is too large");
         const size_t offset = (used + alignof(Command) - 1) & ~(alignof(Command) - 1);
-        if (offset + sizeof(Command) > Capacity) {
+        if (offset + sizeof(Command) > capacity) {
             return false;
         }
-        auto* command = new (storage + offset) Command(std::forward<Func>(func));
+        auto* command = new (Data() + offset) Command(std::forward<Func>(func));
         if (last) {
             last->next = command;
         } else {
@@ -606,12 +609,12 @@ public:
     /// Raw storage in the chunk for a command's variable-length data; null when full.
     void* Allocate(size_t bytes, size_t align) {
         const size_t offset = (used + align - 1) & ~(align - 1);
-        if (offset + bytes > Capacity) {
+        if (offset + bytes > capacity) {
             return nullptr;
         }
         used = offset + bytes;
         PrefetchAhead();
-        return storage + offset;
+        return Data() + offset;
     }
 
     void Execute(vk::CommandBuffer cmdbuf) {
@@ -639,8 +642,10 @@ private:
     /// transfers instead of stalling on each (RecordPrefetch).
     void PrefetchAhead() const {
         if (!BbToggle::Disabled(BbToggle::RecordPrefetch)) {
-            __builtin_prefetch(storage + used + 384, 1, 3);
-            __builtin_prefetch(storage + used + 448, 1, 3);
+            if (used + 448 < capacity) {
+                __builtin_prefetch(Data() + used + 384, 1, 3);
+                __builtin_prefetch(Data() + used + 448, 1, 3);
+            }
         }
     }
 
@@ -659,7 +664,11 @@ private:
         Func func;
     };
 
-    alignas(64) std::byte storage[Capacity];
+    struct alignas(64) StorageBlock { std::byte bytes[64]; };
+    std::byte* Data() { return reinterpret_cast<std::byte*>(storage.get()); }
+    const std::byte* Data() const { return reinterpret_cast<const std::byte*>(storage.get()); }
+    size_t capacity;
+    std::unique_ptr<StorageBlock[]> storage;
     size_t used = 0;
     CommandBase* first{};
     CommandBase* last{};
@@ -760,10 +769,14 @@ public:
         if (!IsRecordingDeferred()) {
             return;
         }
-        ASSERT(bytes + 1024 <= RecordChunk::Capacity);
-        if (RecordChunk::Capacity - record_chunk->Size() < bytes + 1024) {
+        ASSERT(bytes <= SIZE_MAX - 1087);
+        if (record_chunk->StorageCapacity() - record_chunk->Size() < bytes + 1024) {
             full_chunks.push_back(std::move(record_chunk));
-            record_chunk = AcquireChunk();
+            // Second Son can upload more copy regions than Bloodborne's fixed
+            // 128 KiB block allows. Keep the data and its command together, with
+            // the same recording-thread lifetime, in a suitably sized block.
+            record_chunk = bytes + 1024 > RecordChunk::Capacity
+                ? std::make_unique<RecordChunk>(bytes + 1024) : AcquireChunk();
         }
     }
 

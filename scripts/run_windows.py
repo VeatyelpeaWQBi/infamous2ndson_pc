@@ -24,8 +24,10 @@ PYTHON = sys.executable
 
 
 def run(arguments, capture=False, check=True, env=None):
-    result = subprocess.run([str(a) for a in arguments], cwd=ROOT, env=env,
-                            stdout=subprocess.PIPE if capture else None, text=True)
+    child_env = dict(os.environ if env is None else env)
+    child_env['PYTHONIOENCODING'] = 'utf-8'
+    result = subprocess.run([str(a) for a in arguments], cwd=ROOT, env=child_env,
+                            stdout=subprocess.PIPE if capture else None, text=True, encoding='utf-8')
     if check and result.returncode:
         sys.exit(result.returncode)
     return result.stdout.strip() if capture else result.returncode
@@ -76,6 +78,9 @@ def main():
         out.mkdir(parents=True, exist_ok=True)
         config = Path(os.environ['BB_CONFIG'])
     print(f'Game profile: {profile["id"]} / {profile["title_id"]}', flush=True)
+    if profile['id']=='infamous':
+        print(f'Console locale: {os.environ["BB_REGION"]}, language={os.environ["BB_LANGUAGE"]}, '
+              f'UTC offset={os.environ["BB_TIMEZONE_MINUTES"]} minutes, confirm={os.environ["BB_ENTER_BUTTON"]}',flush=True)
     remembered.write_text(str(original), encoding='utf-8')
     os.environ['BB_GAME_DIR'] = str(original)
     # The in-game menu's "Apply and restart" runs this launcher again (probe.c runtime_restart).
@@ -140,7 +145,11 @@ def main():
             Path(os.environ['BB_USER_DIR']).mkdir(parents=True, exist_ok=True)
         print('Starting:', ' '.join(shlex.quote(str(c)) for c in command), flush=True)
         try:
-            status = subprocess.call([str(c) for c in command], cwd=ROOT)
+            if os.environ.get('BB_DEBUG_SESSION')=='1':
+                from debug_session import collect
+                status=collect(command,ROOT,out/'debug',profile)
+            else:
+                status = subprocess.call([str(c) for c in command], cwd=ROOT)
         except KeyboardInterrupt:
             status = 130
         return status
