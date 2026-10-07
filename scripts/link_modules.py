@@ -237,12 +237,13 @@ def link(game, out, module_names=DEFAULT_MODULES, scoped_imports=False):
                      or main_tls['vaddr'] + main_tls['filesz'] > size):
         raise ValueError('unsupported eboot TLS layout')
     procparam = next(p for p in main['ph'] if p['type'] == 0x61000001)
-    from infamous_cpu import protect_text_leaf, EBOOT_SHA256
+    from infamous_cpu import protect_text_leaf, protect_animation_leaf, EBOOT_SHA256
     if main['sha256'] == EBOOT_SHA256:
         from game_profiles import select_profile
         if select_profile(game)['title_id'] != 'CUSA00309':
             raise ValueError('Second Son CPU patch title mismatch')
     red_zone_operands = protect_text_leaf(image, segments, main['sha256'])
+    animation_operands = protect_animation_leaf(image, segments, main['sha256'])
     with (out / 'boot-linked.bin').open('wb') as f:
         f.write(struct.pack('<8s6Q', b'BBPROBE5', len(image), entry, len(segments), len(relocs), len(names), flags))
         f.write(struct.pack('<Q', procparam['vaddr']))
@@ -266,6 +267,7 @@ def link(game, out, module_names=DEFAULT_MODULES, scoped_imports=False):
     report = dict(modules=[{k: (hex(v) if k in ('base', 'init', 'tls_address') else v) for k, v in t.items()} for t in table],
                   bindings=len(bindings), imports=len(names), fs_loads_patched=fs_patched,
                   windows_red_zone_operands=red_zone_operands,
+                  windows_animation_stack_operands=animation_operands,
                   main_tls=dict(zip(('vaddr', 'filesz', 'memsz', 'align'), main_tls_values)),
                   unresolved_imports=unresolved, scoped_imports=scoped_imports,
                   main_original_imports=original_names,

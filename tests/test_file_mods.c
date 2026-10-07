@@ -3,6 +3,47 @@
 #include <assert.h>
 #include "windows_test.h"
 static int32_t guest_errno;
+static unsigned char *protected_buffer;
+static size_t protected_size;
+static unsigned write_faults;
+static LONG CALLBACK write_fault_handler(PEXCEPTION_POINTERS exception) {
+    if (exception->ExceptionRecord->ExceptionCode!=EXCEPTION_ACCESS_VIOLATION ||
+        exception->ExceptionRecord->NumberParameters<2 ||
+        exception->ExceptionRecord->ExceptionInformation[0]!=1) return EXCEPTION_CONTINUE_SEARCH;
+    uintptr_t address=exception->ExceptionRecord->ExceptionInformation[1];
+    if (address<(uintptr_t)protected_buffer || address-(uintptr_t)protected_buffer>=protected_size)
+        return EXCEPTION_CONTINUE_SEARCH;
+    DWORD old;
+    if (!VirtualProtect((void *)(address&~(uintptr_t)4095),4096,PAGE_READWRITE,&old))
+        return EXCEPTION_CONTINUE_SEARCH;
+    ++write_faults; return EXCEPTION_CONTINUE_EXECUTION;
+}
+static void protected_file_reads(void) {
+    int fd=(int)do_open("/app0/asset.dcx",0,0); assert(fd>=3);
+    protected_size=2*1024*1024+4096;
+    protected_buffer=VirtualAlloc(NULL,protected_size,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
+    assert(protected_buffer); memset(protected_buffer,0xcc,protected_size);
+    PVOID handler=AddVectoredExceptionHandler(1,write_fault_handler); assert(handler);
+    DWORD old; assert(VirtualProtect(protected_buffer,protected_size,PAGE_READONLY,&old));
+    write_faults=0;
+    assert(do_read(fd,protected_buffer,protected_size)==6);
+    assert(!memcmp(protected_buffer,"modded",6));
+    assert(write_faults==1); /* Only the page containing bytes actually returned is written. */
+    assert(protected_buffer[6]==0xcc && protected_buffer[protected_size-1]==0xcc);
+    assert(do_lseek(fd,2,0)==2);
+    assert(VirtualProtect(protected_buffer,protected_size,PAGE_READONLY,&old));
+    write_faults=0;
+    assert(do_pread(fd,protected_buffer,3,1)==3 && !memcmp(protected_buffer,"odd",3));
+    assert(write_faults==1 && do_lseek(fd,0,1)==2);
+    assert(do_pread(fd,protected_buffer,16,6)==0);
+    assert(do_pread(fd,protected_buffer,3,-1)==-EINVAL);
+    assert(do_pread(fd,protected_buffer,0,-1)==-EINVAL);
+    assert(do_read(fd,protected_buffer,0)==0);
+    assert(RemoveVectoredExceptionHandler(handler));
+    assert(VirtualFree(protected_buffer,0,MEM_RELEASE)); protected_buffer=NULL;
+    assert(!do_close(fd));
+    puts("Protected guest read/pread: correct bytes, partial EOF, untouched pages, position preserved PASS");
+}
 int32_t *runtime_errno(void) { return &guest_errno; }
 int32_t runtime_guest_errno(int e) { return e; }
 uintptr_t runtime_lookup(const RuntimeExport *table,size_t n,const char *name) {
@@ -45,6 +86,7 @@ int main(void) {
     }
     assert(found && !do_close(dir));
     int save=(int)do_open("/data/test-save",0x202,0644); assert(save>=3);
+    protected_file_reads();
     assert(do_write(save,"save",4)==4 && !do_close(save));
     assert(!path_op("/data/test-save",2,0));
     assert(!unlink(link) && !unlink(source) && !rmdir(game));

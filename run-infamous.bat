@@ -1,6 +1,13 @@
 @echo off
 setlocal
 cd /d "%~dp0"
+call "%~dp0scripts\windows_python.bat" "%~dp0scripts\infamous_language_menu.py"
+if errorlevel 2 (
+    echo Language settings could not be opened. See the message above.
+    pause
+    exit /b 2
+)
+if errorlevel 1 exit /b 0
 if not exist "out\CUSA00309" mkdir "out\CUSA00309"
 set "BB_PREBUILT=1"
 set "BB_DATA_DIR=%~dp0"

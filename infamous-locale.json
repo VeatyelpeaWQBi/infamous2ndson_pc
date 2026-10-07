@@ -2,5 +2,6 @@
   "region": "HK",
   "system_language": 10,
   "timezone_minutes": 480,
-  "confirm_button": "circle"
+  "confirm_button": "circle",
+  "show_fps": true
 }

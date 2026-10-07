@@ -35,6 +35,55 @@ def native_package(name='fixture-native', binding_address=4112, binding_kind=1,
 
 @unittest.skipUnless(EXE.exists(), 'run build.bat --build-tests first')
 class LoaderTests(unittest.TestCase):
+    def test_reserved_red_zone_preserves_locals_and_incoming_argument_across_extrq(self):
+        import hashlib
+        from infamous_cpu import _reserve_leaf_red_zone
+        # An actual native leaf keeps a sentinel below RSP and in an ordinary
+        # local, executes EXTRQ, then checks both values and the caller's argument.
+        # Deterministic writes below the *current* RSP model asynchronous host
+        # stack use: actual exception delivery need not overwrite it every time.
+        sentinel=0x123456789abcdef0
+        frame=0x28
+        code=bytearray(); allocations=[]; locals_=[]; arguments=[]
+        def emit(value,sites=None):
+            value=bytes.fromhex(value)
+            if sites is not None: sites.append((len(code),value))
+            code.extend(value)
+        emit('4881ec28000000',allocations)
+        code.extend(b'\x48\xb9'+struct.pack('<Q',sentinel))
+        emit('48894c24f8',locals_)
+        emit('48894c2408')
+        emit('66480f6ec1')
+        for displacement in ('e0','d0','c0','b0'):
+            emit('c5f8294424'+displacement,locals_)
+        emit('660f78c0080c')
+        emit('c5f157c9') # vxorpd xmm1,xmm1,xmm1
+        for displacement in ('e0','d0','c0','b0'):
+            emit('c5f8294c24'+displacement) # host-clobber model, not a guest local
+        emit('488b4424f8',locals_)
+        emit('4839c8 0f95c2 488b442408 4839c8 0f95c0 08c2')
+        for displacement in ('e0','d0','c0','b0'):
+            emit('c5f8284424'+displacement,locals_)
+            emit('66480f7ec0 4839c8 0f95c0 08c2')
+        emit('488b842430000000',arguments)
+        emit('4839c8 0f95c0 08d0 0fb6c0')
+        emit('4881c428000000',allocations)
+        emit('c3')
+        wrapper=bytes.fromhex('4883ec08')+b'\x48\xb8'+struct.pack('<Q',sentinel)+bytes.fromhex('48890424')
+        wrapper+=b'\xe8'+struct.pack('<i',128-len(wrapper)-5)
+        wrapper+=bytes.fromhex('4883c408 85c0 7506')
+        wrapper+=b'\xff\x25'+struct.pack('<i',64-len(wrapper)-6)+b'\x0f\x0b'
+        for protected in (False,True):
+            with self.subTest(protected=protected):
+                image=bytearray(wrapper.ljust(128,b'\0')+code)
+                if protected:
+                    _reserve_leaf_red_zone(image,[],128,len(image),hashlib.sha256(code).hexdigest(),
+                                           frame,allocations,locals_,arguments)
+                result=self.run_image(package(bytes(image),[(64,1,0,0)],['stack-locals-preserved']))
+                self.assertEqual(result.returncode,20 if protected else 139,result.stdout+result.stderr)
+                if protected:
+                    self.assertIn('first unsupported PS4 import: stack-locals-preserved',result.stdout)
+
     def test_sse4a_extract_register_and_immediate_forms(self):
         def movq_to_xmm(reg, value):
             return (b'\x48\xb8'+struct.pack('<Q',value)+

@@ -12,10 +12,14 @@ def console_locale(data):
     path=Path(data)/'infamous-locale.json'
     locale=dict(SECOND_SON_LOCALE)
     if path.is_file(): locale.update(json.loads(path.read_text(encoding='utf-8')))
+    return validate_console_locale(locale,path)
+
+def validate_console_locale(locale,source='console locale'):
     if (locale['region']!='HK' or type(locale['system_language']) is not int or
         not 0<=locale['system_language']<=29 or type(locale['timezone_minutes']) is not int or
-        not -720<=locale['timezone_minutes']<=840 or locale['confirm_button'] not in ('circle','cross')):
-        raise ValueError(f'Invalid Second Son console locale: {path}')
+        not -720<=locale['timezone_minutes']<=840 or locale['confirm_button'] not in ('circle','cross') or
+        type(locale.get('show_fps',True)) is not bool):
+        raise ValueError(f'Invalid Second Son console locale: {source}')
     return locale
 
 
@@ -54,5 +58,6 @@ def native_environment(profile, data, env):
                BB_ENTER_BUTTON='0' if locale['confirm_button']=='circle' else '1',
                BB_DRAW_PIPE='0',
                BB_LIVE_RES='0', BB_FPS='30', BB_VBLANK_HZ='60',
+               BB_SHOW_FPS='1' if locale.get('show_fps',True) else '0',
                BB_USER_DIR=str(state / 'user'), BB_GPU_USER_DIR=str(state / 'gpu'),
                BB_CONFIG=str(state / 'settings.ini'), BB_USER_NAME='Delsin')

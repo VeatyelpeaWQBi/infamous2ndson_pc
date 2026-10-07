@@ -358,14 +358,20 @@ PipelineCache::~PipelineCache() = default;
 // bbport: shader/pipeline compile time on the GPU thread, reported by BB_FRAME_STATS.
 std::atomic<u64> g_bb_compile_ns;
 std::atomic<u32> g_bb_compiles;
+std::atomic<u64> g_bb_perf_compile_ns, g_bb_perf_compiles;
 namespace {
+thread_local unsigned compile_depth;
 struct CompileTimer {
+    bool outer = compile_depth++ == 0;
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
     ~CompileTimer() {
-        g_bb_compile_ns += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        const auto elapsed = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    std::chrono::steady_clock::now() - start)
                                    .count());
+        g_bb_compile_ns += elapsed;
         ++g_bb_compiles;
+        --compile_depth;
+        if (outer) { g_bb_perf_compile_ns += elapsed; ++g_bb_perf_compiles; }
     }
 };
 } // namespace

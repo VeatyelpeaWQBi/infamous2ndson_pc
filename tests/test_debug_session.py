@@ -13,6 +13,30 @@ import debug_session
 from test_probe import package
 
 class SessionTests(unittest.TestCase):
+    def test_fps_uses_published_interval_and_does_not_invent_zero_on_stale_heartbeat(self):
+        a={'tick_ms':1000,'presents':100}
+        self.assertEqual(debug_session.heartbeat_fps({'tick_ms':2500,'presents':160},a),40)
+        self.assertIsNone(debug_session.heartbeat_fps(a,a))
+        self.assertIsNone(debug_session.heartbeat_fps({'tick_ms':3000,'presents':1},a))
+    def test_selected_user_baseline_is_kept_within_existing_session_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base=Path(tmp)
+            for i in range(6):
+                folder=base/f'session-{i}'; folder.mkdir()
+                debug_session.save_json(folder/'status.json',{'collector':'infamous-debug-v1',
+                    'finished':True,'retain_for_debug':i==0})
+            debug_session.prune_sessions(base,keep=3)
+            self.assertEqual({p.name for p in base.iterdir()},{'session-0','session-4','session-5'})
+
+    def test_snapshot_requests_both_threads_pixels_and_render_bindings(self):
+        with tempfile.TemporaryDirectory() as tmp,contextlib.redirect_stdout(io.StringIO()):
+            base=Path(tmp); session=base/'session-fixture'; session.mkdir()
+            debug_session.save_json(base/'active.json',{'session':str(session),'finished':False})
+            with patch.object(debug_session,'collector_stopped',return_value=False):
+                self.assertEqual(debug_session.control(base,'snapshot'),0)
+            for name in ('request-snapshot','capture-next','render-frame-request'):
+                self.assertTrue((session/name).is_file())
+
     def test_giant_unicode_message_is_valid_and_bounded(self):
         with tempfile.TemporaryDirectory() as tmp:
             path=Path(tmp)/'log'; writer=debug_session.RotatingWriter(path,128)
@@ -66,6 +90,9 @@ class SessionTests(unittest.TestCase):
                 self.assertEqual(launch.call_count,1)
             self.assertEqual(status,0)
             active=debug_session.read_json(Path(tmp)/'active.json'); session=Path(active['session'])
+            launch_env=launch.call_args.kwargs['env']
+            self.assertEqual(launch_env['BB_TOGGLE_FILE'],str(session/'optimizations-mask.txt'))
+            self.assertEqual(launch_env['BB_CAPTURE_TRIGGER'],str(session/'render-frame-request'))
             self.assertTrue(active['finished']); self.assertIsNone(active['monitor_error'])
             metrics=[json.loads(line) for line in (session/'metrics.jsonl').read_text().splitlines()]
             self.assertTrue(metrics); self.assertIn('working_set_bytes',metrics[0])
@@ -84,6 +111,30 @@ class SessionTests(unittest.TestCase):
 
 @unittest.skipUnless(native_executable('bb-probe').exists(),'build.bat --build-tests required')
 class NativeDiagnosticsTests(unittest.TestCase):
+    def test_f10_short_presses_record_three_marks_without_pad_reads(self):
+        with tempfile.TemporaryDirectory() as tmp,contextlib.redirect_stdout(io.StringIO()):
+            status=debug_session.collect([native_executable('pad-test'),'--debug-hotkey'],ROOT,Path(tmp),{'title_id':'fixture'})
+            self.assertEqual(status,0)
+            session=Path(debug_session.read_json(Path(tmp)/'active.json')['session'])
+            marks=[line for line in (session/'input.txt').read_text().splitlines() if line.startswith('# MARK ')]
+            self.assertEqual(len(marks),3)
+            log=(session/'runtime.log').read_text()
+            self.assertEqual(log.count('DEBUG_MARK'),3)
+            self.assertEqual(log.count('F10 performance mark saved'),3)
+            self.assertNotIn('F10 thread snapshot signaled',log)
+            self.assertFalse((session/'capture-next').exists())
+            self.assertFalse((session/'render-frame-request').exists())
+
+    def test_explicit_deep_f10_retains_threads_and_render_capture(self):
+        with tempfile.TemporaryDirectory() as tmp,contextlib.redirect_stdout(io.StringIO()):
+            env=dict(os.environ,BB_F10_DEEP='1')
+            status=debug_session.collect([native_executable('pad-test'),'--debug-hotkey'],ROOT,Path(tmp),{'title_id':'fixture'},env)
+            self.assertEqual(status,0)
+            session=Path(debug_session.read_json(Path(tmp)/'active.json')['session'])
+            self.assertEqual((session/'runtime.log').read_text().count('F10 thread snapshot signaled'),3)
+            self.assertTrue((session/'capture-next').exists())
+            self.assertTrue((session/'render-frame-request').exists())
+
     def test_synthetic_guest_fault_keeps_exit_registers_and_all_thread_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp,contextlib.redirect_stdout(io.StringIO()):
             base=Path(tmp); image=base/'boot.bin'; image.write_bytes(package(bytes.fromhex('0f0b')))

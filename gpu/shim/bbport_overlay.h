@@ -34,4 +34,9 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent);
 /// The menu is open: the game's input is held neutral.
 bool CapturesInput();
 
+/// Window thread: acknowledge receiving F10; independent of FPS visibility.
+void NotifyDebugMark();
+/// Window thread: show the F11 recording state for five seconds.
+void NotifyPerformanceRecording(bool active);
+
 } // namespace BbOverlay

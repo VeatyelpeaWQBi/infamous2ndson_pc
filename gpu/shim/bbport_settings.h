@@ -70,7 +70,7 @@ struct Values {
     std::atomic<bool> effects[EffectCount]{};
     std::atomic<int> model_lod{0}; ///< -2 highest .. 2 lowest, 0 the game's
     std::atomic<int> output_res{OutputDefault}; ///< index into OutputWidths
-    /// Borderless fullscreen window at the desktop size (F11 toggles; BB_FULLSCREEN overrides).
+    /// Borderless fullscreen window at the desktop size (Shift+F11 toggles; BB_FULLSCREEN overrides).
     std::atomic<bool> fullscreen{false};
     /// Live resolution and preset changes (run.sh): 0 off by default (startup patch, fastest
     /// on the Steam Deck and older GPUs), -1 auto (strong discrete GPUs), 1 on. On restart.

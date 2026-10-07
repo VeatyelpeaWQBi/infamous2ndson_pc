@@ -5,6 +5,7 @@
 #include "video_core/renderer_vulkan/ui_composition.h"
 #include "bbport_toggles.h"
 #include "bbport_diagnostics.h"
+#include "video_core/renderer_vulkan/stencil_reference.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "common/debug.h"
 #include "core/debug_state.h"
@@ -909,11 +910,14 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
     // the images registered there are written to BB_CAPTURE_DIR (TextureCache::DumpImagesAt).
     if (static const char* trigger = std::getenv("BB_IMAGE_DUMP_TRIGGER"); trigger) {
         static u32 polls = 0;
-        if ((++polls & 1023) == 0 && std::filesystem::exists(trigger)) {
+        static const bool inspect=[] { const char* v=std::getenv("BB_IMAGE_INSPECT"); return v && v[0]=='1'; }();
+        const bool checkpoint=inspect ? (Regs().color_buffers[0] &&
+            FrameCapture::IsDisplayBuffer(Regs().color_buffers[0].Address())) : (++polls & 1023)==0;
+        if (checkpoint && std::filesystem::exists(trigger)) {
             std::vector<VAddr> addresses;
             if (FILE* f = std::fopen(trigger, "r")) {
                 unsigned long long address;
-                while (std::fscanf(f, "%llx", &address) == 1) {
+                while (addresses.size()<8 && std::fscanf(f, "%llx", &address) == 1) {
                     addresses.push_back(address);
                 }
                 std::fclose(f);
@@ -944,7 +948,11 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
             return;
         }
     }
-    const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline({}, prepared);
+    const GraphicsPipeline* pipeline;
+    {
+        BbStats::Timer timer{BbStats::pipeline_select_ns};
+        pipeline = pipeline_cache.GetGraphicsPipeline({}, prepared);
+    }
     const PreparedDraw* used_prepared = pipeline_cache.UsedPrepared();
     if (prepared) {
         draw_prep->Count(pipeline != nullptr &&
@@ -1137,8 +1145,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     const u64 diagnostic_ps_hash=diagnostic_ps ? diagnostic_ps->pgm_hash : 0;
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
-        BbDiagnostics::Record("draw",num_indices,num_instances,is_indexed,u64(VkPipeline(handle)));
-        BbDiagnostics::Record("shaders",diagnostic_vs_hash,diagnostic_ps_hash);
+        BbDiagnostics::RecordDraw(num_indices,num_instances,is_indexed,u64(VkPipeline(handle)),
+                                  diagnostic_vs_hash,diagnostic_ps_hash);
         if (is_indexed) {
             cmdbuf.drawIndexed(num_indices, num_instances, 0, s32(first_vertex), first_instance);
         } else {
@@ -1148,6 +1156,16 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     if (FrameCapture::Active()) {
         const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
         FrameCapture::Draw(vs_info.pgm_hash, ps ? ps->pgm_hash : 0, num_indices, num_instances);
+        const auto& viewport=regs.viewports[0];
+        const auto note=fmt::format("\ndraw offsets vertex={} instance={}\ndepth test={} write={} func={} clear={} zclear={} "
+            "clip_kill={} cull={}/{} viewport={}x{} zscale={} zoffset={}\n",
+            first_vertex,first_instance,
+            u32(regs.depth_control.depth_enable),u32(regs.depth_control.depth_write_enable),
+            u32(regs.depth_control.depth_func),u32(regs.depth_render_control.depth_clear_enable),
+            regs.depth_clear,u32(regs.clipper_control.dx_rasterization_kill),
+            u32(regs.polygon_control.cull_front),u32(regs.polygon_control.cull_back),
+            viewport.xscale*2,viewport.yscale*2,viewport.zscale,viewport.zoffset);
+        FrameCapture::Note(note.c_str());
         if (const auto& bc = regs.blend_control[0]; bc.enable && regs.color_buffers[0]) {
             char note[128];
             std::snprintf(note, sizeof(note), "\n  blend ps %08x idx %u: src %u dst %u func %u z %u%u",
@@ -1544,6 +1562,7 @@ void Rasterizer::JoinBindHelper(void* context) {
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
+    BbStats::Timer bind_timer{BbStats::bind_ns};
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
         return false;
@@ -3400,12 +3419,16 @@ void Rasterizer::UpdateDepthStencilState() const {
                    zpass == AmdGpu::StencilFunc::ReplaceOp ||
                    zfail == AmdGpu::StencilFunc::ReplaceOp;
         };
-        const bool front_op =
+        const bool front_replace =
             uses_op_val(sc.stencil_fail_front, sc.stencil_zpass_front, sc.stencil_zfail_front);
-        const bool back_op =
+        const bool back_replace =
             regs.depth_control.backface_enable
                 ? uses_op_val(sc.stencil_fail_back, sc.stencil_zpass_back, sc.stencil_zfail_back)
-                : front_op;
+                : front_replace;
+        const u32 front_write = !stencil_clear ? front.stencil_write_mask : 0U;
+        const u32 back_write = !stencil_clear ? back.stencil_write_mask : 0U;
+        const bool front_op = front_replace && front_write;
+        const bool back_op = back_replace && back_write;
         const auto ref_conflict = [](AmdGpu::CompareFunc func, const AmdGpu::StencilRefMask& ref) {
             return func != AmdGpu::CompareFunc::Always && func != AmdGpu::CompareFunc::Never &&
                    ref.stencil_test_val != ref.stencil_op_val;
@@ -3416,11 +3439,20 @@ void Rasterizer::UpdateDepthStencilState() const {
             LOG_WARNING(Render_Vulkan, "Stencil test requires test_val while ReplaceOp requires "
                                        "op_val; the stencil test will use op_val");
         }
-        dynamic_state.SetStencilReferences(front_op ? front.stencil_op_val : front.stencil_test_val,
-                                           back_op ? back.stencil_op_val : back.stencil_test_val);
-        dynamic_state.SetStencilWriteMasks(!stencil_clear ? front.stencil_write_mask : 0U,
-                                           !stencil_clear ? back.stencil_write_mask : 0U);
+        dynamic_state.SetStencilReferences(
+            StencilReference::Select(front.stencil_test_val,front.stencil_op_val,front_write,front_replace),
+            StencilReference::Select(back.stencil_test_val,back.stencil_op_val,back_write,back_replace));
+        dynamic_state.SetStencilWriteMasks(front_write,back_write);
         dynamic_state.SetStencilCompareMasks(front.stencil_mask, back.stencil_mask);
+        if (FrameCapture::Active()) {
+            const auto note = fmt::format("\nstencil front compare={} test={} op={} mask={} write={} "
+                                          "ops={}/{}/{} back compare={} test={} op={}\n",
+                u32(regs.depth_control.stencil_ref_func), u32(front.stencil_test_val),
+                u32(front.stencil_op_val), u32(front.stencil_mask), u32(front.stencil_write_mask),
+                u32(sc.stencil_fail_front),u32(sc.stencil_zpass_front),u32(sc.stencil_zfail_front),
+                u32(regs.depth_control.stencil_bf_func),u32(back.stencil_test_val),u32(back.stencil_op_val));
+            FrameCapture::Note(note.c_str());
+        }
     }
 }
 

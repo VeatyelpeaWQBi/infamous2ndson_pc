@@ -65,7 +65,10 @@ void runtime_debug_input(uint32_t buttons,uint8_t lx,uint8_t ly,uint8_t rx,uint8
     LeaveCriticalSection(&debug_lock);
 }
 void runtime_debug_mark(void) {
-    if (!debug_ready()) return;
+    if (!debug_ready()) {
+        fprintf(stderr,"DEBUG: F10 received, but no diagnostic session is configured\n");
+        return;
+    }
     const uint64_t tick=GetTickCount64();
     EnterCriticalSection(&debug_lock);
     if (enabled) {
@@ -73,14 +76,43 @@ void runtime_debug_mark(void) {
         input_write(line);
     }
     LeaveCriticalSection(&debug_lock);
-    fprintf(stderr,"DEBUG_MARK tick_ms=%llu: F10 thread snapshot requested\n",(unsigned long long)tick);
+    fprintf(stderr,"DEBUG_MARK tick_ms=%llu: F10 received on window event thread\n",(unsigned long long)tick);
+    /* Keep performance marks out of the expensive frame analyzer and thread
+     * suspension path. Explicit debug-control snapshot retains deep capture. */
+    const char *deep=getenv("BB_F10_DEEP");
+    if (!deep || deep[0]!='1') {
+        fprintf(stderr,"DEBUG: F10 performance mark saved tick_ms=%llu; see frames.csv\n",(unsigned long long)tick);
+        fflush(stderr);
+        return;
+    }
     char capture[32768]; const char *directory=getenv("BB_DEBUG_DIR");
     if (directory && strlen(directory)<sizeof(capture)-32) {
         snprintf(capture,sizeof(capture),"%s/capture-next",directory);
         FILE *request=fopen(capture,"w"); if (request) fclose(request);
+        snprintf(capture,sizeof(capture),"%s/render-frame-request",directory);
+        request=fopen(capture,"w"); if (request) fclose(request);
     }
     wchar_t name[64]; swprintf(name,64,L"Local\\bbport-dump-%lu",GetCurrentProcessId());
     HANDLE event=OpenEventW(EVENT_MODIFY_STATE,FALSE,name);
-    if (event) { SetEvent(event); CloseHandle(event); }
+    if (event) {
+        if (SetEvent(event)) fprintf(stderr,"DEBUG: F10 thread snapshot signaled tick_ms=%llu\n",(unsigned long long)tick);
+        else fprintf(stderr,"DEBUG: F10 SetEvent failed, Win32 error %lu\n",GetLastError());
+        CloseHandle(event);
+    }
     else fprintf(stderr,"DEBUG: thread snapshot request failed, Win32 error %lu\n",GetLastError());
+    fflush(stderr);
+}
+void runtime_debug_motion(int active,const float q[4],const float a[3],const float w[3]) {
+    if (!debug_ready()) return;
+    static uint64_t last_motion;
+    static int was_active;
+    const uint64_t tick=GetTickCount64();
+    EnterCriticalSection(&debug_lock);
+    if (enabled && (active!=was_active || (active && tick-last_motion>=50))) {
+        char line[384];
+        snprintf(line,sizeof(line),"# MOTION %llu %d q=%.6g,%.6g,%.6g,%.6g a=%.6g,%.6g,%.6g w=%.6g,%.6g,%.6g\n",
+            (unsigned long long)tick,active,q[0],q[1],q[2],q[3],a[0],a[1],a[2],w[0],w[1],w[2]);
+        input_write(line); last_motion=tick; was_active=active;
+    }
+    LeaveCriticalSection(&debug_lock);
 }

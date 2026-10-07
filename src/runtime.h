@@ -91,6 +91,7 @@ uintptr_t runtime_pad_resolve(const char *name);
 void runtime_debug_input(uint32_t buttons,uint8_t lx,uint8_t ly,uint8_t rx,uint8_t ry,
                          uint8_t l2,uint8_t r2,uint8_t touches);
 void runtime_debug_mark(void);
+void runtime_debug_motion(int active,const float orientation[4],const float acceleration[3],const float velocity[3]);
 void runtime_pad_report(void);
 uintptr_t runtime_rtc_resolve(const char *name);
 const char *runtime_file_user_dir(void);

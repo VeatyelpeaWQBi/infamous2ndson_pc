@@ -4,6 +4,8 @@
 #include <mutex>
 #include <set>
 #include <utility>
+#include <cmath>
+#include <limits>
 #include <xxhash.h>
 
 #include "bbport_toggles.h"
@@ -139,6 +141,65 @@ void TextureCache::DumpImagesAt(VAddr address, const char* dir) {
                     image.info.resources.layers, image.info.resources.levels,
                     image.info.props.is_depth ? "depth" : "color");
         if (image.info.props.is_block) {
+            continue;
+        }
+        if (const char* inspect=std::getenv("BB_IMAGE_INSPECT"); inspect && inspect[0]=='1') {
+            // Nine small patches, mip/layer zero. No full-frame dumps or extra
+            // files: summarize in the collector's existing bounded runtime.log.
+            if (n++>=4 || !width || !height) continue;
+            u32 channels=0, scalar_bytes=0; bool half=false, fp32=false;
+            switch (image.info.pixel_format) {
+            case vk::Format::eR8G8B8A8Unorm: case vk::Format::eR8G8B8A8Srgb:
+                channels=4; scalar_bytes=1; break;
+            case vk::Format::eR16G16B16A16Sfloat: channels=4; scalar_bytes=2; half=true; break;
+            case vk::Format::eR16G16B16A16Unorm: channels=4; scalar_bytes=2; break;
+            case vk::Format::eR16G16Sfloat: channels=2; scalar_bytes=2; half=true; break;
+            case vk::Format::eR16Sfloat: channels=1; scalar_bytes=2; half=true; break;
+            case vk::Format::eD32SfloatS8Uint: case vk::Format::eD32Sfloat:
+            case vk::Format::eR32Sfloat: channels=1; scalar_bytes=4; fp32=true; break;
+            default: std::printf("DEBUG_IMAGE unsupported format %s\n",format.c_str()); continue;
+            }
+            const u32 sw=std::min(8u,width), sh=std::min(8u,height);
+            const u64 patch_bytes=u64(sw)*sh*channels*scalar_bytes;
+            const u64 stride=(patch_bytes+3)&~u64(3);
+            const auto download=runtime.GetStagingPool().Request(stride*9,MemoryType::HostCached,16);
+            std::array<vk::BufferImageCopy,9> copies{};
+            for (u32 y=0;y<3;++y) for (u32 x=0;x<3;++x) {
+                auto& copy=copies[y*3+x]; copy.bufferOffset=download.offset+stride*(y*3+x);
+                copy.imageSubresource=vk::ImageSubresourceLayers{image.info.props.is_depth ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor,0,0,1};
+                copy.imageOffset=vk::Offset3D{s32((width-sw)*x/2),s32((height-sh)*y/2),0};
+                copy.imageExtent=vk::Extent3D{sw,sh,1};
+            }
+            runtime.DownloadImage(&image,download.buffer,copies);
+            scheduler.Finish(); download.Invalidate();
+            const auto* bytes=static_cast<const u8*>(download.mapped);
+            std::printf("DEBUG_IMAGE address=%#llx format=%s extent=%ux%u patches=9x%ux%u\n",
+                static_cast<unsigned long long>(address),format.c_str(),width,height,sw,sh);
+            for(u32 channel=0;channel<channels;++channel) {
+                double minimum=std::numeric_limits<double>::infinity(),maximum=-minimum,sum=0;
+                u32 finite=0,nonfinite=0,zero=0;
+                for(u32 patch=0;patch<9;++patch) for(u32 pixel=0;pixel<sw*sh;++pixel) {
+                    const auto* p=bytes+stride*patch+(pixel*channels+channel)*scalar_bytes;
+                    double value;
+                    if(fp32) { float v; std::memcpy(&v,p,4); value=v; }
+                    else if(scalar_bytes==1) value=*p/255.0;
+                    else {
+                        u16 v; std::memcpy(&v,p,2);
+                        if(!half) value=v/65535.0;
+                        else {
+                            const u32 exponent=(v>>10)&31, mantissa=v&1023;
+                            value=exponent==31 ? (mantissa ? std::numeric_limits<double>::quiet_NaN() : std::numeric_limits<double>::infinity()) :
+                                std::ldexp(double(exponent ? mantissa+1024 : mantissa),exponent ? int(exponent)-25 : -24);
+                            if(v&0x8000) value=-value;
+                        }
+                    }
+                    if(!std::isfinite(value)) { ++nonfinite; continue; }
+                    ++finite; zero+=value==0; sum+=value;
+                    minimum=std::min(minimum,value); maximum=std::max(maximum,value);
+                }
+                std::printf("DEBUG_IMAGE channel=%u finite=%u nonfinite=%u zero=%u min=%.8g max=%.8g mean=%.8g\n",
+                    channel,finite,nonfinite,zero,minimum,maximum,finite ? sum/finite : 0);
+            }
             continue;
         }
         const u32 bytes_per_pixel = image.info.props.is_depth ? 4 : image.info.num_bits / 8;

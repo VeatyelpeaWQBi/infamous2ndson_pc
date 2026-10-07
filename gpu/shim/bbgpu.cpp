@@ -30,6 +30,9 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 extern "C" {
+int bbgpu_toggle_performance_recording(void) {
+    return BbDiagnostics::ToggleRecording() ? 1 : 0;
+}
 // runtime_memory.c
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
 int runtime_memory_write_backing(uintptr_t address, const void* data, uint64_t size);
@@ -229,6 +232,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
     const s32 width = config->width, height = config->height;
     g_window_thread = std::thread([title, width, height] {
         Common::SetCurrentThreadName("bb:window");
+        BbDiagnostics::Writer diagnostics_writer;
         auto* window = new Frontend::WindowSDL(width, height, title.c_str());
         {
             std::scoped_lock lock{g_window_mutex};
@@ -240,6 +244,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
             SDL_Delay(2);
         }
         LOG_INFO(Frontend, "Window closed by user");
+        BbDiagnostics::Flush(true);
         std::fflush(stdout);
         std::_Exit(0);
     });

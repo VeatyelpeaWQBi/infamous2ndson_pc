@@ -43,6 +43,8 @@ private:
     int text_state{};
     std::string text, text_prompt, base_title;
     void UpdateTextTitle();
+    void UpdateMouseMotion();
+    bool mouse_relative{};
     SDL_Window* window{};
     WindowSystemInfo window_info{};
 };

@@ -522,10 +522,14 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         const char* dir=std::getenv("BB_DEBUG_DIR"); return dir ? std::string(dir)+"/capture-next" : std::string{};
     }();
     const u64 capture_tick=GetTickCount64();
+    static const bool manual_only=[] {
+        const char* value=std::getenv("BB_CAPTURE_MANUAL_ONLY");
+        return value && value[0]=='1';
+    }();
     const bool manual_capture=!capture_request.empty() && GetFileAttributesA(capture_request.c_str())!=INVALID_FILE_ATTRIBUTES;
-    const bool capture_due=manual_capture || (capture_interval ?
+    const bool capture_due=manual_capture || (!manual_only && (capture_interval ?
         !diagnostic_capture_tick || capture_tick-diagnostic_capture_tick>=capture_interval :
-        diagnostic_frames==1 || diagnostic_frames%60==0);
+        diagnostic_frames==1 || diagnostic_frames%60==0));
     const auto capture_format = swapchain.GetSurfaceFormat().format;
     const bool bgra = capture_format == vk::Format::eB8G8R8A8Unorm ||
                       capture_format == vk::Format::eB8G8R8A8Srgb;

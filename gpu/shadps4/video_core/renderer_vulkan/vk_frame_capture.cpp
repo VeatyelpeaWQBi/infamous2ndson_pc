@@ -3,10 +3,12 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <format>
 #include <mutex>
+#include <windows.h>
 
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/image_info.h"
@@ -50,6 +52,9 @@ void AddBuffers(Entry& entry) {
     pending_buffers.clear();
 }
 bool pass_open = false;
+bool truncated = false;
+size_t buffer_bytes = 0;
+constexpr size_t MaxEntries = 256, MaxBufferBytes = 128 * 1024;
 std::mutex display_mutex;
 std::vector<VAddr> display_buffers;
 // bbport: read on every draw; the game registers a handful of display buffers once.
@@ -69,7 +74,7 @@ std::string Describe(const Target& t) {
 
 void AddSampled(Entry& entry) {
     for (const auto& s : pending_sampled) {
-        if (entry.sampled.size() < 32 &&
+        if (entry.sampled.size() < 16 &&
             std::ranges::find(entry.sampled, s) == entry.sampled.end()) {
             entry.sampled.push_back(s);
         }
@@ -87,12 +92,14 @@ void Write(VAddr presented) {
     const char* dir = std::getenv("BB_CAPTURE_DIR");
     const std::string path =
         std::format("{}/frame_{}.txt", dir ? dir : ".", static_cast<long long>(std::time(nullptr)));
-    FILE* f = std::fopen(path.c_str(), "w");
+    const bool session_log = std::getenv("BB_DEBUG_DIR") != nullptr;
+    FILE* f = session_log ? stdout : std::fopen(path.c_str(), "w");
     if (!f) {
         std::printf("Frame capture: cannot write %s\n", path.c_str());
         return;
     }
-    std::fprintf(f, "presented buffer %#llx\n", static_cast<unsigned long long>(presented));
+    std::fprintf(f, "DEBUG_FRAME_BEGIN tick_ms=%llu presented=%#llx truncated=%u\n",
+                 GetTickCount64(), static_cast<unsigned long long>(presented), unsigned(truncated));
     u32 index = 0;
     for (const auto& e : entries) {
         if (e.compute) {
@@ -121,8 +128,10 @@ void Write(VAddr presented) {
             std::fprintf(f, "%s\n", b.c_str());
         }
     }
-    std::fclose(f);
-    std::printf("Frame capture: %zu passes written to %s\n", entries.size(), path.c_str());
+    std::fprintf(f, "DEBUG_FRAME_END passes=%zu\n", entries.size());
+    if (session_log) std::fflush(f); else std::fclose(f);
+    std::printf("Frame capture: %zu passes written to %s\n", entries.size(),
+                session_log ? "session runtime.log" : path.c_str());
 }
 
 } // namespace
@@ -196,6 +205,8 @@ void FrameCapture::BeginPass(const VideoCore::ImageInfo* const* colors, u32 num_
         pending_sampled.clear();
         pending_buffers.clear();
         pass_open = false;
+        buffer_bytes = 0;
+        truncated = false;
         state.store(Recording, std::memory_order_release);
     }
     if (state.load(std::memory_order_relaxed) != Recording) {
@@ -207,6 +218,9 @@ void FrameCapture::BeginPass(const VideoCore::ImageInfo* const* colors, u32 num_
     if (pass_open && !entries.empty() && !entries.back().compute &&
         entries.back().colors == targets && entries.back().depth == d) {
         return;
+    }
+    if (entries.size() >= MaxEntries) {
+        truncated = true; pending_sampled.clear(); pending_buffers.clear(); return;
     }
     entries.push_back({.compute = false, .colors = std::move(targets), .depth = d});
     pass_open = true;
@@ -236,6 +250,9 @@ void FrameCapture::Dispatch(u64 cs_hash, u32 x, u32 y, u32 z) {
         entries.back().shaders[0] == cs_hash) {
         ++entries.back().draws;
     } else {
+        if (entries.size() >= MaxEntries) {
+            truncated = true; pending_sampled.clear(); pending_buffers.clear(); return;
+        }
         entries.push_back({.compute = true, .draws = 1, .shaders = {cs_hash}});
         entries.back().note = std::format("groups {}x{}x{}", x, y, z);
     }
@@ -245,6 +262,9 @@ void FrameCapture::Dispatch(u64 cs_hash, u32 x, u32 y, u32 z) {
 }
 
 void FrameCapture::Buffer(u64 stage_hash, u32 slot, VAddr address, const void* data, u64 size) {
+    if (pending_buffers.size() >= 16 || buffer_bytes >= MaxBufferBytes) {
+        truncated = true; return;
+    }
     const u64 bytes = std::min<u64>(size, 1024) & ~u64(3);
     std::string out = std::format("  buffer stage {:016x} slot {} at {:#x} size {}:", stage_hash,
                                   slot, address, size);
@@ -255,6 +275,8 @@ void FrameCapture::Buffer(u64 stage_hash, u32 slot, VAddr address, const void* d
         }
         out += std::format(" {:12.6g}", words[i]);
     }
+    if (out.size() > MaxBufferBytes - buffer_bytes) { truncated = true; return; }
+    buffer_bytes += out.size();
     pending_buffers.push_back(std::move(out));
 }
 
@@ -265,8 +287,8 @@ void FrameCapture::Sampled(const VideoCore::ImageInfo& info, bool storage) {
 }
 
 void FrameCapture::Note(const char* text) {
-    if (!entries.empty()) {
-        entries.back().note += text;
+    if (!entries.empty() && entries.back().note.size() < 512) {
+        entries.back().note.append(text, std::min<size_t>(std::strlen(text),512-entries.back().note.size()));
     }
 }
 

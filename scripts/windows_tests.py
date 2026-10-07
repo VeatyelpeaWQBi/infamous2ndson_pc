@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import sys
 import unittest
-from windows_tools import require_windows
+from windows_tools import require_windows, tool_environment
 
 ROOT = Path(__file__).resolve().parent.parent
 NATIVE_CLASSES = ('test_probe.LoaderTests.', 'test_runtime.RuntimeTests.',
@@ -26,6 +26,11 @@ def main():
     parser.add_argument('--python-only', action='store_true')
     args = parser.parse_args()
     require_windows()
+    # Keep native test children on the same MSYS2 CLANG64 runtime path even
+    # when this module is started directly from VS Code or Explorer.  The
+    # normal test.bat wrapper already supplies this environment; doing it here
+    # prevents direct invocations from producing Windows "missing DLL" dialogs.
+    os.environ.update(tool_environment())
     sys.path.insert(0, str(ROOT / 'tests'))
     suite = unittest.TestSuite()
     omitted = 0

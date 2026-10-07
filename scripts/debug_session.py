@@ -47,6 +47,13 @@ def read_json(path):
     try: return json.loads(Path(path).read_text(encoding='utf-8'))
     except (OSError,ValueError): return {}
 
+def heartbeat_fps(current,previous):
+    """No new publication is unknown, not a zero-FPS interval."""
+    elapsed=current.get('tick_ms',0)-previous.get('tick_ms',0)
+    frames=current.get('presents',0)-previous.get('presents',0)
+    if elapsed<=0 or frames<0: return None
+    return frames*1000/elapsed
+
 def collector_stopped(state):
     pid=state.get('collector_pid')
     if not isinstance(pid,int): return False
@@ -69,8 +76,11 @@ def prune_sessions(base,keep=3):
         if resolved.parent!=base: continue
         state=read_json(path/'status.json')
         if state.get('collector')=='infamous-debug-v1' and (state.get('finished') or collector_stopped(state)):
-            sessions.append(path)
-    for path in sorted(sessions,reverse=True)[keep:]:
+            sessions.append((state.get('retain_for_debug') is True,path))
+    # A selected user baseline takes one of the existing retention slots;
+    # it does not add storage beyond the configured session count.
+    ordered=sorted(sessions,key=lambda item:(item[0],item[1].name),reverse=True)
+    for _,path in ordered[keep:]:
         # Recheck resolution immediately before recursive removal on Windows.
         if path.resolve().parent!=base: raise ValueError('Diagnostic retention path escaped root')
         shutil.rmtree(path)
@@ -127,24 +137,29 @@ def collect(command,cwd,base,profile,env=None):
     session=base/('session-'+datetime.now().strftime('%Y%m%d-%H%M%S-')+uuid.uuid4().hex[:6])
     session.mkdir()
     env=dict(os.environ if env is None else env)
+    env.setdefault('BB_PERF_STATS','1')
+    env.setdefault('BB_CAPTURE_MANUAL_ONLY','1')
     env.update(BB_DEBUG_DIR=str(session),BB_CAPTURE_FRAME=str(session/'last-frame.bmp'),
-               BB_CAPTURE_INTERVAL_MS='10000')
+               BB_CAPTURE_INTERVAL_MS='10000',BB_CAPTURE_TRIGGER=str(session/'render-frame-request'),
+               BB_CAPTURE_DIR=str(session),BB_TOGGLE_FILE=str(session/'optimizations-mask.txt'),
+               BB_IMAGE_DUMP_TRIGGER=str(session/'inspect-images'),BB_IMAGE_INSPECT='1')
     # Record just the relevant non-secret configuration; never serialize all env.
     manifest={'collector':'infamous-debug-v1','started_utc':datetime.now(timezone.utc).isoformat(),
         'title_id':profile.get('title_id'),'game_sha256':profile.get('source_sha256'),
         'command':[str(v) for v in command],'python':os.sys.executable,
         'limits':{'runtime_log_bytes':8*MIB,'runtime_log_backups':1,'input_bytes':4*MIB,
                   'input_backups':1,'metrics_bytes':MIB,'metrics_backups':1,'sessions':3,
-                  'gpu_operations':512,'snapshot_max_resolution':[1920,1080],'snapshot_interval_ms':10000},
+                  'gpu_operations':512,'frame_metrics_bytes':2*MIB,'frame_metrics_backups':1,
+                  'snapshot_max_resolution':[1920,1080],'snapshot_interval_ms':10000},
         'settings':{key:env.get(key) for key in ('BB_GAME_PROFILE','BB_DRAW_PIPE','BB_VK_RECORD_THREAD','BB_FPS','BB_VBLANK_HZ',
-            'BB_REGION','BB_LANGUAGE','BB_TIMEZONE_MINUTES','BB_ENTER_BUTTON')}}
+            'BB_REGION','BB_LANGUAGE','BB_TIMEZONE_MINUTES','BB_ENTER_BUTTON','BB_PERF_STATS','BB_F10_DEEP')}}
     save_json(session/'manifest.json',manifest)
     executable=Path(command[0])
     if executable.is_file():
         with executable.open('rb') as binary: manifest['executable_sha256']=hashlib.file_digest(binary,'sha256').hexdigest()
         manifest['executable_bytes']=executable.stat().st_size
         save_json(session/'manifest.json',manifest)
-    print(f'Debug session: {session}\nAutomatic input/GPU/process recording enabled; F10 marks an issue and requests threads.',flush=True)
+    print(f'Debug session: {session}\nAutomatic input/GPU/process/frame recording enabled; F10 marks an issue. Use debug-control snapshot for deep capture.',flush=True)
     log=RotatingWriter(session/'runtime.log',8*MIB)
     startup=RotatingWriter(session/'startup.log',256*1024,backups=0)
     metrics_log=RotatingWriter(session/'metrics.jsonl',MIB)
@@ -198,7 +213,8 @@ def collect(command,cwd,base,profile,env=None):
                 sample['cpu_percent_one_core']=max(0,(sample['cpu_seconds']-previous['cpu_seconds'])/elapsed*100)
                 old_gpu=previous.get('gpu',{})
                 if 'presents' in heartbeat and 'presents' in old_gpu:
-                    sample['present_fps']=max(0,(heartbeat['presents']-old_gpu['presents'])/elapsed)
+                    # Counters are published independently of the collector's polling clock.
+                    sample['present_fps']=heartbeat_fps(heartbeat,old_gpu)
             # An absent first frame is startup, not evidence of a hang.
             new_stall=bool(heartbeat.get('last_present_ms') and tick-heartbeat['last_present_ms']>15000)
             request=session/'request-snapshot'
@@ -225,6 +241,11 @@ def collect(command,cwd,base,profile,env=None):
     result={**live,'finished':True,'exit_code':status,'ended_utc':datetime.now(timezone.utc).isoformat(),
         'faults':faults[:16],'monitor_error':monitor_error,'reader_errors':reader_errors,
         'latest':previous,'abnormal_exit':status!=0}
+    try:
+        from frame_report import summarize
+        save_json(session/'performance-summary.json',summarize(session))
+    except (OSError,ValueError) as error:
+        result['performance_report_error']=str(error)
     save_json(session/'status.json',result); save_json(base/'active.json',result)
     print(f'Debug session ended: exit={status}; records: {session}',flush=True)
     return status
@@ -238,6 +259,7 @@ def control(base,action):
     if active.get('finished') or collector_stopped(active): raise RuntimeError('Game session collector has already ended')
     (session/'request-snapshot').write_text('manual',encoding='ascii')
     (session/'capture-next').touch()
+    (session/'render-frame-request').touch()
     print('Thread snapshot requested; it will appear in runtime.log.'); return 0
 
 if __name__=='__main__':

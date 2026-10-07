@@ -27,9 +27,15 @@ class GameProfiles(unittest.TestCase):
             path.write_text(json.dumps({'system_language':1,'confirm_button':'cross'}))
             self.assertEqual(game_profiles.console_locale(tmp)['confirm_button'],'cross')
             for key,value in (('system_language',True),('system_language',99),('timezone_minutes',841),
-                              ('timezone_minutes','480'),('confirm_button','invalid'),('region','invalid')):
+                              ('timezone_minutes','480'),('confirm_button','invalid'),('region','invalid'),('show_fps','false')):
                 path.write_text(json.dumps({key:value}))
                 with self.assertRaises(ValueError): game_profiles.console_locale(tmp)
+    def test_saved_fps_choice_reaches_native_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for enabled in (False,True):
+                (Path(tmp)/'infamous-locale.json').write_text(json.dumps({'show_fps':enabled}))
+                env={}; game_profiles.native_environment({'id':'infamous','title_id':'CUSA00309'},tmp,env)
+                self.assertEqual(env['BB_SHOW_FPS'],'1' if enabled else '0')
     def test_launcher_debug_route_uses_collector_without_launching_second_process(self):
         with tempfile.TemporaryDirectory() as tmp:
             data=Path(tmp); digest=self.game(data)

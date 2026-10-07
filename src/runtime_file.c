@@ -260,6 +260,7 @@ static int host_fd(int fd) {
 /* Pages of the destination may be write-protected for GPU tracking: the kernel's copy then
  * fails with EFAULT instead of faulting to our handler. A user-mode write to each page first
  * goes through the handler, which unprotects it (and records the upcoming write). */
+#ifndef _WIN32
 static void touch_for_write(void *buffer,uint64_t size) {
     if (!size) return;
     uintptr_t p=(uintptr_t)buffer & ~(uintptr_t)4095, end=(uintptr_t)buffer+size;
@@ -268,21 +269,68 @@ static void touch_for_write(void *buffer,uint64_t size) {
         *b=*b;
     }
 }
+#endif
+#ifdef _WIN32
+/* Windows kernel I/O cannot invoke our user-mode GPU write-fault handler.
+ * A preliminary touch is racy: another GPU thread can reprotect a page before
+ * ReadFile writes it. Read into an untracked, bounded host allocation, then
+ * copy in user mode so write faults invalidate GPU caches normally. */
+static int64_t host_read_guest(int h,void *buffer,uint64_t size,int64_t offset,int positioned) {
+    if (positioned && offset<0) { errno=EINVAL; return -1; }
+    if (!size) return 0;
+    if (size>INT64_MAX) { errno=EINVAL; return -1; }
+    const size_t capacity=size<1024*1024 ? (size_t)size : 1024*1024;
+    unsigned char *staging=malloc(capacity);
+    if (!staging) { errno=ENOMEM; return -1; }
+    int64_t done=0;
+    while ((uint64_t)done<size) {
+        const size_t chunk=size-(uint64_t)done<capacity ? (size_t)(size-(uint64_t)done) : capacity;
+        ssize_t n=positioned ? pread(h,staging,chunk,offset+done) : read(h,staging,chunk);
+        if (n<0) {
+            int e=errno; free(staging); errno=e; return done ? done : -1;
+        }
+        if (n) memcpy((unsigned char *)buffer+done,staging,(size_t)n);
+        done+=n;
+        if ((size_t)n<chunk) break;
+    }
+    free(staging); return done;
+}
+#endif
 static int64_t do_read(int fd,void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return get(fd) ? -EISDIR : -EBADF;
+#ifdef _WIN32
+    int64_t n=host_read_guest(h,buffer,size,0,0);
+#else
     touch_for_write(buffer,size);
     ssize_t n=read(h,buffer,size);
-    if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
+#endif
+    if (n<0) {
+        int e=errno;
+        if (audio_trace() || getenv("BB_DEBUG_DIR"))
+            fprintf(stderr,"DEBUG_IO read fd=%d path=%s bytes=%llu errno=%d\n",fd,
+                get(fd) ? get(fd)->path : "stdio",(unsigned long long)size,e);
+        return -e;
+    }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
 }
 static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd(fd);
     if (h<0) return get(fd) ? -EISDIR : -EBADF;
+#ifdef _WIN32
+    int64_t n=host_read_guest(h,buffer,size,offset,1);
+#else
     touch_for_write(buffer,size);
     ssize_t n=pread(h,buffer,size,offset);
-    if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
+#endif
+    if (n<0) {
+        int e=errno;
+        if (audio_trace() || getenv("BB_DEBUG_DIR"))
+            fprintf(stderr,"DEBUG_IO pread fd=%d path=%s bytes=%llu offset=%lld errno=%d\n",fd,
+                get(fd) ? get(fd)->path : "stdio",(unsigned long long)size,(long long)offset,e);
+        return -e;
+    }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
 }

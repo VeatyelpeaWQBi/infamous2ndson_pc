@@ -317,10 +317,20 @@ static void start_dump_thread(void) {
  * each distinct writing instruction is printed once per address. */
 static volatile uintptr_t hw_watch;
 static volatile char hw_mode = 'w';
+/* Optional "x<address> xmm=<0..15>" only reports nonfinite XYZ lanes.
+ * It avoids unrelated draws consuming a once-per-instruction diagnostic. */
+static volatile unsigned hw_xmm = 16;
 static const char *hw_watch_file;
 static volatile LONG hw_hits;
 static uintptr_t hw_rips[64];
 static void hw_watch_hit(CONTEXT *c) {
+    if (hw_xmm < 16) {
+        uint32_t lanes[4];
+        memcpy(lanes, &(&c->Xmm0)[hw_xmm], sizeof(lanes));
+        if ((lanes[0] & 0x7f800000u) != 0x7f800000u &&
+            (lanes[1] & 0x7f800000u) != 0x7f800000u &&
+            (lanes[2] & 0x7f800000u) != 0x7f800000u) return;
+    }
     uintptr_t rip = (uintptr_t)c->Rip;
     LONG n = hw_hits < 64 ? hw_hits : 64;
     for (LONG i = 0; i < n; ++i) if (hw_rips[i] == rip) return;
@@ -333,6 +343,14 @@ static void hw_watch_hit(CONTEXT *c) {
             "  rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx r8=%llx r12=%llx r13=%llx r14=%llx r15=%llx\n",
             (unsigned long long)hw_watch, where, *(volatile unsigned *)hw_watch, GetCurrentThreadId(),
             c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->R8, c->R12, c->R13, c->R14, c->R15);
+    fprintf(stderr, "  rbp=%llx rsp=%llx\n", c->Rbp, c->Rsp);
+    const M128A *xmm = &c->Xmm0;
+    for (unsigned i = 0; i < 16; ++i) {
+        float lanes[4];
+        memcpy(lanes, &xmm[i], sizeof(lanes));
+        fprintf(stderr, "  xmm%u=%g,%g,%g,%g\n", i,
+                lanes[0], lanes[1], lanes[2], lanes[3]);
+    }
     uintptr_t rbp = c->Rbp;
     for (int depth = 0; depth < 6 && rbp > c->Rsp; ++depth) {
         uintptr_t frame[2];
@@ -349,16 +367,20 @@ static unsigned __stdcall hw_watch_thread(void *unused) {
     for (;;) {
         unsigned long long address = 0;
         char mode = 'w';
+        unsigned xmm_index = 16;
         FILE *f = fopen(hw_watch_file, "r");
         if (f) {
             int c = fgetc(f);
             if (c == 'r' || c == 'x') mode = (char)c; else if (c != EOF) ungetc(c, f);
             if (fscanf(f, "%llx", &address) != 1) address = 0;
+            if (mode == 'x' && fscanf(f, " xmm=%u", &xmm_index) != 1) xmm_index = 16;
+            if (xmm_index > 15) xmm_index = 16;
             fclose(f);
         }
-        if (address != hw_watch || mode != hw_mode) {
-            hw_hits = 0; hw_mode = mode; hw_watch = (uintptr_t)address;
-            fprintf(stderr, "HW watch: %#llx (%s)\n", address, mode == 'r' ? "reads and writes" : "writes");
+        if (address != hw_watch || mode != hw_mode || xmm_index != hw_xmm) {
+            hw_hits = 0; hw_mode = mode; hw_xmm = xmm_index; hw_watch = (uintptr_t)address;
+            fprintf(stderr, "HW watch: %#llx (%s), invalid_xmm=%u\n", address,
+                    mode == 'x' ? "execute" : mode == 'r' ? "reads and writes" : "writes", xmm_index);
         }
         DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
         HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);

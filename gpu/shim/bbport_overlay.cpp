@@ -46,6 +46,21 @@ extern "C" void runtime_restart(void); // bb-probe (probe.c)
 
 namespace BbOverlay {
 
+static std::atomic<u64> debug_notice_until{};
+static std::atomic<u64> performance_notice_until{};
+static std::atomic<bool> performance_recording{};
+
+void NotifyDebugMark() {
+    // Start the five-second acknowledgement on the next rendered frame, so
+    // a long render stall cannot consume the notice before the user sees it.
+    debug_notice_until.store(~u64{0}, std::memory_order_relaxed);
+}
+
+void NotifyPerformanceRecording(bool active) {
+    performance_recording.store(active, std::memory_order_relaxed);
+    performance_notice_until.store(~u64{0}, std::memory_order_relaxed);
+}
+
 namespace {
 
 std::mutex imgui_mutex; // the ImGui context: window thread (input) and present thread
@@ -411,9 +426,9 @@ void Menu() {
 void FpsCounter() {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     const float pad = 12.0f * base_scale;
-    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - pad,
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + pad,
                                    viewport->WorkPos.y + pad),
-                            ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+                             ImGuiCond_Always, ImVec2(0.0f, 0.0f));
     ImGui::SetNextWindowBgAlpha(0.5f);
     ImGui::Begin("##fps", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
@@ -599,7 +614,9 @@ bool HandleEvent(const SDL_Event& event) {
 }
 
 bool Visible() {
-    return initialized && (menu_open || BbSettings::Get().show_fps);
+    return initialized && (menu_open || BbSettings::Get().show_fps ||
+        SDL_GetTicks() < debug_notice_until.load(std::memory_order_relaxed) ||
+        SDL_GetTicks() < performance_notice_until.load(std::memory_order_relaxed));
 }
 
 bool CapturesInput() {
@@ -632,11 +649,40 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
 
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
+    u64 pending_notice = ~u64{0};
+    debug_notice_until.compare_exchange_strong(pending_notice, SDL_GetTicks() + 5000,
+                                               std::memory_order_relaxed);
+    u64 pending_recording = ~u64{0};
+    performance_notice_until.compare_exchange_strong(pending_recording, SDL_GetTicks() + 5000,
+                                                     std::memory_order_relaxed);
     if (menu_open) {
         Menu();
     }
     if (BbSettings::Get().show_fps && !menu_open) {
         FpsCounter();
+    }
+    if (SDL_GetTicks() < debug_notice_until.load(std::memory_order_relaxed)) {
+        const auto* viewport = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + 12 * scale,
+                                      viewport->WorkPos.y + 64 * scale));
+        ImGui::SetNextWindowBgAlpha(0.85f);
+        ImGui::Begin("##debug-mark", nullptr, ImGuiWindowFlags_NoDecoration |
+            ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);
+        ImGui::TextUnformatted("F10 received - diagnostic mark saved");
+        ImGui::End();
+    }
+    if (SDL_GetTicks() < performance_notice_until.load(std::memory_order_relaxed)) {
+        const auto* viewport = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + 12 * scale,
+                                      viewport->WorkPos.y + 112 * scale));
+        ImGui::SetNextWindowBgAlpha(0.85f);
+        ImGui::Begin("##performance-recording", nullptr, ImGuiWindowFlags_NoDecoration |
+            ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);
+        ImGui::Text("F11 performance recording: %s",
+                    performance_recording.load(std::memory_order_relaxed) ? "ON" : "SAVED");
+        ImGui::End();
     }
     ImGui::Render();
 

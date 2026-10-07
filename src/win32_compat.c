@@ -45,6 +45,10 @@ static int64_t positional(int fd, void *buffer, size_t size, int64_t offset, int
         if (!ok) {
             DWORD e = GetLastError();
             if (e == ERROR_HANDLE_EOF) break;
+            if (getenv("BB_DEBUG_DIR"))
+                fprintf(stderr,"DEBUG_IO Win32 %s fd=%d bytes=%lu offset=%lld error=%lu\n",
+                    write ? "pwrite" : "pread",fd,(unsigned long)chunk,
+                    (long long)(offset+done),(unsigned long)e);
             SetFilePointerEx(h, position, NULL, FILE_BEGIN);
             if (done) return done;
             errno = e == ERROR_NOACCESS ? EFAULT : e == ERROR_ACCESS_DENIED ? EBADF : EIO;

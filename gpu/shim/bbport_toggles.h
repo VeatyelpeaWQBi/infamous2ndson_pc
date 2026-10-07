@@ -103,8 +103,10 @@ inline std::atomic<std::uint64_t> t_resident{0}, t_protect{0}, t_image_create{0}
 /// Diagnostics are collected only with BB_FRAME_STATS=1.
 inline const bool enabled = [] {
     const char* env = std::getenv("BB_FRAME_STATS");
-    return env && env[0] == '1';
+    const char* perf = std::getenv("BB_PERF_STATS");
+    return (env && env[0] == '1') || (perf && perf[0] == '1');
 }();
+inline std::atomic<std::uint64_t> bind_ns{0}, pipeline_select_ns{0};
 struct Timer {
     std::atomic<std::uint64_t>& total;
     std::chrono::steady_clock::time_point start =

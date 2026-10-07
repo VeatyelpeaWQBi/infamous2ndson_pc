@@ -35,6 +35,12 @@ int bbgpu_text_input_begin(const char *initial_utf8, const char *prompt_utf8);
 int bbgpu_text_input_poll(char *out_utf8, uint64_t size);
 /* 1 while the in-game settings menu is open: the game's pad input is held neutral. */
 int bbgpu_overlay_captures_input(void);
+/* Window-thread mouse events, consumed once by the guest pad sampler. */
+typedef struct {
+    float dx, dy;
+    uint32_t active, left, reset;
+} BbMouseMotion;
+void bbgpu_mouse_motion_read(BbMouseMotion *state);
 /* Number of symbols registered by the vendored libraries (diagnostics). */
 unsigned bbgpu_symbol_count(void);
 void bbgpu_debug_flush(void);

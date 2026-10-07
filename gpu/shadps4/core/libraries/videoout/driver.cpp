@@ -10,6 +10,7 @@
 #include "common/assert.h"
 #include "bbport_platform.h"
 #include "bbport_toggles.h"
+#include "bbport_diagnostics.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -28,6 +29,7 @@ extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
 namespace Vulkan {
 extern std::atomic<u64> g_bb_compile_ns;
+extern std::atomic<u64> g_bb_perf_compile_ns, g_bb_perf_compiles;
 extern std::atomic<u32> g_bb_compiles;
 } // namespace Vulkan
 
@@ -298,7 +300,20 @@ void VideoOutDriver::Flip(const Request& req) {
 
     // bbport: BB_FRAME_STATS=1 prints flip rate and frame time spread every 5 seconds.
     static const bool frame_stats = EmulatorSettingsImpl::Flag("BB_FRAME_STATS", false);
-    if (frame_stats) {
+    static const bool performance = EmulatorSettingsImpl::Flag("BB_PERF_STATS", false);
+    if (performance && BbDiagnostics::Enabled()) {
+        using namespace BbStats;
+        const int clock=gpu_thread_clock.load(std::memory_order_relaxed);
+        BbDiagnostics::Frame({draws.load(),dispatches.load(),submissions.load(),
+            clock!=-1 ? BbPlatform::ReadThreadCpuClockNs(clock) : 0,
+            Vulkan::g_bb_perf_compiles.load(),Vulkan::g_bb_perf_compile_ns.load(),
+            image_upload_bytes.load(),buffer_upload_bytes.load(),t_protect.load(),
+            t_refresh.load(),t_staging.load(),sync_recording_ns.load(),host_copies_wait_ns.load(),
+            copy_threads_wait_ns.load(),tick_wait_ns.load(),bind_ns.load(),pipeline_select_ns.load()});
+    }
+    // Numeric bounded telemetry replaces verbose per-stall text and preserves
+    // cumulative counters; do not exchange/reset them underneath Frame().
+    if (frame_stats && !performance) {
         using Clock = std::chrono::steady_clock;
         static Clock::time_point window_start = Clock::now(), last = window_start;
         static u32 frames;

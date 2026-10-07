@@ -17,8 +17,133 @@
 #include "video_core/texture_cache/blit_helper.h"
 #include <vk_mem_alloc.h>
 #include "bbport_diagnostics.h"
+#include "video_core/renderer_vulkan/vk_frame_capture.h"
+#include "core/platform.h"
+#include "video_core/renderer_vulkan/stencil_reference.h"
 #include <thread>
 #include <atomic>
+#include "bbport_mouse_motion.h"
+
+static void mouse_motion_input() {
+    BbMouseMotionInput input;
+    SDL_Event event{}; BbMouseMotion sample{};
+    event.type=SDL_EVENT_KEY_DOWN; event.key.windowID=42; event.key.key=SDLK_F6;
+    input.Event(event,42,true); assert(input.Active());
+    event.key.repeat=true; input.Event(event,42,true); assert(input.Active());
+    event={}; event.type=SDL_EVENT_MOUSE_MOTION; event.motion.windowID=42;
+    event.motion.xrel=12; event.motion.yrel=-8;
+    input.Event(event,42,true); input.Event(event,42,true); input.Read(&sample);
+    assert(sample.active && sample.dx==24 && sample.dy==-16);
+    input.Read(&sample); assert(sample.dx==0 && sample.dy==0); // consumed exactly once
+    event.motion.windowID=99; input.Event(event,42,true); input.Read(&sample);
+    assert(sample.dx==0); // another window cannot steer the game
+    event={}; event.type=SDL_EVENT_MOUSE_BUTTON_DOWN; event.button.windowID=42; event.button.button=SDL_BUTTON_LEFT;
+    input.Event(event,42,true); input.Read(&sample); assert(sample.left);
+    input.Event(event,42,false); input.Read(&sample); assert(!sample.active && !sample.left);
+    event={}; event.type=SDL_EVENT_KEY_DOWN; event.key.windowID=42; event.key.key=SDLK_F6;
+    input.Event(event,42,true); input.Read(&sample); const auto generation=sample.reset;
+    event.key.key=SDLK_F7; input.Event(event,42,true); input.Read(&sample);
+    assert(sample.active && sample.reset==generation+1);
+    event.key.key=SDLK_ESCAPE; input.Event(event,42,true); assert(!input.Active());
+    std::puts("Mouse motion: toggle, repeat suppression, window isolation, deltas, buttons, focus/menu release PASS");
+}
+
+static void stencil_reference() {
+    using Vulkan::StencilReference::Select;
+    // Real captured Second Son pass: NE ref 4 with compare mask 4, no writes.
+    const u32 reference=Select(4,0,0,true);
+    for(u32 stored=0;stored<256;++stored) {
+        assert(((reference&4)!=(stored&4)) == ((4u&4)!=(stored&4)));
+        assert(((reference&4)==(stored&4)) == ((4u&4)==(stored&4)));
+        const u32 after=(stored&~0u)|(reference&0u);
+        assert(after==stored);
+    }
+    assert(Select(4,0,0,false)==4);
+    assert(Select(4,0,255,true)==0);
+    assert(Select(4,32,255,true)==32);
+    assert(Select(4,32,255,false)==4);
+    // Writable REPLACE_OP keeps the prior write semantics for all byte values.
+    for(u32 value=0;value<256;++value)
+        assert((Select(4,value,255,true)&255)==value);
+    std::puts("Stencil: masked-out replacement preserves comparison; writable replacement unchanged PASS");
+}
+
+static void irq_controller() {
+    Platform::IrqController controller;
+    std::array<std::thread,8> workers;
+    std::atomic<unsigned> persistent{}, once{};
+    std::array<unsigned,8> identities{};
+    const Platform::InterruptId ids[]={Platform::InterruptId::Compute0RelMem,
+        Platform::InterruptId::Compute1RelMem,Platform::InterruptId::Compute2RelMem,
+        Platform::InterruptId::Compute3RelMem,Platform::InterruptId::Compute4RelMem,
+        Platform::InterruptId::Compute5RelMem,Platform::InterruptId::Compute6RelMem,
+        Platform::InterruptId::GfxFlip};
+    for(unsigned i=0;i<workers.size();++i) workers[i]=std::thread([&,i] {
+        controller.Register(ids[i],[&](auto) { ++persistent; },&identities[i]);
+        for(unsigned j=0;j<1000;++j) {
+            controller.RegisterOnce(ids[i],[&](auto) { ++once; });
+            controller.Signal(ids[i]);
+        }
+        controller.Unregister(ids[i],&identities[i]);
+        controller.Signal(ids[i]);
+    });
+    for(auto& worker:workers) worker.join();
+    assert(persistent==8000 && once==8000);
+    once=0;
+    for(auto& worker:workers) worker=std::thread([&] {
+        for(unsigned j=0;j<500;++j)
+            controller.RegisterOnce(Platform::InterruptId::GfxEop,[&](auto) { ++once; });
+    });
+    for(auto& worker:workers) worker.join();
+    for(unsigned i=0;i<4001;++i) controller.Signal(Platform::InterruptId::GfxEop);
+    assert(once==4000);
+    std::puts("Concurrent independent IRQs, persistent removal and shared one-time queue PASS");
+}
+
+static void frame_capture(const std::filesystem::path& directory) {
+    using Vulkan::FrameCapture;
+    std::filesystem::create_directories(directory);
+    const auto trigger = directory / "capture-request";
+    _putenv_s("BB_CAPTURE_TRIGGER",trigger.string().c_str());
+    _putenv_s("BB_CAPTURE_DIR",directory.string().c_str());
+    _putenv_s("BB_DEBUG_DIR","");
+    VideoCore::ImageInfo display{}, scene{};
+    display.guest_address=0x100000; display.size={1920,1080,1};
+    display.pixel_format=vk::Format::eR8G8B8A8Unorm;
+    scene=display; scene.guest_address=0x200000;
+    const VideoCore::ImageInfo* display_ptr=&display;
+    const VideoCore::ImageInfo* scene_ptr=&scene;
+    FrameCapture::AddDisplayBuffer(display.guest_address);
+    FrameCapture::OnFlip(display.guest_address);
+    assert(!FrameCapture::Active());
+    std::ofstream(trigger).put('1');
+    FrameCapture::OnFlip(display.guest_address);
+    assert(FrameCapture::Active() && !std::filesystem::exists(trigger));
+    FrameCapture::BeginPass(&display_ptr,1,nullptr);
+    FrameCapture::Draw(0xabc,0xdef,3,1);
+    FrameCapture::BeginPass(&scene_ptr,1,nullptr);
+    FrameCapture::Sampled(display,false);
+    FrameCapture::Draw(0x123,0x456,36,2);
+    float constants[256]{};
+    for(unsigned i=0;i<300;++i) FrameCapture::Buffer(0x123,i,0x400000,constants,sizeof(constants));
+    FrameCapture::Draw(0x123,0x456,3,1);
+    FrameCapture::Dispatch(0x789,4,2,1);
+    FrameCapture::BeginPass(&display_ptr,1,nullptr);
+    assert(!FrameCapture::Active());
+    std::filesystem::path report;
+    for(const auto& entry:std::filesystem::directory_iterator(directory))
+        if(entry.path().extension()==".txt") report=entry.path();
+    assert(!report.empty());
+    std::ifstream input(report); const std::string text((std::istreambuf_iterator<char>(input)),{});
+    assert(text.find("DEBUG_FRAME_BEGIN")!=std::string::npos);
+    assert(text.find("truncated=1")!=std::string::npos);
+    assert(text.find("PASS draws 2 (indices 75)")!=std::string::npos);
+    assert(text.find("COMPUTE dispatches 1")!=std::string::npos);
+    assert(text.find("samples 0x100000")!=std::string::npos);
+    assert(text.find("DEBUG_FRAME_END passes=3")!=std::string::npos);
+    assert(text.size()<2*1024*1024);
+    std::puts("Frame capture: trigger, complete frame boundaries, sampled resources, bounded constants PASS");
+}
 
 static void diagnostic_ring(const std::filesystem::path& directory) {
     std::filesystem::create_directories(directory);
@@ -28,6 +153,7 @@ static void diagnostic_ring(const std::filesystem::path& directory) {
     std::thread second([] { for (unsigned i=0;i<1500;++i) BbDiagnostics::Record("dispatch",i,2); });
     first.join(); second.join();
     BbDiagnostics::Presented(1920,1080);
+    BbDiagnostics::Flush(true);
     std::ifstream input(directory/"gpu-recent.txt");
     std::string line; std::getline(input,line);
     unsigned count=0; u64 previous=0;
@@ -52,6 +178,50 @@ static void diagnostic_ring(const std::filesystem::path& directory) {
     const auto elapsed=std::chrono::steady_clock::now()-start;
     release=true; holder.join();
     assert(elapsed<std::chrono::milliseconds(500));
+    // A blocked diagnostic writer must not block render producers or crash flush.
+    locked=false; release=false;
+    std::thread io_holder([&] {
+        std::scoped_lock lock{BbDiagnostics::Get().writer_mutex}; locked=true;
+        while(!release) std::this_thread::yield();
+    });
+    while(!locked) std::this_thread::yield();
+    const auto io_start=std::chrono::steady_clock::now();
+    BbDiagnostics::RecordDraw(3,1,0,10,20,30);
+    BbDiagnostics::Presented(1280,720); BbDiagnostics::Flush(true);
+    const auto io_elapsed=std::chrono::steady_clock::now()-io_start;
+    release=true; io_holder.join();
+    assert(io_elapsed<std::chrono::milliseconds(500));
+    BbFrameMetrics::History history;
+    BbFrameMetrics::Counters values{}; values[0]=10;
+    history.Push(1000000000,1000,values);
+    values[0]=17; history.Push(1016000000,1016,values);
+    assert(history.sequence==1 && history.frames[0].interval_ns==16000000 && history.frames[0].delta[0]==7);
+    values[0]=1; history.Push(1032000000,1032,values);
+    assert(history.frames[1].delta[0]==0); // reset cannot underflow
+    for(unsigned i=0;i<1200;++i) history.Push(1048000000ull+i*16000000ull,1048+i*16,values);
+    assert(history.sequence==1202 && history.First()==179);
+    // Queue overflow is explicit; newest frames survive and serialize in order.
+    auto& state=BbDiagnostics::Get();
+    { std::scoped_lock lock{state.mutex}; state.frames=history; }
+    BbDiagnostics::Flush(true);
+    assert(state.written_frame==1202 && state.dropped_frames==178);
+    assert(std::filesystem::file_size(directory/"frames.csv")>1000);
+    const auto size=std::filesystem::file_size(directory/"frames.csv");
+    BbDiagnostics::Flush(true); assert(std::filesystem::file_size(directory/"frames.csv")==size);
+    // Writer lifecycle flushes the remaining numeric frames without a GPU.
+    {
+        BbDiagnostics::Writer writer;
+        BbDiagnostics::Frame(values);
+    }
+    assert(state.written_frame==1203);
+    const bool active_recording=BbDiagnostics::ToggleRecording();
+    assert(active_recording);
+    for (unsigned i=0;i<4;++i) BbDiagnostics::Frame(values);
+    assert(!BbDiagnostics::ToggleRecording());
+    BbDiagnostics::Flush(true);
+    assert(std::filesystem::exists(directory/"performance-recording-1.csv"));
+    const auto recording_text=std::ifstream(directory/"performance-recording-1.csv");
+    assert(recording_text.good());
     std::puts("Bounded recent GPU operations / telemetry / fault flush PASS");
 }
 
@@ -176,7 +346,11 @@ static void textures() {
     vmaDestroyBuffer(instance.GetAllocator(),staging,allocation);
 }
 int main(int argc,char** argv) {
-    if (argc==3 && !std::strcmp(argv[1],"--shaders")) shaders(argv[2]);
+    if (argc==2 && !std::strcmp(argv[1],"--irq")) irq_controller();
+    else if (argc==2 && !std::strcmp(argv[1],"--stencil")) stencil_reference();
+    else if (argc==2 && !std::strcmp(argv[1],"--mouse-motion")) mouse_motion_input();
+    else if (argc==3 && !std::strcmp(argv[1],"--shaders")) shaders(argv[2]);
     else if (argc==3 && !std::strcmp(argv[1],"--diagnostics")) diagnostic_ring(argv[2]);
+    else if (argc==3 && !std::strcmp(argv[1],"--frame-capture")) frame_capture(argv[2]);
     else textures();
 }

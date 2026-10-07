@@ -7,6 +7,16 @@
 #include "sdl_window.h"
 #include "bbport_overlay.h"
 #include "bbport_settings.h"
+#include "bbport_mouse_motion.h"
+#include "bbport_debug_hotkey.h"
+
+extern "C" void runtime_debug_mark(void);
+extern "C" int bbgpu_toggle_performance_recording(void);
+
+static BbMouseMotionInput mouse_motion;
+extern "C" void bbgpu_mouse_motion_read(BbMouseMotion* state) {
+    mouse_motion.Read(state);
+}
 
 namespace Frontend {
 
@@ -55,9 +65,12 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     width = w;
     height = h;
     LOG_INFO(Frontend, "Window {}x{} on {}", w, h, driver);
+    UpdateTextTitle();
 }
 
 WindowSDL::~WindowSDL() {
+    mouse_motion.Release();
+    SDL_SetWindowRelativeMouseMode(window, false);
     SDL_DestroyWindow(window);
 }
 
@@ -77,8 +90,28 @@ int WindowSDL::PollTextInput(std::string& out) {
 
 void WindowSDL::UpdateTextTitle() {
     const std::string title = text_active ? base_title + " \u2014 " + text_prompt + ": " + text + "_  (Enter = OK, Esc = cancel)"
-                                          : base_title;
+        : base_title + (mouse_relative
+            ? " | Mouse motion ON: move/ shake, Left click spray, F7 center, F6/Esc release"
+            : " | F6: mouse motion");
     SDL_SetWindowTitle(window, title.c_str());
+}
+
+void WindowSDL::UpdateMouseMotion() {
+    const bool allowed = !text_active && !BbOverlay::CapturesInput() &&
+                         (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS);
+    if (!allowed) mouse_motion.Release();
+    const bool active = mouse_motion.Active();
+    if (active == mouse_relative) return;
+    if (!SDL_SetWindowRelativeMouseMode(window, active)) {
+        LOG_WARNING(Frontend, "Mouse motion capture failed: {}", SDL_GetError());
+        mouse_motion.Release();
+        SDL_SetWindowRelativeMouseMode(window, false);
+        mouse_relative = false;
+    } else {
+        mouse_relative = active;
+    }
+    LOG_INFO(Frontend, "Mouse motion {}", mouse_relative ? "enabled" : "released");
+    UpdateTextTitle();
 }
 
 bool WindowSDL::PollEvents() {
@@ -94,8 +127,21 @@ bool WindowSDL::PollEvents() {
     if (!text_active) {
         BbOverlay::UpdateTextInput(window);
     }
+    UpdateMouseMotion();
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
+        // Receive short presses even if the guest stops polling pads in a
+        // cutscene. Handle before the overlay or text input can consume them.
+        if (bb_debug_hotkey(&event, SDL_GetWindowID(window), runtime_debug_mark)) {
+            BbOverlay::NotifyDebugMark();
+            continue;
+        }
+        int recording_active=0;
+        if (bb_performance_hotkey(&event, SDL_GetWindowID(window),
+                                  bbgpu_toggle_performance_recording, &recording_active)) {
+            BbOverlay::NotifyPerformanceRecording(recording_active != 0);
+            continue;
+        }
         if (text_active && (event.type == SDL_EVENT_TEXT_INPUT || event.type == SDL_EVENT_KEY_DOWN)) {
             std::scoped_lock lock{text_mutex};
             if (event.type == SDL_EVENT_TEXT_INPUT) {
@@ -113,8 +159,17 @@ bool WindowSDL::PollEvents() {
             continue;
         }
         if (BbOverlay::HandleEvent(event)) {
+            UpdateMouseMotion();
             continue;
         }
+        const bool allowed = !text_active && !BbOverlay::CapturesInput() &&
+                             (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS);
+        if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST && event.window.windowID == SDL_GetWindowID(window)) {
+            mouse_motion.Release();
+        } else {
+            mouse_motion.Event(event, SDL_GetWindowID(window), allowed);
+        }
+        UpdateMouseMotion();
         switch (event.type) {
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
         case SDL_EVENT_WINDOW_RESIZED: {
@@ -126,12 +181,17 @@ bool WindowSDL::PollEvents() {
         }
         case SDL_EVENT_KEY_DOWN:
             // F11: borderless fullscreen at the desktop size, or back to the window.
-            if (event.key.key == SDLK_F11 && !event.key.repeat) {
+            // Shift+F11 preserves the previous fullscreen shortcut; plain F11 controls
+            // the bounded asynchronous performance recording.
+            if (event.key.key == SDLK_F11 && !event.key.repeat &&
+                (event.key.mod & SDL_KMOD_SHIFT)) {
                 SDL_SetWindowFullscreen(window, !(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN));
             }
             break;
         case SDL_EVENT_QUIT:
         case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+            mouse_motion.Release();
+            UpdateMouseMotion();
             is_open = false;
             break;
         default:

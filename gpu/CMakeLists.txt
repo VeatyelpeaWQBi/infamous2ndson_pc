@@ -291,6 +291,12 @@ foreach(test_target IN ITEMS motion-history-test motion-shader-test ui-compositi
 endforeach()
 if (BB_BUILD_TESTS)
     enable_testing()
+    # CTest/Test Explorer starts native targets directly, outside test.bat.
+    # Preserve the existing MSYS2 CLANG64 runtime search path for those
+    # processes without copying DLLs or changing the user's global PATH.
+    if (WIN32)
+        get_filename_component(BBPORT_CLANG_BIN "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    endif()
     foreach(test_target IN ITEMS motion-history-test ui-composition-test upscaler-support-test videodec-test)
         add_test(NAME ${test_target} COMMAND $<TARGET_FILE:${test_target}>)
         set_tests_properties(${test_target} PROPERTIES LABELS "unit" TIMEOUT 30)
@@ -305,6 +311,15 @@ if (BB_BUILD_TESTS)
     add_test(NAME diagnostics-ring COMMAND $<TARGET_FILE:image-compat-test>
         --diagnostics "${CMAKE_CURRENT_BINARY_DIR}/test-diagnostics")
     set_tests_properties(diagnostics-ring PROPERTIES LABELS "unit" TIMEOUT 30)
+    add_test(NAME diagnostics-frame COMMAND $<TARGET_FILE:image-compat-test>
+        --frame-capture "${CMAKE_CURRENT_BINARY_DIR}/test-frame-capture")
+    set_tests_properties(diagnostics-frame PROPERTIES LABELS "unit" TIMEOUT 30)
+    add_test(NAME irq-controller-concurrency COMMAND $<TARGET_FILE:image-compat-test> --irq)
+    set_tests_properties(irq-controller-concurrency PROPERTIES LABELS "unit" TIMEOUT 30)
+    add_test(NAME stencil-readonly-reference COMMAND $<TARGET_FILE:image-compat-test> --stencil)
+    set_tests_properties(stencil-readonly-reference PROPERTIES LABELS "unit" TIMEOUT 30)
+    add_test(NAME mouse-motion-input COMMAND $<TARGET_FILE:image-compat-test> --mouse-motion)
+    set_tests_properties(mouse-motion-input PROPERTIES LABELS "unit" TIMEOUT 30)
     find_program(SPIRV_VALIDATOR NAMES spirv-val)
     if (SPIRV_VALIDATOR)
         foreach(image IN ITEMS 0 1 2)
@@ -327,6 +342,14 @@ if (BB_BUILD_TESTS)
     endforeach()
     add_test(NAME image-compat-textures COMMAND $<TARGET_FILE:image-compat-test>)
     set_tests_properties(image-compat-textures PROPERTIES LABELS "gpu" TIMEOUT 120)
+    if (WIN32)
+        get_property(BBPORT_TESTS DIRECTORY PROPERTY TESTS)
+        foreach(BBPORT_TEST IN LISTS BBPORT_TESTS)
+            set_tests_properties(${BBPORT_TEST} PROPERTIES
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${BBPORT_CLANG_BIN}"
+                ENVIRONMENT "BB_GPU_USER_DIR=${CMAKE_CURRENT_BINARY_DIR}/test-user")
+        endforeach()
+    endif()
 endif()
 
 add_executable(fsr4-bench EXCLUDE_FROM_ALL tools/fsr4_bench.cpp

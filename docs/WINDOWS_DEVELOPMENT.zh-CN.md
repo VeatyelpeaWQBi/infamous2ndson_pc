@@ -16,6 +16,10 @@ Second Son 启动器会识别标题与程序指纹、隔离血源补丁和 MOD�
 - 编译器：已有的 MSYS2 CLANG64，配套 Clang、libc++、LLD、CMake、Ninja 和开发库。
 - MSYS2 定位：优先 `BB_MSYS2`，否则从 PATH 中的 CLANG64 编译器定位，再尝试 `C:\msys64`。
 - 运行时：保留 CLANG64 的 SDL3、FFmpeg、libc++ 等 DLL。启动器仅在当前子进程环境中加入其路径，不修改全局 PATH。
+
+`out\*.exe` 是开发构建产物，不是便携发布包，直接在资源管理器中双击会绕过运行时路径设置并出现
+“找不到 SDL3.dll/libc++.dll”等系统提示。请使用根目录的 `test.bat`、`build.bat`、`run.bat`，
+或从 VS Code 的 CTest 入口启动；这些入口会自动加入现有 MSYS2 CLANG64 DLL 路径。
 - 图形：现有显卡驱动提供的 Vulkan；不需要为了构建额外安装独立 Vulkan SDK。
 
 若需要指定本机已有工具，可在当前 PowerShell 窗口设置：
