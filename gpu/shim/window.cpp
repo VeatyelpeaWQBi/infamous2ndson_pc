@@ -9,6 +9,8 @@
 #include "bbport_settings.h"
 #include "bbport_mouse_motion.h"
 #include "bbport_debug_hotkey.h"
+#include "bbport_diagnostics.h"
+#include "bbport_benchmark_control.h"
 
 extern "C" void runtime_debug_mark(void);
 extern "C" int bbgpu_toggle_performance_recording(void);
@@ -120,6 +122,10 @@ void WindowSDL::UpdateMouseMotion() {
 }
 
 bool WindowSDL::PollEvents() {
+    static BbBenchmark::Control benchmark;
+    if(benchmark.Poll([](bool state){return BbDiagnostics::SetRecording(state);},[] {
+        if(const char* dir=std::getenv("BB_DEBUG_DIR")) std::ofstream(std::string(dir)+"/capture-next").put('1');
+    })) is_open=false;
     {
         std::scoped_lock lock{text_mutex};
         if (text_requested) { // SDL text input must be toggled from the window thread

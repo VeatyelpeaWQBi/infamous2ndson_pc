@@ -1343,6 +1343,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
         upscaler->OnDispatch(cs.pgm_hash);
     }
     if (ExecuteShaderHLE(cs, Regs(), cs_program, *this)) {
+        buffer_cache.PrefetchReadbacks();
         return;
     }
 
@@ -1371,6 +1372,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     DebugState.IncDispatch();
 
     ResetBindings(true);
+    buffer_cache.PrefetchReadbacks();
     scheduler.KickRecording();
 }
 
@@ -1422,6 +1424,7 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
     DebugState.IncDispatch();
 
     ResetBindings(true);
+    buffer_cache.PrefetchReadbacks();
     scheduler.KickRecording();
 }
 
@@ -1445,6 +1448,7 @@ void Rasterizer::OnSubmit() {
         buffer_cache.ProcessFaultBuffer();
     }
     texture_cache.ProcessDownloadImages();
+    buffer_cache.PrefetchReadbacks();
     texture_cache.RunGarbageCollector();
     runtime.TickFrame();
 }
@@ -1710,6 +1714,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     }
 
     if (uses_dma) {
+        buffer_cache.InvalidateReadbackHints(); // Unknown-address shaders cannot reuse an older snapshot.
         buffer_cache.SynchronizeDmaBuffers();
         fault_process_pending = true;
     }
@@ -2194,7 +2199,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
-                const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                const u64 size = [&] {
+                    BbStats::BufferTimer<0> timer{BbStats::buffer_clamp_ns};
+                    return memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                }();
                 if (size != vsharp.GetSize()) {
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
@@ -2214,7 +2222,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
                 }
-                needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
+                {
+                    BbStats::BufferTimer<1> timer{BbStats::buffer_hazard_ns};
+                    needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
+                }
             }
         }
 
@@ -3254,6 +3265,7 @@ void Rasterizer::RegisterMemory(VAddr addr, u64 size) {
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     DrainDrawPipe();
     buffer_cache.InvalidateMemory(addr, size);
+    buffer_cache.ForgetReadbacks(addr,size);
     texture_cache.UnmapMemory(addr, size);
     {
         std::scoped_lock lock{mapped_ranges_mutex};

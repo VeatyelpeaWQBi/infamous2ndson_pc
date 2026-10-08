@@ -103,6 +103,7 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     };
     runtime.DownloadImage(&image, download.buffer, std::span{&image_download, 1});
     if (sync) {
+        BbStats::WaitTimer timer{BbStats::image_readback_wait_ns};
         scheduler.Finish();
         download.Invalidate();
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
@@ -283,6 +284,11 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         // Ensure image is reuploaded when accessed again.
         image.flags |= ImageFlagBits::GpuDirty;
     });
+}
+
+bool TextureCache::HasImageOverlap(VAddr address,size_t size) {
+    std::scoped_lock lock{mutex};bool found=false;
+    ForEachImageInRegion(address,size,[&](ImageId,Image&){found=true;});return found;
 }
 
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {

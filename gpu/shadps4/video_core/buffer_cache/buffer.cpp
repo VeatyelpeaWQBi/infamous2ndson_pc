@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <numeric>
+#include "bbport_toggles.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -274,7 +275,7 @@ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_w
         if (!scheduler.IsFree(watch.tick) && !allow_wait) {
             return false;
         }
-        scheduler.Wait(watch.tick);
+        {BbStats::WaitTimer timer{BbStats::stream_reuse_wait_ns}; scheduler.Wait(watch.tick);}
         wait_bound = watch.upper_bound;
         ++wait_cursor;
     }

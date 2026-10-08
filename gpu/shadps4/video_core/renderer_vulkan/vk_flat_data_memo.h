@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Read-only flat user-data only. No guest pointer or GPU-written buffer shortcuts.
+// Exact read-only byte snapshots. No GPU-written buffer or stale guest pointer reuse.
 #pragma once
 #include <array>
 #include <cstring>

@@ -57,6 +57,11 @@ def native_environment(profile, data, env):
     if env.get('BB_PRESENT_MODE') not in ('Mailbox','Fifo'):
         env['BB_PRESENT_MODE']='Mailbox'
     env.setdefault('BB_FLAT_DATA_MEMO','1')
+    # Actual-game A/B: avoid draining unrelated GPU work for hot CPU readbacks,
+    # and present ready frames between guest vblank ticks with a 60 FPS ceiling.
+    env.setdefault('BB_READBACK_PREFETCH','1')
+    env.setdefault('BB_FPS_LIMIT','60')
+    env.setdefault('BB_CPU_WORD_SUMMARY','1')
     env.update(BB_GAME_PROFILE='infamous', BB_UPSCALER='none', BB_DEBUG_MOTION='0',
                BB_REGION=locale['region'], BB_LANGUAGE=str(locale['system_language']),
                BB_TIMEZONE_MINUTES=str(locale['timezone_minutes']),

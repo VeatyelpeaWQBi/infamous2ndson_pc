@@ -109,6 +109,8 @@ struct PageManager::Impl {
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
+        const auto previous_ip=BbStats::fault_instruction;
+        BbStats::fault_instruction=reinterpret_cast<std::uintptr_t>(Common::GetRip(context));
         // bbport: the draw recording thread handles its faults inline too (vk_draw_pipe.h).
         const auto is_gpu_thread = rasterizer->IsGpuSideThread();
         if (is_gpu_thread) {
@@ -116,11 +118,13 @@ struct PageManager::Impl {
         }
         if (Common::IsWriteError(context)) {
             BbStats::Timer timer{BbStats::t_write_faults};
-            return rasterizer->OnWriteFault(addr, is_gpu_thread);
+            const bool handled=rasterizer->OnWriteFault(addr, is_gpu_thread);
+            BbStats::fault_instruction=previous_ip;return handled;
         } else {
             BbStats::read_faults.fetch_add(1, std::memory_order_relaxed);
             BbStats::Timer timer{BbStats::t_read_faults};
-            return rasterizer->ReadMemory(addr, 8, is_gpu_thread);
+            const bool handled=rasterizer->ReadMemory(addr, 8, is_gpu_thread);
+            BbStats::fault_instruction=previous_ip;return handled;
         }
         return false;
     }

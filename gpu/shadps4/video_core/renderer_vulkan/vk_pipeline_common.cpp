@@ -11,6 +11,8 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_descriptor_pack.h"
+#include "bbport_toggles.h"
 
 namespace Vulkan {
 
@@ -25,6 +27,7 @@ Pipeline::~Pipeline() = default;
 
 void Pipeline::BindResources(DescriptorWrites& set_writes,
                              const Shader::PushData& push_data) const {
+    BbStats::Timer descriptor_timer{BbStats::descriptor_bind_ns};
     const auto bind_point =
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;
     const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
@@ -44,6 +47,20 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
                 cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, set_writes);
             });
             return;
+        }
+        static const bool packed=[] {
+            const char* v=std::getenv("BB_DESCRIPTOR_PACK");return v && v[0]=='1';
+        }();
+        if(packed) {
+            if(const auto bytes=DescriptorPackingSize(set_writes)) {
+                const auto storage=scheduler.RecordBytes(*bytes,alignof(vk::WriteDescriptorSet));
+                const auto writes=PackDescriptorWrites(set_writes,storage);
+                ASSERT(writes.size()==set_writes.size());
+                scheduler.Record([bind_point,layout,writes](vk::CommandBuffer cmdbuf) {
+                    cmdbuf.pushDescriptorSetKHR(bind_point,layout,0,writes);
+                });
+                return;
+            }
         }
         // Writes and the infos they point to are laid out in the recording chunk, with the
         // pointers already aimed at those copies: the command only carries a span.

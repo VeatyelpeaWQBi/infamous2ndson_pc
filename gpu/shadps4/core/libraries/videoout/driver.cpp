@@ -312,7 +312,12 @@ void VideoOutDriver::Flip(const Request& req) {
             copy_threads_wait_ns.load(),tick_wait_ns.load(),bind_ns.load(),pipeline_select_ns.load(),
             buffer_bind_ns.load(),texture_bind_ns.load(),sampler_bind_ns.load(),
             texture_set_hits.load(),texture_set_misses.load(),texture_set_revalidated.load(),
-            image_read_memo_hits.load(),image_subresource_checks.load(),flat_data_memo_hits.load(),flat_data_bytes_saved.load()});
+            image_read_memo_hits.load(),image_subresource_checks.load(),flat_data_memo_hits.load(),flat_data_bytes_saved.load(),
+            buffer_clamp_ns.load(),buffer_stream_ns.load(),buffer_arena_ns.load(),buffer_hazard_ns.load(),
+            buffer_stream_calls.load(),buffer_arena_calls.load(),buffer_residency_ns.load(),buffer_sync_ns.load(),buffer_alias_ns.load(),
+            fault_slot_wait_ns.load(),frame_ahead_wait_ns.load(),stream_reuse_wait_ns.load(),
+            buffer_readback_wait_ns.load(),image_readback_wait_ns.load(),gds_store_wait_ns.load(),
+            buffer_readback_calls.load(),buffer_readback_bytes.load(),readback_prefetches.load(),readback_prefetch_hits.load(),clean_arena_read_hits.load(),descriptor_bind_ns.load()});
     }
     // Numeric bounded telemetry replaces verbose per-stall text and preserves
     // cumulative counters; do not exchange/reset them underneath Frame().

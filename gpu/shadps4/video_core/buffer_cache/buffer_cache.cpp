@@ -137,14 +137,43 @@ void BufferCache::ExtendWriteFault(VAddr device_addr) {
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
-    const auto flush_request = [this, device_addr, size, is_write] {
+    const auto original_ip=BbStats::fault_instruction;
+    const auto write_bytes=BbStats::write_data_bytes;
+    const auto flush_request = [this, device_addr, size, is_write,assume_locks,original_ip,write_bytes] {
+        if(TryPrefetchedReadback(device_addr,size)) {
+            if(is_write) memory_tracker->MarkRegionAsCpuModified(device_addr,size);
+            return;
+        }
+        NoteReadbackPage(device_addr);
+        static const bool trace=[] {const char* v=std::getenv("BB_READBACK_TRACE");return v && v[0]=='1';}();
+        static auto last=std::chrono::steady_clock::time_point{};
+        const auto now=std::chrono::steady_clock::now();
+        if(trace && now-last>=std::chrono::seconds(1)) {
+            last=now;u64 dirty_bytes=0;
+            const auto page=Common::AlignDown(device_addr,u64{4096});
+            gpu_modified_ranges.ForEachInRange(page,4096,[&](VAddr a,VAddr b){dirty_bytes+=b-a;});
+            std::fprintf(stderr,"READBACK_ORIGIN address=%#llx request=%llu write=%d gpu_caller=%d ip=%#llx dirty_page_bytes=%llu write_data_bytes=%llu\n",
+                device_addr,size,int(is_write),int(assume_locks),u64(original_ip),dirty_bytes,write_bytes);
+            bool found=false;
+            for(const auto& slot:readback_slots) if(slot.hint.page==page) {
+                const auto& hint=slot.hint;found=true;
+                std::fprintf(stderr,"READBACK_MISS page=%#llx tick=%llu epoch=%llu copied_epoch=%llu valid=%d cpu_dirty=%d image_overlap=%d\n",
+                    page,hint.tick,hint.epoch,hint.copied_epoch,int(hint.Valid()),
+                    int(IsRegionCpuModified(page,4096)),int(texture_cache.HasImageOverlap(page,4096)));
+            }
+            if(!found) std::fprintf(stderr,"READBACK_MISS page=%#llx pool_full=1\n",page);
+        }
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
         const auto* arena = GetArena(first_block, last_block);
 
         // GPU-modified ranges come as many small scattered islands,
         // so the download is widened to a window around the request
-        constexpr u64 WindowSize = 512_KB;
+        static const u64 WindowSize = [] {
+            const char* value=std::getenv("BB_READBACK_WINDOW_KIB");
+            const u64 kib=value ? std::strtoull(value,nullptr,10) : 512;
+            return std::bit_ceil(std::clamp<u64>(kib,4,512))*1024;
+        }();
         const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
         const VAddr window_start =
             std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), arena->cpu_addr);
@@ -186,12 +215,15 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     if (total_size_bytes == 0) {
         return;
     }
+    NoteReadbackWrite(device_addr,size); // An on-demand readback changes CPU/GPU ownership.
+    BbStats::buffer_readback_calls.fetch_add(1,std::memory_order_relaxed);
+    BbStats::buffer_readback_bytes.fetch_add(total_size_bytes,std::memory_order_relaxed);
     const auto download = staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached);
     for (auto& copy : copies) {
         copy.dstOffset += download.offset;
     }
     runtime.CopyBuffer(arena, download.buffer, copies);
-    scheduler.Finish();
+    {BbStats::WaitTimer timer{BbStats::buffer_readback_wait_ns};scheduler.Finish();}
 
     download.buffer->Invalidate(download.offset, download.size);
     for (const auto& copy : copies) {
@@ -293,6 +325,24 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
+        static const bool clean_arena=[] {
+            const char* value=std::getenv("BB_CLEAN_ARENA_READ");return value && value[0]=='1';
+        }();
+        // A larger earlier upload may already cover this small readonly range.
+        // Reuse only fully resident, CPU-clean raw buffers; texel aliases retain
+        // their normal image synchronization path. No content/version shortcut.
+        if(clean_arena && size && !is_texel_buffer && !IsRegionCpuModified(device_addr,size)) {
+            const auto* arena=address_space[device_addr>>ARENA_PAGE_BITS];
+            const u64 end=device_addr+size;
+            const u64 first=device_addr>>block_shift,last=(end-1)>>block_shift;
+            if(arena && end>=device_addr && end<=arena->cpu_addr+arena->size_bytes &&
+               resident_ranges.Contains(first,last+1)) {
+                BbStats::clean_arena_read_hits.fetch_add(1,std::memory_order_relaxed);
+                return {arena,arena->Offset(device_addr)};
+            }
+        }
+        BbStats::BufferTimer<2> timer{BbStats::buffer_stream_ns};
+        if (BbStats::buffer_profiling) BbStats::buffer_stream_calls.fetch_add(1,std::memory_order_relaxed);
         if (stats) {
             auto& region = Stats().regions[RegionKey(device_addr)];
             ++region.stream_count;
@@ -319,6 +369,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         stream_buffer.Commit();
         return {&stream_buffer, offset};
     }
+    BbStats::BufferTimer<3> timer{BbStats::buffer_arena_ns};
+    if (BbStats::buffer_profiling) BbStats::buffer_arena_calls.fetch_add(1,std::memory_order_relaxed);
     const u64 first_block = device_addr >> block_shift;
     const u64 last_block = (device_addr + size - 1) >> block_shift;
     const auto* arena = GetArena(first_block, last_block);
@@ -333,6 +385,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
             BbStats::buffer_upload_bytes.load(std::memory_order_relaxed) - uploaded_before;
     }
     if (is_written) {
+        NoteReadbackWrite(device_addr,size);
         gpu_modified_ranges.Add(device_addr, size);
     }
     return {arena, arena->Offset(device_addr)};
@@ -376,6 +429,80 @@ bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
 
 bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
     return memory_tracker->IsRegionGpuModified(addr, size);
+}
+
+bool BufferCache::ReadbackPrefetchEnabled() const {
+    static const bool enabled=[] {const char* v=std::getenv("BB_READBACK_PREFETCH");return v && v[0]=='1';}();return enabled;
+}
+void BufferCache::NoteReadbackPage(VAddr address) {
+    if(!ReadbackPrefetchEnabled()) return;
+    const VAddr page=Common::AlignDown(address,u64{4096});
+    for(auto& slot:readback_slots) if(slot.hint.page==page) {
+        slot.last_use=++readback_use_serial;return;
+    }
+    static const bool adaptive=[] {
+        const char* value=std::getenv("BB_READBACK_LRU");return !value || value[0]!='0';
+    }();
+    if(!adaptive) {
+        for(auto& slot:readback_slots) if(!slot.hint.page) {
+            slot.hint.page=page;slot.last_use=++readback_use_serial;return;
+        }
+        return;
+    }
+    auto* victim=SelectReadbackVictim(readback_slots,[&](u64 tick){return scheduler.IsFree(tick);});
+    if(!victim) return; // All storage is still in flight: retain the normal readback path.
+    victim->hint.Forget();
+    victim->hint.page=page;
+    victim->last_use=++readback_use_serial;
+}
+void BufferCache::NoteReadbackWrite(VAddr address,u64 size) {
+    if(!ReadbackPrefetchEnabled()) return;
+    for(auto& slot:readback_slots) if(slot.hint.page) slot.hint.Write(address,size);
+}
+void BufferCache::InvalidateReadbackHints() {
+    if(!ReadbackPrefetchEnabled()) return;
+    for(auto& slot:readback_slots) if(slot.hint.page) slot.hint.Write(slot.hint.page,4096);
+}
+void BufferCache::PrefetchReadbacks() {
+    if(!ReadbackPrefetchEnabled()) return;
+    bool queued=false;
+    for(auto& slot:readback_slots) {
+        auto& hint=slot.hint;
+        if(!hint.page || hint.Valid() || !gpu_modified_ranges.Intersects(hint.page,4096) || IsRegionCpuModified(hint.page,4096)) continue;
+        if(texture_cache.HasImageOverlap(hint.page,4096)) continue;
+        if(hint.tick && !scheduler.IsFree(hint.tick)) continue; // Never reuse in-flight snapshot storage.
+        if(!slot.buffer) slot.buffer=std::make_unique<Buffer>(instance,0,4096,MemoryType::HostCached,"Hot CPU readback");
+        const auto first=hint.page>>block_shift,last=(hint.page+4095)>>block_shift;
+        const auto* arena=GetArena(first,last);
+        const vk::BufferCopy copy{arena->Offset(hint.page),0,4096};
+        runtime.CopyBuffer(arena,slot.buffer.get(),std::span{&copy,1});
+        hint.Captured(scheduler.CurrentTick());
+        queued=true;
+        BbStats::readback_prefetches.fetch_add(1,std::memory_order_relaxed);
+    }
+    if(queued) scheduler.Flush(); // Signal snapshots before unrelated later rendering can extend their wait.
+}
+bool BufferCache::TryPrefetchedReadback(VAddr address,u64 size) {
+    if(!ReadbackPrefetchEnabled()) return false;
+    for(auto& slot:readback_slots) {
+        auto& hint=slot.hint;
+        if(!hint.Matches(address,size) || !hint.Valid() || !slot.buffer || IsRegionCpuModified(hint.page,4096)) continue;
+        if(texture_cache.HasImageOverlap(hint.page,4096)) continue;
+        {BbStats::WaitTimer timer{BbStats::buffer_readback_wait_ns};scheduler.Wait(hint.tick);}
+        slot.buffer->Invalidate(0,4096);
+        bool copied=true;
+        gpu_modified_ranges.ForEachInRange(hint.page,4096,[&](VAddr a,VAddr b) {
+            copied &= memory->TryWriteBacking(reinterpret_cast<void*>(a),slot.buffer->mapped_data.data()+a-hint.page,b-a);
+        });
+        if(!copied) return false;
+        gpu_modified_ranges.Subtract(hint.page,4096);
+        memory_tracker->UnmarkRegionAsGpuModified(hint.page,4096);
+        hint.Consumed();
+        slot.last_use=++readback_use_serial;
+        BbStats::readback_prefetch_hits.fetch_add(1,std::memory_order_relaxed);
+        return true;
+    }
+    return false;
 }
 
 void BufferCache::ProcessFaultBuffer() {
@@ -446,6 +573,7 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
 }
 
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
+    BbStats::BufferTimer<4> timer{BbStats::buffer_residency_ns};
     u32 resident_blocks{};
     IntervalList bind_ranges;
     resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
@@ -456,7 +584,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     if (bind_ranges.Empty()) {
         return;
     }
-    BbStats::Timer timer{BbStats::t_resident};
+    BbStats::Timer allocate_timer{BbStats::t_resident};
 
     const vk::MemoryAllocateInfo alloc_info = {
         .allocationSize = resident_blocks << block_shift,
@@ -504,6 +632,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
 
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
                                     bool is_written, bool is_texel_buffer) {
+    BbStats::BufferTimer<5> timer{BbStats::buffer_sync_ns};
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes{};
     const Buffer* src_buffer{};
@@ -513,9 +642,12 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             copies.emplace_back(total_size_bytes, addr, size);
             total_size_bytes += size;
         },
-        [&] { src_buffer = UploadCopies(arena, copies, total_size_bytes); });
+        [&] {
+            src_buffer = UploadCopies(arena, copies, total_size_bytes);
+        });
 
     if (src_buffer) {
+        for(const auto& copy:copies) NoteReadbackWrite(arena->cpu_addr+copy.dstOffset,copy.size);
         runtime.CopyBuffer(src_buffer, arena, copies);
     }
     if (is_texel_buffer && !is_written) {
@@ -603,9 +735,11 @@ const Buffer* BufferCache::UploadCopies(const Buffer* arena, std::span<vk::Buffe
 }
 
 bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size) {
+    BbStats::BufferTimer<6> timer{BbStats::buffer_alias_ns};
     if (auto type = texture_cache.IsMeta(device_addr)) {
         if (*type == TextureCache::MetaType::HTile) {
             static constexpr u32 ZmaskUncompressed = 0xf;
+            NoteReadbackWrite(device_addr,size);
             runtime.FillBuffer(arena, arena->Offset(device_addr), size, ZmaskUncompressed);
             return true;
         } else {
@@ -659,6 +793,7 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
         return false;
     }
     auto& tile_manager = texture_cache.GetTileManager();
+    NoteReadbackWrite(device_addr,size);
     tile_manager.TileImage(image, buffer_copies, arena, arena_offset);
     return true;
 }

@@ -20,6 +20,7 @@
 #include "common/debug.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/region_definitions.h"
+#include "video_core/buffer_cache/cpu_word_summary.h"
 #include "video_core/page_manager.h"
 
 namespace VideoCore {
@@ -93,6 +94,7 @@ public:
         }
 
         RegionBits& bits = GetRegionBits<type>();
+        if constexpr (type == Type::CPU && enable) cpu_summary.Mark(start_page,end_page);
         if constexpr (type == Type::CPU && enable) {
             CountWriteFaults(start_page, end_page);
         }
@@ -102,9 +104,11 @@ public:
             bits.UnsetRange(start_page, end_page);
         }
         if constexpr (type == Type::CPU) {
+            cpu_summary.Refresh(cpu,start_page,end_page);
             UpdateProtection<!enable, false>();
-        } else if (EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise) {
-            UpdateProtection<enable, true>();
+        } else {
+            if (EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise)
+                UpdateProtection<enable, true>();
         }
     }
 
@@ -122,7 +126,9 @@ public:
         if (add.None()) {
             return;
         }
+        cpu_summary.Mark(start_page,end_page);
         cpu |= add;
+        cpu_summary.Refresh(cpu,start_page,end_page);
         UpdateProtection<false, false>();
     }
 
@@ -149,9 +155,10 @@ public:
         // bbport: nothing modified in the range means nothing to clear or re-protect (CPU bits
         // always match `writeable` after a change); this runs for every buffer binding, so
         // it is checked before building the range mask.
-        if (type == Type::CPU && !bits.AnyInRange(start_page, end_page) &&
-            !BbToggle::Disabled(BbToggle::PageTrackingEarlyExit)) {
-            return;
+        if constexpr (type == Type::CPU) {
+            if (!BbToggle::Disabled(BbToggle::PageTrackingEarlyExit) &&
+                ((CpuSummaryEnabled() && !cpu_summary.MightBeDirty(start_page,end_page)) ||
+                 !bits.AnyInRange(start_page,end_page))) return;
         }
         RegionBits mask(bits, start_page, end_page);
 
@@ -159,9 +166,11 @@ public:
             bits.UnsetRange(start_page, end_page);
             if constexpr (type == Type::CPU) {
                 KeepHotPagesModified(start_page, end_page);
+                cpu_summary.Refresh(cpu,start_page,end_page);
                 UpdateProtection<true, false>();
-            } else if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled) {
-                UpdateProtection<false, true>();
+            } else {
+                if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled)
+                    UpdateProtection<false, true>();
             }
         }
 
@@ -186,6 +195,9 @@ public:
             return false;
         }
 
+        if constexpr (type == Type::CPU) {
+            if(CpuSummaryEnabled() && !cpu_summary.MightBeDirty(start_page,end_page)) return false;
+        }
         const RegionBits& bits = GetRegionBits<type>();
         return bits.AnyInRange(start_page, end_page);
     }
@@ -193,6 +205,12 @@ public:
     LockType lock;
 
 private:
+    static bool CpuSummaryEnabled() {
+        static const bool enabled=[] {
+            const char* value=std::getenv("BB_CPU_WORD_SUMMARY");return !value || value[0]!='0';
+        }();
+        return enabled;
+    }
     /**
      * Notify tracker about changes in the CPU tracking state of a word in the buffer
      *
@@ -285,6 +303,7 @@ private:
     PageManager* tracker;
     VAddr cpu_addr = 0;
     RegionBits cpu;
+    CpuWordSummary cpu_summary;
     RegionBits gpu;
     RegionBits writeable;
     RegionBits readable;

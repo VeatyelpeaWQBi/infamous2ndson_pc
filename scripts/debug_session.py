@@ -154,7 +154,7 @@ def collect(command,cwd,base,profile,env=None):
                   'snapshot_max_resolution':[1920,1080],'snapshot_source_max_resolution':[4096,2160],
                   'snapshot_slots':8,'snapshot_mark_slots':4,'snapshot_followup_slots':4,'snapshot_followups':3,'snapshot_interval_ms':1000,
                   'snapshot_manual_only':env.get('BB_CAPTURE_MANUAL_ONLY')=='1'},
-        'settings':{key:env.get(key) for key in ('BB_GAME_PROFILE','BB_SHADER_SOURCE','BB_SHADER_BUNDLE','BB_IMAGE_READ_MEMO','BB_FLAT_DATA_MEMO','BB_PRESENT_MODE','BB_HDR','BB_FSR1','BB_UPSCALER','BB_GPU_PROFILE','BB_PREP_PRIORITY','BB_PIPELINE_CACHE','BB_DRAW_PIPE','BB_VK_RECORD_THREAD','BB_FPS','BB_VBLANK_HZ',
+        'settings':{key:env.get(key) for key in ('BB_GAME_PROFILE','BB_SHADER_SOURCE','BB_SHADER_BUNDLE','BB_IMAGE_READ_MEMO','BB_FLAT_DATA_MEMO','BB_PRESENT_MODE','BB_HDR','BB_FSR1','BB_UPSCALER','BB_GPU_PROFILE','BB_PREP_PRIORITY','BB_PIPELINE_CACHE','BB_DRAW_PIPE','BB_TEXTURE_HELPER','BB_VK_RECORD_THREAD','BB_FPS','BB_FPS_LIMIT','BB_VBLANK_HZ','BB_FRAMES_AHEAD','BB_CPU_WORD_SUMMARY','BB_BUFFER_PROFILE','BB_FAULT_CHUNK_WORDS','BB_READBACK_WINDOW_KIB','BB_READBACK_TRACE','BB_READBACK_PREFETCH','BB_READBACK_LRU','BB_CLEAN_ARENA_READ','BB_DESCRIPTOR_PACK',
             'BB_REGION','BB_LANGUAGE','BB_TIMEZONE_MINUTES','BB_ENTER_BUTTON','BB_PERF_STATS','BB_F10_DEEP')}}
     save_json(session/'manifest.json',manifest)
     executable=Path(command[0])

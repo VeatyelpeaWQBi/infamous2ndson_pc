@@ -9,6 +9,7 @@
 #include <chrono>
 #include <memory>
 #include "bbport_frame_metrics.h"
+#include "bbport_present_metrics.h"
 #include <windows.h>
 #ifdef MemoryBarrier
 #undef MemoryBarrier
@@ -26,6 +27,8 @@ struct State {
     std::string directory;
     bool failure_reported{};
     BbFrameMetrics::History frames;
+    BbPresentMetrics::History presented;
+    u64 written_present{},present_file_bytes{},dropped_present{};
     BbFrameMetrics::RecordingHistory recording_frames;
     u64 written_frame{},frame_file_bytes{},dropped_frames{};
     bool recording{},record_pending{};
@@ -60,6 +63,13 @@ inline bool ToggleRecording() {
     std::fflush(stderr);
     return s.recording;
 }
+// Window-thread benchmark commands share the same serialization as F11.
+inline bool SetRecording(bool desired) {
+    auto& s=Get(); if(s.directory.empty()) return false;
+    bool current;
+    {std::scoped_lock lock{s.mutex}; current=s.recording;}
+    return current==desired ? current : ToggleRecording();
+}
 inline void Record(const char* kind,u64 a=0,u64 b=0,u64 c=0,u64 d=0) {
     auto& s=Get(); if (s.directory.empty()) return;
     std::scoped_lock lock{s.mutex};
@@ -93,10 +103,12 @@ inline void Flush(bool force=false) {
     if (!force && now-s.last_flush<1000) return;
     // Allocate off the producer lock; copying the bounded history is the only shared work.
     const auto frames_storage=std::make_unique<BbFrameMetrics::History>();
+    const auto present_storage=std::make_unique<BbPresentMetrics::History>();
     std::unique_lock lock{s.mutex,std::try_to_lock}; if (!lock.owns_lock()) return;
     const auto events=s.events;
     // Expanded numeric histories must not consume a Windows thread's small stack.
     *frames_storage=s.frames;
+    *present_storage=s.presented;
     const auto& frames=*frames_storage;
     std::unique_ptr<BbFrameMetrics::RecordingHistory> recording_frames;
     const auto sequence=s.sequence,presents=s.presents,last_present=s.last_present;
@@ -111,6 +123,29 @@ inline void Flush(bool force=false) {
     }
     s.last_flush=now;
     lock.unlock(); // filesystem latency must never stall render producers
+    if(present_storage->sequence>s.written_present) {
+        const std::string path=s.directory+"/present-frames.csv";
+        const u64 first=std::max(s.written_present+1,present_storage->First());
+        s.dropped_present+=first-s.written_present-1;
+        FILE* output=nullptr;
+        for(u64 seq=first;seq<=present_storage->sequence;++seq) {
+            const auto& row=present_storage->rows[(seq-1)%present_storage->Capacity];
+            if(s.present_file_bytes>=2*1024*1024) {
+                if(output) {std::fclose(output);output=nullptr;}
+                if(!MoveFileExA(path.c_str(),(path+".1").c_str(),MOVEFILE_REPLACE_EXISTING)) break;
+                s.present_file_bytes=0;
+            }
+            if(!output) {
+                output=std::fopen(path.c_str(),s.present_file_bytes ? "ab":"wb");
+                if(!output) break;
+                if(!s.present_file_bytes) s.present_file_bytes=std::fprintf(output,"sequence,tick_ms,interval_ns,width,height,dropped_frames\n");
+            }
+            const int count=std::fprintf(output,"%llu,%llu,%llu,%u,%u,%llu\n",row.sequence,row.tick_ms,row.interval_ns,row.width,row.height,s.dropped_present);
+            if(count<0 || std::ferror(output)) break;
+            s.present_file_bytes+=count;s.written_present=seq;
+        }
+        if(output) std::fclose(output);
+    }
     const auto publish=[&](const char* name,auto write) {
         const std::string target=s.directory+"/"+name, pending=target+".next";
         FILE* f=std::fopen(pending.c_str(),"w");
@@ -141,7 +176,7 @@ inline void Flush(bool force=false) {
         FILE* f=nullptr;
         for (u64 seq=first;seq<=frames.sequence;++seq) {
             const auto& row=frames.frames[(seq-1)%frames.Capacity];
-            char line[1024];
+            char line[std::tuple_size_v<BbFrameMetrics::Counters>*24+128];
             int used=std::snprintf(line,sizeof(line),"%llu,%llu,%llu,%llu",row.sequence,row.tick_ms,row.interval_ns,dropped);
             for (auto value:row.delta) used+=std::snprintf(line+used,sizeof(line)-used,",%llu",static_cast<unsigned long long>(value));
             line[used++]='\n';
@@ -208,6 +243,8 @@ inline void Presented(u32 width,u32 height) {
     {
         std::scoped_lock lock{s.mutex}; ++s.presents;
         s.last_present=GetTickCount64(); s.width=width; s.height=height;
+        const auto ns=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        s.presented.Push(ns,s.last_present,width,height);
     }
     Record("present",width,height);
 }

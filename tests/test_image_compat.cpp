@@ -17,6 +17,11 @@
 #include "video_core/texture_cache/blit_helper.h"
 #include <vk_mem_alloc.h>
 #include "bbport_diagnostics.h"
+#include "video_core/buffer_cache/cpu_word_summary.h"
+#include "video_core/buffer_cache/fault_buffer_limits.h"
+#include "video_core/buffer_cache/readback_hint.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/host_shaders/fault_buffer_process_comp.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "core/platform.h"
 #include "video_core/renderer_vulkan/stencil_reference.h"
@@ -36,7 +41,97 @@
 #include "video_core/renderer_vulkan/vk_frame_snapshot.h"
 #include "video_core/renderer_vulkan/vk_texture_set_key.h"
 #include "video_core/renderer_vulkan/vk_flat_data_memo.h"
+#include "video_core/renderer_vulkan/vk_descriptor_pack.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "bbport_benchmark_control.h"
+
+static void runtime_benchmark_control(const std::filesystem::path& directory) {
+    std::filesystem::create_directories(directory);
+    auto history=std::make_unique<BbPresentMetrics::History>();
+    history->Push(100,1,1920,1080); history->Push(150,2,1920,1080);
+    assert(history->sequence==1 && history->rows[0].interval_ns==50);
+    for(u64 i=0;i<5000;++i) history->Push(200+i,3+i,1920,1080);
+    assert(history->First()>1);
+    BbBenchmark::Command parsed;
+    for(const char* bad:{"0 quit","-1 quit"," -1 quit","1 quit extra","1 unknown","18446744073709551616 quit"})
+        assert(!BbBenchmark::Parse(bad,parsed));
+    const auto path=directory/"control.txt";_putenv_s("BB_BENCH_CONTROL",path.string().c_str());
+    BbBenchmark::Control control; unsigned calls=0,snapshots=0;
+    std::ofstream(path)<<"1 record-start\n";
+    assert(!control.Poll([&](bool value){++calls;return value;},[&]{++snapshots;}));
+    assert(calls==1 && std::filesystem::exists(path.string()+".ack"));
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    assert(!control.Poll([&](bool value){++calls;return value;},[&]{++snapshots;}));
+    assert(calls==1); // Retry cannot toggle recording twice.
+    std::ofstream(path)<<"2 snapshot\n";std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    control.Poll([&](bool value){++calls;return value;},[&]{++snapshots;});assert(snapshots==1);
+    std::ofstream(path)<<"3 quit\n";std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    assert(control.Poll([&](bool value){++calls;return value;},[&]{++snapshots;}));
+    _putenv_s("BB_BENCH_CONTROL","");
+    std::puts("Actual-present history / owned control acknowledgements / idempotency / bounded input validation PASS");
+}
+
+// Exercise the production transfer and scheduler. An unrelated later submission
+// waits on a host-controlled gate: reading the earlier snapshot must not drain it.
+static void readback_prefetch_gpu() {
+    using namespace VideoCore;
+    Vulkan::Instance instance(0, false);
+    Vulkan::Scheduler scheduler(instance);
+    Vulkan::Runtime runtime(instance, scheduler);
+    Buffer source(instance, 0, 4096, MemoryType::DeviceLocal);
+    Buffer snapshot(instance, 0, 4096, MemoryType::HostCached);
+    Buffer unrelated(instance, 0, 4096, MemoryType::DeviceLocal);
+    ReadbackHint hint;
+    hint.page = 0x1000;
+    const vk::BufferCopy copy{0, 0, 4096};
+    runtime.FillBuffer(&source, 0, 4096, 0xa5a5a5a5);
+    runtime.CopyBuffer(&source, &snapshot, std::span{&copy, 1});
+    hint.Captured(scheduler.CurrentTick());
+    scheduler.Flush();
+
+    vk::SemaphoreTypeCreateInfo timeline{.semaphoreType = vk::SemaphoreType::eTimeline};
+    auto [result, gate] = instance.GetDevice().createSemaphoreUnique({.pNext = &timeline});
+    assert(result == vk::Result::eSuccess);
+    runtime.FillBuffer(&unrelated, 0, 4096, 0x11111111);
+    Vulkan::SubmitInfo later{};
+    later.AddWait(*gate, 1);
+    const u64 later_tick = scheduler.CurrentTick();
+    scheduler.Flush(later);
+
+    std::atomic<bool> completed{false};
+    std::thread reader([&] {
+        scheduler.Wait(hint.tick);
+        snapshot.Invalidate(0, 4096);
+        completed.store(true, std::memory_order_release);
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!completed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const bool independent = completed.load(std::memory_order_acquire);
+    const bool later_pending = independent && !scheduler.IsFree(later_tick);
+    // Always release the gate, including failure paths, so a regression cannot
+    // leave the driver or test teardown waiting for an unsignaled semaphore.
+    assert(instance.GetDevice().signalSemaphore({.semaphore = *gate, .value = 1}) ==
+           vk::Result::eSuccess);
+    reader.join();
+    scheduler.Wait(later_tick);
+    assert(independent && later_pending);
+    for (const auto byte : snapshot.mapped_data) assert(byte == 0xa5);
+
+    hint.Write(0x1100, 4);
+    assert(!hint.Valid()); // A newer write rejects the old snapshot.
+    runtime.FillBuffer(&source, 0, 4096, 0x11111111);
+    runtime.CopyBuffer(&source, &snapshot, std::span{&copy, 1});
+    hint.Captured(scheduler.CurrentTick());
+    scheduler.Flush();
+    scheduler.Wait(hint.tick);
+    snapshot.Invalidate(0, 4096);
+    for (const auto byte : snapshot.mapped_data) assert(byte == 0x11);
+    hint.Consumed();
+    assert(!hint.Valid());
+    std::puts("GPU readback snapshot: early timeline completion, later-work independence and fresh bytes PASS");
+}
 
 static void flat_visibility() {
     Vulkan::Instance instance(0,false); Vulkan::Scheduler scheduler(instance);
@@ -72,9 +167,10 @@ static void flat_visibility() {
 }
 
 static void flat_memo() {
-    auto memo=std::make_unique<Vulkan::FlatDataMemo>();
+    using Memo=Vulkan::FlatDataMemo;
+    auto memo=std::make_unique<Memo>();
     std::array<u8,16> bytes{};
-    Vulkan::FlatDataMemo::Epoch epoch{1,0}; u64 copies=0;
+    Memo::Epoch epoch{1,0}; u64 copies=0;
     const auto upload=[&](u64 stage=16) {
         return memo->Upload(stage,bytes,[&]{return epoch;},[&]{return ++copies;});
     };
@@ -82,7 +178,7 @@ static void flat_memo() {
     bytes[15]=9; assert(!upload().reused && copies==2);
     assert(upload().reused); ++epoch.tick; assert(!upload().reused);
     ++epoch.wrap; assert(!upload().reused);
-    assert(!upload(16+16*Vulkan::FlatDataMemo::Capacity).reused); // slot collision
+    assert(!upload(16+16*Memo::Capacity).reused); // slot collision
     assert(!upload().reused && upload().reused);
     // Changes during copy must stamp the new epoch, not the request's old one.
     bytes[0]=7;
@@ -831,8 +927,162 @@ static void image_read_memo() {
     const double baseline=bench(false), optimized=bench(true);
     std::printf("Image partial-read barrier equivalence PASS; 10000 repeated reads: baseline %.3f ms, memo %.3f ms\n",baseline,optimized);
 }
+static void descriptor_pack_cpu() {
+    std::array<vk::DescriptorBufferInfo,2> buffers{{{{},16,32},{{},64,128}}};
+    std::array<vk::DescriptorImageInfo,2> images{};
+    images[0].imageLayout=vk::ImageLayout::eGeneral;
+    images[1].imageLayout=vk::ImageLayout::eShaderReadOnlyOptimal;
+    std::array<vk::BufferView,2> views{};
+    std::array<vk::WriteDescriptorSet,3> writes{{
+        {.dstBinding=3,.descriptorCount=2,.pBufferInfo=buffers.data()},
+        {.dstBinding=7,.descriptorCount=2,.pImageInfo=images.data()},
+        {.dstBinding=11,.descriptorCount=2,.pTexelBufferView=views.data()}}};
+    const auto bytes=Vulkan::DescriptorPackingSize(writes);assert(bytes);
+    std::vector<u64> storage((*bytes+7)/8);
+    const auto packed=Vulkan::PackDescriptorWrites(writes,{reinterpret_cast<u8*>(storage.data()),*bytes});
+    assert(packed.size()==3 && packed[0].pBufferInfo!=buffers.data());
+    buffers[0].offset=999;images[0].imageLayout=vk::ImageLayout::eUndefined;
+    writes[0].dstBinding=999;
+    assert(packed[0].dstBinding==3 && packed[0].pBufferInfo[0].offset==16);
+    assert(packed[0].pBufferInfo[1].range==128 && packed[1].pImageInfo[0].imageLayout==vk::ImageLayout::eGeneral);
+    assert(packed[2].pTexelBufferView!=views.data());
+    assert(Vulkan::PackDescriptorWrites(writes,{reinterpret_cast<u8*>(storage.data()),*bytes-1}).empty());
+    writes[0].pNext=&buffers;assert(!Vulkan::DescriptorPackingSize(writes));
+    std::puts("Descriptor owned snapshot: arrays, all info types, source mutation and unsupported extension PASS");
+}
+static void fault_decode_gpu(u32 chunk,bool packed=false) {
+    using namespace Vulkan;
+    Instance instance(0,false);Scheduler scheduler(instance,packed);const auto device=instance.GetDevice();
+    constexpr u32 WordCount=2048,InputBytes=WordCount*4;
+    VideoCore::Buffer input(instance,0,InputBytes,VideoCore::MemoryType::HostUncached);
+    VideoCore::Buffer output(instance,0,64,VideoCore::MemoryType::HostCached);
+    VideoCore::Buffer blank(instance,0,InputBytes,VideoCore::MemoryType::HostUncached);
+    std::memset(blank.mapped_data.data(),0,InputBytes);blank.Flush(0,InputBytes);
+    const std::array<vk::DescriptorSetLayoutBinding,2> bindings{{
+        {.binding=0,.descriptorType=vk::DescriptorType::eStorageBuffer,.descriptorCount=1,.stageFlags=vk::ShaderStageFlagBits::eCompute},
+        {.binding=1,.descriptorType=vk::DescriptorType::eStorageBuffer,.descriptorCount=1,.stageFlags=vk::ShaderStageFlagBits::eCompute}}};
+    auto set=Check(device.createDescriptorSetLayoutUnique({.flags=vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+        .bindingCount=2,.pBindings=bindings.data()}));
+    const auto set_handle=*set;
+    auto layout=Check(device.createPipelineLayoutUnique({.setLayoutCount=1,.pSetLayouts=&set_handle}));
+    const auto module=CompileSPV(FAULT_BUFFER_PROCESS_COMP,device);
+    const std::array<u32,3> constants{14,8,chunk};
+    const std::array<vk::SpecializationMapEntry,3> entries{{{0,0,4},{1,4,4},{2,8,4}}};
+    const vk::SpecializationInfo spec{.mapEntryCount=3,.pMapEntries=entries.data(),.dataSize=12,.pData=constants.data()};
+    auto pipeline=Check(device.createComputePipelineUnique({}, {.stage={.stage=vk::ShaderStageFlagBits::eCompute,
+        .module=module,.pName="main",.pSpecializationInfo=&spec},.layout=*layout}));
+    vk::DescriptorBufferInfo ib{input.Handle(),0,InputBytes},ob{output.Handle(),0,64};
+    const std::array<vk::WriteDescriptorSet,2> writes{{
+        {.dstBinding=0,.descriptorCount=1,.descriptorType=vk::DescriptorType::eStorageBuffer,.pBufferInfo=&ib},
+        {.dstBinding=1,.descriptorCount=1,.descriptorType=vk::DescriptorType::eStorageBuffer,.pBufferInfo=&ob}}};
+    std::array<bool,WordCount*32> seen{};unsigned decoded=0;
+    auto* words=reinterpret_cast<u32*>(input.mapped_data.data());
+    std::memset(words,0,InputBytes);
+    for(unsigned i=0;i<64;++i) words[i*32]=1;
+    words[WordCount-1]|=1u<<31;input.Flush(0,InputBytes);
+    for(unsigned pass=0;pass<12;++pass) {
+        std::memset(output.mapped_data.data(),0,64);output.Flush(0,64);
+        const vk::MemoryBarrier2 before{.srcStageMask=vk::PipelineStageFlagBits2::eAllCommands|vk::PipelineStageFlagBits2::eHost,
+            .srcAccessMask=vk::AccessFlagBits2::eShaderWrite|vk::AccessFlagBits2::eHostWrite,
+            .dstStageMask=vk::PipelineStageFlagBits2::eComputeShader,.dstAccessMask=vk::AccessFlagBits2::eShaderRead|vk::AccessFlagBits2::eShaderWrite};
+        scheduler.Record([before](vk::CommandBuffer c) {
+            c.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount=1,.pMemoryBarriers=&before});
+        });
+        ib.buffer=input.Handle();
+        if(packed) {
+            const auto bytes=Vulkan::DescriptorPackingSize(writes);assert(bytes);
+            const auto owned=Vulkan::PackDescriptorWrites(writes,
+                scheduler.RecordBytes(*bytes,alignof(vk::WriteDescriptorSet)));
+            scheduler.Record([handle=*pipeline,layout=*layout,owned,chunk](vk::CommandBuffer c) {
+                c.bindPipeline(vk::PipelineBindPoint::eCompute,handle);
+                c.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,layout,0,owned);
+                c.dispatch((WordCount+64*chunk-1)/(64*chunk),1,1);
+            });
+            // A stale pointer would bind a valid but empty input, failing the
+            // decoded+pending invariant without invalid GPU handles or buffers.
+            ib.buffer=blank.Handle();
+        } else {
+            const auto cmd=scheduler.CommandBuffer();
+            cmd.bindPipeline(vk::PipelineBindPoint::eCompute,*pipeline);
+            cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,*layout,0,writes);cmd.dispatch((WordCount+64*chunk-1)/(64*chunk),1,1);
+        }
+        const vk::MemoryBarrier2 after{.srcStageMask=vk::PipelineStageFlagBits2::eComputeShader,
+            .srcAccessMask=vk::AccessFlagBits2::eShaderWrite,.dstStageMask=vk::PipelineStageFlagBits2::eHost,.dstAccessMask=vk::AccessFlagBits2::eHostRead};
+        scheduler.Record([after](vk::CommandBuffer c) {
+            c.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount=1,.pMemoryBarriers=&after});
+        });
+        scheduler.Finish();output.Invalidate(0,64);input.Invalidate(0,InputBytes);
+        const auto* values=reinterpret_cast<const u64*>(output.mapped_data.data());
+        const u32 count=VideoCore::StoredFaultCount(values[0],8);assert(count<=7);
+        for(u32 i=1;i<=count;++i) {
+            const u64 page=values[i]>>14;assert(page<WordCount*32 && !seen[page]);seen[page]=true;++decoded;
+        }
+        unsigned pending=0;for(unsigned i=0;i<WordCount;++i) pending+=std::popcount(words[i]);
+        assert(decoded+pending==65); // No overflow loss or duplicated fault address.
+        if(decoded==65) assert(pending==0);
+    }
+    assert(decoded==65 && seen[WordCount*32-1]);
+    assert(VideoCore::StoredFaultCount(~0ull,1024)==1023);
+    device.destroyShaderModule(module);
+    std::puts("Real GPU fault decoder: clean bitmap, bounded output, overflow retry and high-address fault PASS");
+}
+static void cpu_word_summary() {
+    VideoCore::RegionBits bits;
+    VideoCore::CpuWordSummary clean(false);
+    assert(!clean.MightBeDirty(0,VideoCore::NUM_PAGES_PER_REGION));
+    VideoCore::CpuWordSummary summary;
+    bits.Fill(); summary.Refresh(bits,0,1024);
+    u32 random=12345;
+    const auto next=[&] {random=random*1664525u+1013904223u;return random;};
+    for(unsigned i=0;i<10000;++i) {
+        const size_t a=next()%1024,b=std::min<size_t>(1024,a+1+next()%256);
+        if(next()&1) {summary.Mark(a,b);bits.SetRange(a,b);}
+        else bits.UnsetRange(a,b);
+        summary.Refresh(bits,a,b);
+        for(unsigned j=0;j<8;++j) {
+            const size_t lo=next()%1024,hi=std::min<size_t>(1024,lo+1+next()%1024);
+            bool reference=false;for(size_t at=lo;at<hi;++at) reference|=bits.Get(at);
+            assert((summary.MightBeDirty(lo,hi)&&bits.AnyInRange(lo,hi))==reference);
+        }
+    }
+    bits.Clear();summary.Refresh(bits,0,1024);assert(!summary.MightBeDirty(0,1024));
+    summary.Mark(63,65);bits.SetRange(63,65);summary.Refresh(bits,63,65);
+    assert(summary.MightBeDirty(63,65)); assert(!summary.MightBeDirty(128,1024));
+    bits.Unset(63);summary.Refresh(bits,63,64);assert(bits.Get(64));
+    assert(!summary.MightBeDirty(0,64));assert(summary.MightBeDirty(64,65));
+    std::puts("CPU dirty-word summary: mixed writes, uploads and word boundaries PASS");
+}
 int main(int argc,char** argv) {
-    if (argc==2 && !std::strcmp(argv[1],"--flat-data-visibility")) flat_visibility();
+    if(argc==2 && !std::strcmp(argv[1],"--descriptor-pack")) {descriptor_pack_cpu();return 0;}
+    if(argc==2 && !std::strcmp(argv[1],"--descriptor-pack-gpu")) {fault_decode_gpu(1,true);return 0;}
+    if(argc==2 && !std::strcmp(argv[1],"--readback-prefetch-gpu")) {readback_prefetch_gpu();return 0;}
+    if(argc==2 && !std::strcmp(argv[1],"--readback-hint")) {
+        VideoCore::ReadbackHint hint;hint.page=0x1000;assert(!hint.Valid());
+        hint.Captured(3);assert(hint.Valid() && hint.Matches(0x1100,16));
+        hint.Write(0x3000,4096);assert(hint.Valid());
+        hint.Write(0x1ffc,4);assert(!hint.Valid());hint.Captured(4);assert(hint.Valid());
+        assert(!hint.Matches(0x1ffc,8));assert(!hint.Matches(0x1000,4097));
+        hint.Consumed();assert(!hint.Valid());
+        hint.Captured(5);hint.Forget();assert(!hint.Valid() && !hint.Matches(0x1100,4));
+        assert(hint.tick==5); // Storage remains pinned even when guest memory is unmapped.
+        struct Slot {VideoCore::ReadbackHint hint;u64 last_use{};};
+        std::array<Slot,3> slots{};
+        for(size_t i=0;i<slots.size();++i) {
+            slots[i].hint.page=0x1000*(i+1);slots[i].last_use=i+1;slots[i].hint.Captured(i+1);
+        }
+        auto free=[](u64 tick){return tick<=2;};
+        assert(VideoCore::SelectReadbackVictim(slots,free)==&slots[0]);
+        slots[0].last_use=4; // A cache hit protects the frequently used page.
+        assert(VideoCore::SelectReadbackVictim(slots,free)==&slots[1]);
+        slots[0].hint.Forget();
+        assert(VideoCore::SelectReadbackVictim(slots,free)==&slots[0]);
+        assert(!VideoCore::SelectReadbackVictim(slots,[](u64){return false;}));
+        std::puts("Readback snapshot generation / unrelated writes / page bounds / ownership invalidation PASS");return 0;
+    }
+    if(argc==2 && !std::strcmp(argv[1],"--fault-decode-gpu")) {fault_decode_gpu(1);fault_decode_gpu(32);return 0;}
+    if(argc==2 && !std::strcmp(argv[1],"--cpu-word-summary")) {cpu_word_summary();return 0;}
+    if (argc==3 && !std::strcmp(argv[1],"--runtime-benchmark-control")) runtime_benchmark_control(argv[2]);
+    else if (argc==2 && !std::strcmp(argv[1],"--flat-data-visibility")) flat_visibility();
     else if (argc==2 && !std::strcmp(argv[1],"--flat-data-memo")) flat_memo();
     else if (argc==2 && !std::strcmp(argv[1],"--texture-set-distribution")) texture_set_distribution();
     else if (argc==3 && !std::strcmp(argv[1],"--snapshot-pixels")) snapshot_pixels(argv[2]);

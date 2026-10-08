@@ -39,6 +39,12 @@ fi
 if [[ ${BB_PGO:-off} != off ]]; then
     echo 'Windows PGO is not validated; use BB_PGO=off. GCC/Linux profiles are not reused.' >&2; exit 1
 fi
+# Bound the existing LLVM ThinLTO backend independently of Ninja's job count.
+# Keep linker memory bounded; this does not limit game worker threads.
+lto_jobs=${BB_LTO_JOBS:-1}
+if [[ ! $lto_jobs =~ ^[1-9][0-9]?$ || $lto_jobs -gt 64 ]]; then
+    echo 'BB_LTO_JOBS must be between 1 and 64.' >&2; exit 1
+fi
 # Ordinary builds are offline. Only an explicit opt-in permits missing source downloads.
 allow_downloads=OFF
 if [[ ${BB_ALLOW_DOWNLOADS:-0} == 1 ]]; then allow_downloads=ON; fi
@@ -59,7 +65,7 @@ done
 mkdir -p out
 cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" -DBB_PGO=off \
-    -DBB_LTO="${BB_LTO:-ON}" -DBB_ALLOW_DOWNLOADS="$allow_downloads" \
+    -DBB_LTO="${BB_LTO:-ON}" -DBB_LTO_JOBS="$lto_jobs" -DBB_ALLOW_DOWNLOADS="$allow_downloads" \
     -DBB_BUILD_TESTS="$([[ $build_tests == 1 ]] && echo ON || echo OFF)"
 echo "Windows GPU library: PGO off, LTO ${BB_LTO:-ON}"
 if ! cmake --build out/gpu --target bbgpu > out/gpu-build.log 2>&1; then
@@ -69,11 +75,11 @@ fi
 read -r -a includes <<< "$(pkg-config --cflags vulkan sdl3)"
 read -r -a libraries <<< "$(pkg-config --libs vulkan sdl3)"
 libraries=("${libraries[@]/-mwindows/-mconsole}")
-cflags=(-std=gnu11 -D_FILE_OFFSET_BITS=64 -D_WIN32_WINNT=0x0A00 -O2 -g -Wall -Wextra -Werror)
+cflags=(-std=gnu11 -D_FILE_OFFSET_BITS=64 -D_WIN32_WINNT=0x0A00 -O2 -gline-tables-only -Wall -Wextra -Werror)
 mapfile -t gpu < out/gpu/bbgpu_link.txt
 runtime=(src/runtime*.c src/win32_*.c)
 link=(-Wl,--disable-dynamicbase,--disable-high-entropy-va -lwinmm -lws2_32 -lpsapi)
-if [[ ${BB_LTO:-ON} != OFF ]]; then link+=(-flto=thin); fi
+if [[ ${BB_LTO:-ON} != OFF ]]; then link+=(-flto=thin "-Wl,--thinlto-jobs=$lto_jobs"); fi
 # Recompile every decoder source after a source change; no recursive deletion is needed.
 atrac9=(third_party/LibAtrac9/C/src/*.c)
 if [[ ! -f out/libatrac9.a || -n $(find third_party/LibAtrac9/C/src -newer out/libatrac9.a -name '*.c') ]]; then
@@ -95,8 +101,11 @@ if [[ -f out/bb-probe.exe && -f out/bb-gpu-capabilities.exe &&
     echo "Up to date: $PWD/out/bb-probe.exe"
 else
     "$CC" "${cflags[@]}" "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" \
-        src/vulkan_smoke.c out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" "${link[@]}" -o out/bb-probe.exe
-    "$CC" "${cflags[@]}" tools/gpu_capabilities.c "${includes[@]}" "${libraries[@]}" -o out/bb-gpu-capabilities.exe
+        src/vulkan_smoke.c out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" "${link[@]}" -o out/bb-probe.next.exe
+    "$CC" "${cflags[@]}" tools/gpu_capabilities.c "${includes[@]}" "${libraries[@]}" -o out/bb-gpu-capabilities.next.exe
+    # Failed links preserve the last working launcher instead of deleting it.
+    mv -f out/bb-probe.next.exe out/bb-probe.exe
+    mv -f out/bb-gpu-capabilities.next.exe out/bb-gpu-capabilities.exe
     echo "Built $PWD/out/bb-probe.exe"
 fi
 if [[ $build_tests == 1 ]]; then

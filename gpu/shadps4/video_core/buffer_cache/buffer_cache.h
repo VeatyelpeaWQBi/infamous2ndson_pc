@@ -13,6 +13,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
+#include "video_core/buffer_cache/readback_hint.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 
 namespace AmdGpu {
@@ -100,6 +101,11 @@ public:
 
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
+    void ForgetReadbacks(VAddr addr,u64 size) {
+        for(auto& slot:readback_slots) if(slot.hint.Overlaps(addr,size)) slot.hint.Forget();
+    }
+    void PrefetchReadbacks();
+    void InvalidateReadbackHints();
 
     /// Processes the fault buffer.
     void ProcessFaultBuffer();
@@ -161,6 +167,13 @@ private:
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
+    struct ReadbackSlot {ReadbackHint hint;std::unique_ptr<Buffer> buffer;u64 last_use{};};
+    std::array<ReadbackSlot,8> readback_slots{};
+    u64 readback_use_serial{};
+    bool ReadbackPrefetchEnabled() const;
+    bool TryPrefetchedReadback(VAddr address,u64 size);
+    void NoteReadbackPage(VAddr address);
+    void NoteReadbackWrite(VAddr address,u64 size);
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;

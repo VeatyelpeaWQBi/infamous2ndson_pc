@@ -782,6 +782,14 @@ public:
 
     /// Copies `data` into recording storage that lives until the command that uses it has
     /// been recorded (the same chunk). With threaded recording off, returns `data` itself.
+    std::span<u8> RecordBytes(size_t bytes,size_t alignment) {
+        ASSERT(IsRecordingDeferred());
+        ReserveRecordData(bytes+alignment);
+        auto* data=static_cast<u8*>(record_chunk->Allocate(bytes,alignment));
+        ASSERT(data);
+        return {data,bytes};
+    }
+
     template <typename T>
     std::span<const T> RecordData(std::span<const T> data) {
         if (!IsRecordingDeferred() || data.empty()) {

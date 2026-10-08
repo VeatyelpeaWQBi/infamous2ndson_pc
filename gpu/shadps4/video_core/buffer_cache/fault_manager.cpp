@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/div_ceil.h"
+#include "bbport_toggles.h"
+#include "video_core/buffer_cache/fault_buffer_limits.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -24,6 +26,16 @@ FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& 
       download_buffer{instance, 0, MaxPendingFaults * PageFaultAreaSize, MemoryType::HostCached} {
     const auto device = instance.GetDevice();
     Vulkan::SetObjectName(device, fault_buffer.Handle(), "Fault Buffer");
+    // Device-local allocations have undefined initial contents. Clear before guest shaders
+    // can atomically set fault bits; the explicit barrier preserves visibility.
+    scheduler.Record([buffer=fault_buffer.Handle(),size=fault_buffer_size](vk::CommandBuffer cmd) {
+        cmd.fillBuffer(buffer,0,size,0);
+        const vk::BufferMemoryBarrier2 barrier{.srcStageMask=vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask=vk::AccessFlagBits2::eTransferWrite,.dstStageMask=vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask=vk::AccessFlagBits2::eShaderRead|vk::AccessFlagBits2::eShaderWrite,
+            .buffer=buffer,.offset=0,.size=size};
+        cmd.pipelineBarrier2(vk::DependencyInfo{.bufferMemoryBarrierCount=1,.pBufferMemoryBarriers=&barrier});
+    });
 
     const std::array<vk::DescriptorSetLayoutBinding, 2> bindings = {{
         {
@@ -47,10 +59,12 @@ FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& 
     fault_process_desc_layout =
         Vulkan::Check(device.createDescriptorSetLayoutUnique(desc_layout_ci));
 
-    const std::array<u32, 2> spec_data{sparse_pagebits, MaxPageFaults};
-    const std::array<vk::SpecializationMapEntry, 2> spec_entries{{
+    if(const char* value=std::getenv("BB_FAULT_CHUNK_WORDS")) words_per_thread=std::clamp(std::atoi(value),1,32);
+    const std::array<u32, 3> spec_data{sparse_pagebits, MaxPageFaults,words_per_thread};
+    const std::array<vk::SpecializationMapEntry, 3> spec_entries{{
         {0, 0, sizeof(u32)},
         {1, sizeof(u32), sizeof(u32)},
+        {2, 2*sizeof(u32), sizeof(u32)},
     }};
     const vk::SpecializationInfo specialization{
         .mapEntryCount = static_cast<u32>(spec_entries.size()),
@@ -86,6 +100,7 @@ FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& 
 
 void FaultManager::ProcessFaultBuffer() {
     if (u64 wait_tick = fault_areas[current_area]) {
+        BbStats::WaitTimer timer{BbStats::fault_slot_wait_ns};
         scheduler.Wait(wait_tick);
         scheduler.PopPendingOperations();
     }
@@ -93,6 +108,7 @@ void FaultManager::ProcessFaultBuffer() {
     const u32 offset = current_area * PageFaultAreaSize;
     u8* mapped = download_buffer.mapped_data.data() + offset;
     std::memset(mapped, 0, PageFaultAreaSize);
+    download_buffer.Flush(offset,PageFaultAreaSize);
 
     const vk::BufferMemoryBarrier2 pre_barrier = {
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -152,7 +168,7 @@ void FaultManager::ProcessFaultBuffer() {
                                 writes);
     // 1 bit per page, 32 pages per workgroup
     const u32 num_threads = sparse_num_pages / 32;
-    const u32 num_workgroups = Common::DivCeil(num_threads, 64u);
+    const u32 num_workgroups = Common::DivCeil(num_threads, 64u*words_per_thread);
     cmdbuf.dispatch(num_workgroups, 1, 1);
 
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
@@ -162,9 +178,10 @@ void FaultManager::ProcessFaultBuffer() {
     });
 
     scheduler.DeferOperation([this, mapped, area = current_area] {
+        download_buffer.Invalidate(area*PageFaultAreaSize,PageFaultAreaSize);
         fault_ranges.Clear();
         const u64* fault_buf = std::bit_cast<const u64*>(mapped);
-        const u32 fault_count = fault_buf[0];
+        const u32 fault_count = StoredFaultCount(fault_buf[0],MaxPageFaults);
         for (u32 i = 1; i <= fault_count; ++i) {
             fault_ranges.Add(fault_buf[i], sparse_pagesize);
             LOG_INFO(Render_Vulkan, "Accessed non-GPU cached memory at {:#x}", fault_buf[i]);

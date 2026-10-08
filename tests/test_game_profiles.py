@@ -20,6 +20,18 @@ def sfo_fixture(title):
 
 
 class GameProfiles(unittest.TestCase):
+    def test_infamous_readback_and_pacing_defaults_keep_explicit_diagnostic_overrides(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env={};game_profiles.native_environment({'id':'infamous','title_id':'CUSA00309'},tmp,env)
+            self.assertEqual(env['BB_READBACK_PREFETCH'],'1')
+            self.assertEqual(env['BB_FPS_LIMIT'],'60')
+            self.assertEqual(env['BB_CPU_WORD_SUMMARY'],'1')
+            env={'BB_READBACK_PREFETCH':'0','BB_FPS_LIMIT':'0','BB_CPU_WORD_SUMMARY':'0'}
+            game_profiles.native_environment({'id':'infamous','title_id':'CUSA00309'},tmp,env)
+            for key in ('BB_READBACK_PREFETCH','BB_FPS_LIMIT','BB_CPU_WORD_SUMMARY'):
+                self.assertEqual(env[key],'0')
+            other={};game_profiles.native_environment({'id':'bloodborne'},tmp,other)
+            self.assertFalse(other)
     def test_infamous_presentation_is_synchronized_and_memo_override_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:
             for mode in ('Immediate','Mailbox','Fifo','unknown'):

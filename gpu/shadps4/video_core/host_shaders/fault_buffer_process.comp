@@ -6,6 +6,7 @@
 
 layout(constant_id = 0) const uint CACHING_PAGEBITS = 12;
 layout(constant_id = 1) const uint MAX_PAGE_FAULTS = 1024;
+layout(constant_id = 2) const uint WORDS_PER_THREAD = 1;
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
@@ -20,19 +21,32 @@ layout(std430, binding = 1) buffer output_buf32 {
     uint download_buffer32[];
 };
 
-void main() {
-    const uint id = gl_GlobalInvocationID.x;
+void process_word(uint id) {
     uint word = fault_buffer[id];
+    if (word == 0u) {
+        return; // Most words are clean: avoid writing the entire 1 TiB address-space bitmap.
+    }
     fault_buffer[id] = 0u;
     const uint base_bit = id * 32u;
     while (word != 0u) {
         const uint store_index = atomicAdd(download_buffer32[0], 1u) + 1u;
         if (store_index >= MAX_PAGE_FAULTS) {
+            atomicOr(fault_buffer[id], word); // Preserve unreported faults for the next pass.
             return;
         }
         const uint bit = findLSB(word);
         word &= word - 1;
         const uint page = base_bit + bit;
         download_buffer[store_index] = uint64_t(page) << CACHING_PAGEBITS;
+    }
+}
+
+void main() {
+    // Coalesced accesses at every iteration; fewer idle thread groups for clean bitmaps.
+    const uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    for (uint i = 0u; i < WORDS_PER_THREAD; ++i) {
+        const uint id = gl_GlobalInvocationID.x + i * stride;
+        if (id >= fault_buffer.length()) break;
+        process_word(id);
     }
 }

@@ -103,6 +103,9 @@ static void sample_host(PadData *d) {
     d->orientation[3]=1.0f;
     d->connected=1; d->connected_count=connected_count ? connected_count : 1;
     d->timestamp=now_us();
+    /* Owned automated benchmark children use scripted input exclusively. */
+    const char *exclusive=getenv("BB_BENCHMARK_INPUT");
+    if (exclusive && exclusive[0]=='1') return;
     SDL_Gamepad *g=current_gamepad();
     if (bbgpu_overlay_captures_input()) return; /* settings menu open: neutral input */
     const bool *k=SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(NULL) : NULL;

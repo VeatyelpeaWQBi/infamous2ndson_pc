@@ -111,6 +111,31 @@ inline std::atomic<std::uint64_t> buffer_bind_ns{0}, texture_bind_ns{0}, sampler
     texture_set_hits{0}, texture_set_misses{0}, texture_set_revalidated{0};
 inline std::atomic<std::uint64_t> image_read_memo_hits{0}, image_subresource_checks{0};
 inline std::atomic<std::uint64_t> flat_data_memo_hits{0},flat_data_bytes_saved{0};
+inline std::atomic<std::uint64_t> buffer_clamp_ns{0},buffer_stream_ns{0},buffer_arena_ns{0},buffer_hazard_ns{0};
+inline std::atomic<std::uint64_t> buffer_stream_calls{0},buffer_arena_calls{0};
+inline std::atomic<std::uint64_t> buffer_residency_ns{0},buffer_sync_ns{0},buffer_alias_ns{0};
+inline std::atomic<std::uint64_t> fault_slot_wait_ns{0},frame_ahead_wait_ns{0},stream_reuse_wait_ns{0};
+inline std::atomic<std::uint64_t> buffer_readback_wait_ns{0},image_readback_wait_ns{0},gds_store_wait_ns{0};
+inline std::atomic<std::uint64_t> buffer_readback_calls{0},buffer_readback_bytes{0};
+inline thread_local std::uintptr_t fault_instruction{};
+inline thread_local std::uint64_t write_data_bytes{};
+inline std::atomic<std::uint64_t> readback_prefetches{0},readback_prefetch_hits{0};
+inline std::atomic<std::uint64_t> clean_arena_read_hits{0};
+inline std::atomic<std::uint64_t> descriptor_bind_ns{0};
+inline const bool buffer_profiling=[] {
+    const char* value=std::getenv("BB_BUFFER_PROFILE"); return value && value[0]=='1';
+}();
+// Diagnostic estimates: independent one-in-16 sampling per scope. Disabled in normal play.
+template <unsigned Slot> struct BufferTimer {
+    static inline thread_local unsigned sequence{};
+    std::atomic<std::uint64_t>& total;
+    bool sampled=buffer_profiling && ((sequence++ & 15)==0);
+    std::chrono::steady_clock::time_point start=sampled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    ~BufferTimer() {
+        if(sampled) total.fetch_add(16*std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now()-start).count(),std::memory_order_relaxed);
+    }
+};
 struct Timer {
     std::atomic<std::uint64_t>& total;
     std::chrono::steady_clock::time_point start =
