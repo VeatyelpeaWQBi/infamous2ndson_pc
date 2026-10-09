@@ -27,6 +27,27 @@ public:
     explicit MemoryTracker(PageManager& tracker_) : tracker{&tracker_} {}
     ~MemoryTracker() = default;
 
+    // At most two existing 4 MiB regions. Hot writable pages cannot be
+    // versioned through faults, so never use this shortcut with BB_HOT_PAGES.
+    bool GetCpuVersions(VAddr address, u64 size, std::array<u64, 2>& versions) const {
+        static const bool hot = [] {
+            const char* value = std::getenv("BB_HOT_PAGES");
+            return value && value[0] == '1';
+        }();
+        constexpr u64 Limit = u64{1} << MAX_CPU_PAGE_BITS;
+        if (hot || !size || address >= Limit || size > Limit - address) return false;
+        const u64 first = address >> TRACKER_HIGHER_PAGE_BITS;
+        const u64 last = (address + size - 1) >> TRACKER_HIGHER_PAGE_BITS;
+        if (last - first > 1) return false;
+        for (u64 index = first; index <= last; ++index) {
+            const auto* region = top_tier[index];
+            if (!region) return false;
+            versions[index - first] = region->CpuVersion();
+        }
+        if (first == last) versions[1] = 0;
+        return true;
+    }
+
     /// Returns true if a region has been modified from the CPU
     bool IsRegionCpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
         return IteratePages<true>(

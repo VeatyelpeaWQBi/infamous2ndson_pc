@@ -128,6 +128,7 @@ void MemoryManager::CopySparseMemory(VAddr source, u8* dest, u64 size) {
     });
 }
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
+    VideoCore::NoteHostWrite();
     BbWriteLog::Note(reinterpret_cast<uintptr_t>(address), data, size, BbWriteLog::Backing);
     return runtime_memory_write_backing(reinterpret_cast<uintptr_t>(address), data, size) != 0;
 }

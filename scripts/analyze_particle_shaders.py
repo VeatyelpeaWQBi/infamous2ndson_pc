@@ -1,11 +1,51 @@
 """Read-only comparison of original GCN shaders and runtime SPIR-V for measured hotspots."""
 import argparse
+import ctypes
 from collections import Counter
 import hashlib
 import json
+import re
 from pathlib import Path
 import struct
 import subprocess
+
+
+def decode_runtime_bundle(data, source, checksum):
+    """Validate the native BBVKPK01 codec; never resurrect loose-file entries."""
+    limit = 64 * 1024 * 1024
+    if len(data) < 24 or len(data) > limit or data[:8] != b'BBVKPK01':
+        raise ValueError('Invalid runtime shader bundle header or size')
+    stored, count, version = struct.unpack_from('<QII', data, 8)
+    if stored != source or version != 1 or count > 32768:
+        raise ValueError('Runtime shader bundle source/version mismatch')
+    at, blobs = 24, {}
+    for _ in range(count):
+        if at + 16 > len(data):
+            raise ValueError('Truncated runtime shader bundle entry')
+        namesize, size, digest = struct.unpack_from('<IIQ', data, at)
+        at += 16
+        if not 1 <= namesize <= 128 or at + namesize + size > len(data):
+            raise ValueError('Invalid runtime shader bundle entry bounds')
+        name = data[at:at + namesize].decode('ascii')
+        at += namesize
+        blob = data[at:at + size]
+        at += size
+        if '..' in name or not re.fullmatch(r'[a-z0-9_.]+', name) or name in blobs:
+            raise ValueError('Invalid or duplicate runtime shader bundle name')
+        if checksum(blob) != digest:
+            raise ValueError('Runtime shader bundle checksum mismatch')
+        blobs[name] = blob
+    if at != len(data):
+        raise ValueError('Trailing runtime shader bundle bytes')
+    return blobs
+
+
+def existing_xxh3(tools):
+    library = ctypes.CDLL(str((tools / 'libxxhash.dll').resolve()))
+    function = library.XXH3_64bits
+    function.argtypes = (ctypes.c_char_p, ctypes.c_size_t)
+    function.restype = ctypes.c_uint64
+    return lambda data: function(data, len(data))
 
 
 def extract_codes(data):
@@ -74,6 +114,13 @@ def main():
     report = {'source': str(args.source.resolve()), 'source_sha256': hashlib.sha256(data).hexdigest(),
               'original_shader_count': len(codes), 'shaders': [],
               'note': 'Static instruction counts are not runtime GPU costs. Raw GCN is exported for the engine decoder; LLVM does not support gfx700 disassembly.'}
+    bundle_path = args.cache / 'all_shaders.vkpack'
+    bundle = None
+    if bundle_path.is_file():
+        checksum = existing_xxh3(args.tools)
+        bundle = decode_runtime_bundle(bundle_path.read_bytes(), checksum(data), checksum)
+        report['runtime_bundle'] = {'path': str(bundle_path.resolve()), 'entries': len(bundle),
+                                    'authoritative': True}
     for shader_hash in args.hashes:
         entry = {'hash': f'{shader_hash:016x}', 'original_found': shader_hash in codes, 'variants': []}
         if shader_hash not in codes and args.runtime_dumps:
@@ -90,12 +137,21 @@ def main():
                          original_sha256=hashlib.sha256(code).hexdigest())
             (args.out / f'{shader_hash:016x}.gcn').write_bytes(code)
             entry['gcn_decoder'] = 'Use image-compat-test --gcn-disassemble; raw bytes are not decompiled pseudocode.'
-        for path in sorted(args.cache.glob(f'0x{shader_hash:016x}_*.spv')):
-            spv = path.read_bytes()
+        if bundle is not None:
+            # The engine does not fall back to stale loose files on a bundle miss.
+            modules = [(name, blob, 'bundle') for name, blob in bundle.items()
+                       if re.fullmatch(rf'0x{shader_hash:016x}_[0-9]+\.spv', name)]
+        else:
+            modules = [(path.name, path.read_bytes(), 'loose')
+                       for path in args.cache.glob(f'0x{shader_hash:016x}_*.spv')]
+        for name, spv, origin in sorted(modules):
+            path = args.cache / name if origin == 'loose' else args.out / name
+            if origin == 'bundle':
+                path.write_bytes(spv)  # Selected diagnostic exports only, never cache inputs.
             validation = subprocess.run([str(args.tools / 'spirv-val.exe'), '--target-env', 'vulkan1.3', str(path)],
                                         text=True, capture_output=True, check=False)
             subprocess.run([str(args.tools / 'spirv-dis.exe'), str(path), '-o', str(args.out / (path.stem + '.spvasm'))], check=True)
-            entry['variants'].append({'file': path.name, 'sha256': hashlib.sha256(spv).hexdigest(),
+            entry['variants'].append({'file': path.name, 'origin': origin, 'sha256': hashlib.sha256(spv).hexdigest(),
                                       'bytes': len(spv), 'validation_exit': validation.returncode,
                                       'validation_error': validation.stderr, **spirv_counts(spv)})
         report['shaders'].append(entry)

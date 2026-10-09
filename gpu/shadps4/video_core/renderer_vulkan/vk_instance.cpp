@@ -397,10 +397,13 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    static constexpr std::array queue_priorities = {1.0f};
+    static constexpr std::array queue_priorities = {1.0f,0.5f};
+    const auto* readback_flag=std::getenv("BB_READBACK_QUEUE");
+    const u32 queue_count=readback_flag&&readback_flag[0]=='1'
+        ? std::min(2u,family_properties[queue_family_index].queueCount):1u;
     const vk::DeviceQueueCreateInfo queue_info = {
         .queueFamilyIndex = queue_family_index,
-        .queueCount = static_cast<u32>(queue_priorities.size()),
+        .queueCount = queue_count,
         .pQueuePriorities = queue_priorities.data(),
     };
 
@@ -628,6 +631,7 @@ bool Instance::CreateDevice() {
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
 
     graphics_queue = device->getQueue(queue_family_index, 0);
+    if(queue_count>1)readback_queue=device->getQueue(queue_family_index,1);
     present_queue = device->getQueue(queue_family_index, 0);
 
     if (calibrated_timestamps) {

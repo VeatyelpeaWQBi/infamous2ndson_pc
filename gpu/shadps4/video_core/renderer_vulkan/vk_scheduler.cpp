@@ -27,6 +27,44 @@
 namespace Vulkan {
 
 std::mutex Scheduler::submit_mutex;
+static bool RedundantBindings() {
+    static const bool enabled=[] {const auto* f=std::getenv("BB_REDUNDANT_BINDS");return f&&f[0]=='1';}();return enabled;
+}
+void Scheduler::BindPipeline(vk::CommandBuffer cmd,vk::PipelineBindPoint point,vk::Pipeline pipeline) {
+    if(RedundantBindings()&&recorded_bindings.SkipPipeline(point,pipeline)) return;
+    cmd.bindPipeline(point,pipeline);
+}
+void Scheduler::PushConstants(vk::CommandBuffer cmd,vk::PipelineLayout layout,vk::ShaderStageFlags stages,
+                              u32 offset,u32 size,const void* data) {
+    if(RedundantBindings()&&recorded_bindings.SkipPush(layout,stages,offset,size,data)) return;
+    cmd.pushConstants(layout,stages,offset,size,data);
+}
+void Scheduler::PushDescriptors(vk::CommandBuffer cmd,vk::PipelineBindPoint point,vk::PipelineLayout layout,
+                                u32 set,std::span<const vk::WriteDescriptorSet> writes) {
+    if(RedundantBindings()&&recorded_bindings.SkipDescriptors(point,layout,set,writes)) return;
+    cmd.pushDescriptorSetKHR(point,layout,set,vk::ArrayProxy<const vk::WriteDescriptorSet>{u32(writes.size()),writes.data()});
+}
+void Scheduler::SetVertexInput(vk::CommandBuffer cmd,std::span<const vk::VertexInputBindingDescription2EXT> b,
+                               std::span<const vk::VertexInputAttributeDescription2EXT> a) {
+    if(RedundantBindings()&&recorded_bindings.SkipVertex(b,a)) return;
+    cmd.setVertexInputEXT(vk::ArrayProxy<const vk::VertexInputBindingDescription2EXT>{u32(b.size()),b.data()},
+                          vk::ArrayProxy<const vk::VertexInputAttributeDescription2EXT>{u32(a.size()),a.data()});
+}
+
+void Scheduler::BindGraphicsPipeline(vk::CommandBuffer cmd, vk::Pipeline pipeline) {
+    if(RedundantBindings()){BindPipeline(cmd,vk::PipelineBindPoint::eGraphics,pipeline);return;}
+    static const bool enabled = [] {
+        const char* value = std::getenv("BB_PIPELINE_BIND_MEMO");
+        return value && value[0] == '1';
+    }();
+    if (enabled && !graphics_binding_memo.NeedsBind(
+            u64(reinterpret_cast<uintptr_t>(VkCommandBuffer(cmd))), u64(VkPipeline(pipeline)))) {
+        BbStats::pipeline_bind_memo_hits.fetch_add(1,std::memory_order_relaxed);
+        return;
+    }
+    if (enabled) BbStats::pipeline_bind_memo_misses.fetch_add(1,std::memory_order_relaxed);
+    cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+}
 
 Scheduler::Scheduler(const Instance& instance, bool threaded_recording)
     : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
@@ -199,9 +237,12 @@ void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
         return;
     }
     BbCopy::FlushBatch();
+    auto uploaded=upload_fence?upload_fence():upload_waiter;
     deferred_signals_issued.fetch_add(1, std::memory_order_relaxed);
-    Record([signal = std::move(signal), done = deferred_signals_done](vk::CommandBuffer) mutable {
-        BbCopy::AfterCopies([signal = std::move(signal), done = std::move(done)] {
+    Record([signal = std::move(signal), done = deferred_signals_done,
+            uploaded=std::move(uploaded)](vk::CommandBuffer) mutable {
+        BbCopy::AfterCopies([signal = std::move(signal), done = std::move(done),uploaded=std::move(uploaded)] {
+            if(uploaded) uploaded();
             signal();
             done->fetch_add(1, std::memory_order_release);
         });
@@ -225,6 +266,7 @@ void Scheduler::WaitDeferredSignals() {
 }
 
 void Scheduler::WaitHostCopies() {
+    if(upload_waiter) upload_waiter();
     if (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
         BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
         BbStats::host_copy_waits.fetch_add(1, std::memory_order_relaxed);
@@ -388,6 +430,8 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
+    graphics_binding_memo.Invalidate();
+    recorded_bindings.Forget();
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();
@@ -427,11 +471,10 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     const vk::Semaphore timeline = work_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
-
-    static constexpr std::array<vk::PipelineStageFlags, 2> wait_stage_masks = {
-        vk::PipelineStageFlagBits::eAllCommands,
-        vk::PipelineStageFlagBits::eColorAttachmentOutput,
-    };
+    if(readback_semaphore&&readback_tick)info.AddWait(readback_semaphore,readback_tick);
+    // Every added dependency gets an actual mask; the old two-element table was insufficient.
+    std::array<vk::PipelineStageFlags,4> wait_stage_masks;
+    wait_stage_masks.fill(vk::PipelineStageFlagBits::eAllCommands);
 
     const vk::TimelineSemaphoreSubmitInfo timeline_si = {
         .waitSemaphoreValueCount = info.num_wait_semas,

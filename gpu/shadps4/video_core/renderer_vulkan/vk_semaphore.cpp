@@ -45,14 +45,18 @@ void Semaphore::Refresh() {
 }
 
 void Semaphore::Wait(u64 tick) {
+    while(!WaitFor(tick,WAIT_TIMEOUT)) {}
+}
+
+bool Semaphore::WaitFor(u64 tick,u64 timeout_ns) {
     // No need to wait if the GPU is ahead of the tick
     if (IsFree(tick)) {
-        return;
+        return true;
     }
     // Update the GPU tick and try again
     Refresh();
     if (IsFree(tick)) {
-        return;
+        return true;
     }
 
     // If none of the above is hit, fallback to a regular wait
@@ -62,9 +66,12 @@ void Semaphore::Wait(u64 tick) {
         .pValues = &tick,
     };
 
-    while (instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT) != vk::Result::eSuccess) {
-    }
+    const auto result=instance.GetDevice().waitSemaphores(&wait_info,timeout_ns);
+    // Device loss must reach the existing crash collector, never an endless wait loop.
+    ASSERT_MSG(result==vk::Result::eSuccess||result==vk::Result::eTimeout,
+               "GPU semaphore wait failed: {}",vk::to_string(result));
     Refresh();
+    return result==vk::Result::eSuccess||IsFree(tick);
 }
 
 } // namespace Vulkan

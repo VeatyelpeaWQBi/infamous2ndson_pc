@@ -181,6 +181,9 @@ public:
         UniqueImage image;
         State state;
         std::vector<State> subresource_states;
+        State partial_base_state;
+        boost::container::static_vector<u32,64> dirty_subresources;
+        bool dirty_overflow{};
         // Repeated sampling of one partial view need not walk every mip/layer.
         // Any different access invalidates this memo, including all writes.
         struct {

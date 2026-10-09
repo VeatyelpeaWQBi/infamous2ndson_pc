@@ -197,8 +197,8 @@ void TileManager::RecordTilingDispatch(vk::Pipeline pipeline, const vk::Descript
                                        const vk::DescriptorBufferInfo& linear,
                                        const vk::DescriptorBufferInfo& params, u32 dim_x) {
     scheduler.Record([pipeline, layout = *pl_layout, tiled, linear, params,
-                      dim_x](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+                      dim_x,recorder=&scheduler](vk::CommandBuffer cmdbuf) {
+        recorder->BindPipeline(cmdbuf,vk::PipelineBindPoint::eCompute, pipeline);
         const std::array<vk::WriteDescriptorSet, 3> set_writes = {{
             {
                 .dstBinding = 0,
@@ -219,7 +219,7 @@ void TileManager::RecordTilingDispatch(vk::Pipeline pipeline, const vk::Descript
                 .pBufferInfo = &params,
             },
         }};
-        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, set_writes);
+        recorder->PushDescriptors(cmdbuf,vk::PipelineBindPoint::eCompute, layout, 0, set_writes);
         cmdbuf.dispatch(dim_x, 1, 1);
     });
 }

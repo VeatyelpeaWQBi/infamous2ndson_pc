@@ -32,8 +32,8 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;
     const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
     const vk::PipelineLayout layout = *pipeline_layout;
-    scheduler.Record([layout, stage_flags, push_data](vk::CommandBuffer cmdbuf) {
-        cmdbuf.pushConstants(layout, stage_flags, 0u, sizeof(push_data), &push_data);
+    scheduler.Record([layout, stage_flags, push_data,recorder=&scheduler](vk::CommandBuffer cmdbuf) {
+        recorder->PushConstants(cmdbuf,layout, stage_flags, 0u, sizeof(push_data), &push_data);
     });
 
     // Bind descriptor set.
@@ -44,7 +44,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
     if (uses_push_descriptors) {
         if (!scheduler.IsRecordingDeferred()) {
             scheduler.Record([&](vk::CommandBuffer cmdbuf) {
-                cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, set_writes);
+                scheduler.PushDescriptors(cmdbuf,bind_point, layout, 0, set_writes);
             });
             return;
         }
@@ -56,8 +56,8 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
                 const auto storage=scheduler.RecordBytes(*bytes,alignof(vk::WriteDescriptorSet));
                 const auto writes=PackDescriptorWrites(set_writes,storage);
                 ASSERT(writes.size()==set_writes.size());
-                scheduler.Record([bind_point,layout,writes](vk::CommandBuffer cmdbuf) {
-                    cmdbuf.pushDescriptorSetKHR(bind_point,layout,0,writes);
+                scheduler.Record([bind_point,layout,writes,recorder=&scheduler](vk::CommandBuffer cmdbuf) {
+                    recorder->PushDescriptors(cmdbuf,bind_point,layout,0,writes);
                 });
                 return;
             }
@@ -87,8 +87,8 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
                     scheduler.RecordData(std::span{write.pTexelBufferView, write.descriptorCount}).data();
             }
         }
-        scheduler.Record([bind_point, layout, writes](vk::CommandBuffer cmdbuf) {
-            cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
+        scheduler.Record([bind_point, layout, writes,recorder=&scheduler](vk::CommandBuffer cmdbuf) {
+            recorder->PushDescriptors(cmdbuf,bind_point, layout, 0, writes);
         });
         return;
     }
@@ -99,7 +99,8 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
         set_write.dstSet = desc_set;
     }
     instance.GetDevice().updateDescriptorSets(set_writes, {});
-    scheduler.Record([bind_point, layout, desc_set](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([bind_point, layout, desc_set,recorder=&scheduler](vk::CommandBuffer cmdbuf) {
+        recorder->ForgetDescriptors(bind_point);
         cmdbuf.bindDescriptorSets(bind_point, layout, 0, desc_set, {});
     });
 }

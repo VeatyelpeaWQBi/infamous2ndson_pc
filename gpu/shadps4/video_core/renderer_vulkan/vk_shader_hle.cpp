@@ -109,7 +109,7 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
     const u32 count = static_cast<u32>(copies.size());
     scheduler.Record([src = src->Handle(), dst = dst->Handle(), table = stream.Handle(), src_min,
                       src_size, dst_min, dst_size, table_offset, table_size,
-                      count](vk::CommandBuffer cmdbuf) {
+                      count,recorder=&scheduler](vk::CommandBuffer cmdbuf) {
         const std::array<vk::DescriptorBufferInfo, 3> infos{{
             {src, src_min, src_size},
             {dst, dst_min, dst_size},
@@ -122,9 +122,9 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
                          .descriptorType = vk::DescriptorType::eStorageBuffer,
                          .pBufferInfo = &infos[i]};
         }
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *pipe.pipeline);
-        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pipe.layout, 0, writes);
-        cmdbuf.pushConstants(*pipe.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(count),
+        recorder->BindPipeline(cmdbuf,vk::PipelineBindPoint::eCompute, *pipe.pipeline);
+        recorder->PushDescriptors(cmdbuf,vk::PipelineBindPoint::eCompute, *pipe.layout, 0, writes);
+        recorder->PushConstants(cmdbuf,*pipe.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(count),
                              &count);
         cmdbuf.dispatch(count, 1, 1);
     });

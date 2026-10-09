@@ -11,6 +11,8 @@
 #include "common/interval_set.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/buffer_cache/cpu_buffer_memo.h"
+#include "video_core/buffer_cache/upload_worker.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/buffer_cache/readback_hint.h"
@@ -30,6 +32,7 @@ class GraphicsPipeline;
 struct SubmitInfo;
 class Runtime;
 class StagingBufferPool;
+class ReadbackQueue;
 } // namespace Vulkan
 
 namespace VideoCore {
@@ -147,12 +150,14 @@ private:
         VAddr request{};
         u64 request_size{};
         u64 bytes{},tick{};
+        bool separate_queue{};
     };
     std::shared_ptr<PendingReadback> BeginReadback(VAddr address,u64 size);
     bool CompleteReadback(const std::shared_ptr<PendingReadback>& readback);
     std::vector<ReadbackVersion*> pending_readback_versions; // GPU thread only.
     std::vector<std::unique_ptr<Buffer>> readback_pool;
     u64 readback_pool_bytes{}; // At most 64 MiB of completed host allocations.
+    std::unique_ptr<Vulkan::ReadbackQueue> readback_queue;
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
@@ -162,7 +167,7 @@ private:
     void SmallGuestCopy(const BbCopy::Item& item);
 
     const Buffer* UploadCopies(const Buffer* arena, std::span<vk::BufferCopy> copies,
-                               size_t total_size_bytes);
+                               size_t total_size_bytes, PageManager::ProtectionBatch protections={});
 
     bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size);
 
@@ -181,6 +186,11 @@ private:
     Core::MemoryManager* memory;
     TextureCache& texture_cache;
     std::unique_ptr<MemoryTracker> memory_tracker;
+    PageManager& page_manager;
+    std::unique_ptr<UploadWorker> upload_worker;
+    std::array<CpuBufferMemo, 4096> cpu_buffer_memos{}; // GPU command thread only.
+    struct StreamMemo {VAddr address{};u32 size{};u64 tick{},epoch{},host{},offset{};};
+    std::array<StreamMemo,4096> stream_memos{};
 
     StreamBuffer stream_buffer;
     Buffer gds_buffer;

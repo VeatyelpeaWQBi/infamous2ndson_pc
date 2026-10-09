@@ -85,3 +85,19 @@ User-selected yumlevi/bloodborne_pc windows-port changes (2026-10-09):
   images on a Vulkan-backed fixture; no guest memory access).
   No full upstream merge, unified cross-platform launcher or Russian menu
   translation was imported. Game files remain read-only.
+
+AYOUB readonly synchronization memo experiment (2026-10-09):
+  Derived from 153a5aa MemoryTracker::GetCpuVersions and BufferCache::sync_memos.
+  BB_BUFFER_SYNC_MEMO=1 is opt-in. Local regions are 4 MiB, not 16 MiB;
+  readonly raw-buffer bindings compare CPU-write tokens and current arena
+  pointers. CPU faults/window invalidation advance tokens before unprotecting.
+  Writable/texel bindings and BB_HOT_PAGES bypass the memo. No resource preload,
+  game modification, write-discard or weaker GPU readback is introduced.
+  See docs/AYOUB_DEEP_PERFORMANCE_REVIEW.2026-10-09.zh-CN.md for measurements.
+
+AYOUB graphics-pipeline BindCache experiment (2026-10-09):
+  Narrow adaptation of 153a5aa DynamicState::BindCache; BB_PIPELINE_BIND_MEMO=1
+  compares graphics binds on the actual recording thread. New command buffers
+  and raw CommandBuffer escapes invalidate it; SceneTargets resampler also
+  uses the tracked entry. Compute, descriptors, push constants and all draws
+  retain their existing behavior. Default remains off pending actual-game tests.

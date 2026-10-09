@@ -6,6 +6,7 @@
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_barrier_tracker.h"
+#include "video_core/renderer_vulkan/vk_writer_history.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/types.h"
@@ -91,6 +92,10 @@ public:
 
     void AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
                       vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access);
+    u64 LastBufferWriter(const VideoCore::Buffer* buffer,u64 offset,u64 size) const {
+        return writer_history.LastWriter(reinterpret_cast<u64>(buffer),offset,size);
+    }
+    void UnknownBufferWrite();
 
     bool IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
                           bool check_read_access = false);
@@ -118,6 +123,7 @@ private:
     std::unique_ptr<VideoCore::BlitHelper> blit_helper;
     StagingBufferPool staging_pool;
     BarrierTracker barrier_tracker;
+    BufferWriterHistory writer_history;
     VideoCore::Image::Barriers image_barriers;
     vk::MemoryBarrier2 memory_barrier{};
     // bbport: ranges inserted into barrier_tracker since its last Clear(); re-inserting a

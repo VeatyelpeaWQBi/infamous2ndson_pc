@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_write_log.h"
+#include "video_core/buffer_cache/region_definitions.h"
 
 #include <array>
 #include <atomic>
@@ -54,6 +55,7 @@ void NoteIntent(std::uint64_t address, const void* data, std::uint64_t size, Sou
 }
 
 void Note(std::uint64_t address, const void* data, std::uint64_t size, Source source) {
+    VideoCore::NoteHostWrite();
     if (Enabled()) {
         Record(address, data, size, source);
     }

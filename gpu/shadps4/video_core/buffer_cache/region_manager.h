@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 
@@ -54,6 +55,20 @@ public:
         return cpu_addr;
     }
 
+    // AYOUB1080p 153a5aa: invalidate readonly GPU-buffer reuse before
+    // making guest writes possible. This token is not a GPU-write version.
+    u64 CpuVersion() const noexcept {
+        return cpu_version.load(std::memory_order_acquire);
+    }
+
+    static bool CpuVersionsEnabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("BB_BUFFER_SYNC_MEMO");
+            return value && value[0] == '1';
+        }();
+        return enabled;
+    }
+
     static constexpr size_t SanitizeAddress(size_t address) {
         return static_cast<size_t>(std::max<s64>(static_cast<s64>(address), 0LL));
     }
@@ -96,6 +111,8 @@ public:
         RegionBits& bits = GetRegionBits<type>();
         if constexpr (type == Type::CPU && enable) cpu_summary.Mark(start_page,end_page);
         if constexpr (type == Type::CPU && enable) {
+            NextUploadEpoch();
+            if (CpuVersionsEnabled()) cpu_version.fetch_add(1, std::memory_order_release);
             CountWriteFaults(start_page, end_page);
         }
         if constexpr (enable) {
@@ -126,6 +143,8 @@ public:
         if (add.None()) {
             return;
         }
+        NextUploadEpoch();
+        if (CpuVersionsEnabled()) cpu_version.fetch_add(1, std::memory_order_release);
         cpu_summary.Mark(start_page,end_page);
         cpu |= add;
         cpu_summary.Refresh(cpu,start_page,end_page);
@@ -301,6 +320,7 @@ private:
     std::chrono::steady_clock::time_point hot_since{};
 
     PageManager* tracker;
+    std::atomic<u64> cpu_version{1};
     VAddr cpu_addr = 0;
     RegionBits cpu;
     CpuWordSummary cpu_summary;

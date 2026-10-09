@@ -772,6 +772,12 @@ bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 
     return has_access;
 }
 
+static bool ReadbackQueueTracking() {
+    static const bool enabled=[] {const auto* f=std::getenv("BB_READBACK_QUEUE");return f&&f[0]=='1';}();return enabled;
+}
+void Runtime::UnknownBufferWrite() {
+    if(ReadbackQueueTracking())writer_history.Unknown(scheduler.CurrentTick());
+}
 void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
                            vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access) {
     AddressRange range = {
@@ -792,6 +798,8 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eColorAttachmentWrite |
         vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite |
         vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
+    if(ReadbackQueueTracking()&&(src_access&WRITE_MASK))
+        writer_history.WriteRange(reinterpret_cast<u64>(handle),offset,size,scheduler.CurrentTick());
 
     // bbport: reads are tracked at 4 KiB granularity. Constant data comes from ring allocations
     // at a new offset every draw; rounded, they land in ranges already present and the

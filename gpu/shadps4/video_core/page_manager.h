@@ -5,6 +5,9 @@
 
 #include <cstddef>
 #include <memory>
+#include <functional>
+#include <span>
+#include <vector>
 #include "common/alignment.h"
 #include "common/types.h"
 #include "video_core/buffer_cache//region_definitions.h"
@@ -29,7 +32,13 @@ class PageManager {
     static constexpr size_t PAGES_PER_LOCK = NUM_PAGES_PER_REGION;
 
 public:
+    struct ProtectionRange {VAddr address; u64 size;};
+    using ProtectionBatch = std::vector<ProtectionRange>;
+    using ProtectionCallback = std::function<void(VAddr,u64,u32)>;
     explicit PageManager(Vulkan::Rasterizer* rasterizer);
+    // Host-only fixture: permits testing the production watcher/protection
+    // protocol on ordinary Windows pages, without a guest process.
+    explicit PageManager(ProtectionCallback callback);
     ~PageManager();
 
     /// Register a range of mapped gpu memory.
@@ -37,6 +46,10 @@ public:
 
     /// Unregister a range of gpu memory that was unmapped.
     void OnGpuUnmap(VAddr address, size_t size);
+    bool BeginDeferredProtection();
+    ProtectionBatch TakeDeferredProtection();
+    ProtectionBatch EndDeferredProtection();
+    void RefreshDeferredProtection(std::span<const ProtectionRange> ranges) const;
 
     /// Updates watches in the pages touching the specified region.
     template <bool track>

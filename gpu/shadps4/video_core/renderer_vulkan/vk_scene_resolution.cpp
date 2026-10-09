@@ -246,6 +246,7 @@ void SceneTargets::Resample(vk::Image src, vk::Image dst, const VideoCore::Image
     });
     const auto pipeline = ResamplePipeline(format, stencil);
     const auto layout = *resample_layout;
+    auto* pipeline_recorder = &scheduler;
     scheduler.Record([=](vk::CommandBuffer cmd) {
         const vk::RenderingAttachmentInfo attachment{
             .imageView = target_view,
@@ -275,10 +276,9 @@ void SceneTargets::Resample(vk::Image src, vk::Image dst, const VideoCore::Image
                                    .descriptorType = vk::DescriptorType::eSampledImage,
                                    .pImageInfo = &infos[1]},
         };
-        cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, layout, 0,
-                                 vk::ArrayProxy<const vk::WriteDescriptorSet>(
-                                     stencil ? 2u : 1u, writes.data()));
-        cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+        pipeline_recorder->PushDescriptors(cmd,vk::PipelineBindPoint::eGraphics, layout, 0,
+            std::span<const vk::WriteDescriptorSet>{writes.data(),stencil?2u:1u});
+        pipeline_recorder->BindGraphicsPipeline(cmd, pipeline);
         cmd.setViewportWithCount(vk::Viewport{0.f, 0.f, float(dst_size.width),
                                               float(dst_size.height), 0.f, 1.f});
         cmd.setScissorWithCount(vk::Rect2D{{0, 0}, dst_size});
@@ -286,7 +286,7 @@ void SceneTargets::Resample(vk::Image src, vk::Image dst, const VideoCore::Image
             // Copy depth first, then reconstruct all eight stencil bits without needing
             // VK_EXT_shader_stencil_export (e.g. Pascal). Discard keeps unset bits clear.
             for (u32 bit : {0u, 1u, 2u, 4u, 8u, 16u, 32u, 64u, 128u}) {
-                cmd.pushConstants(layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(bit), &bit);
+                pipeline_recorder->PushConstants(cmd,layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(bit), &bit);
                 cmd.setStencilWriteMask(vk::StencilFaceFlagBits::eFrontAndBack, bit);
                 cmd.setStencilReference(vk::StencilFaceFlagBits::eFrontAndBack, bit);
                 cmd.draw(3, 1, 0, 0);

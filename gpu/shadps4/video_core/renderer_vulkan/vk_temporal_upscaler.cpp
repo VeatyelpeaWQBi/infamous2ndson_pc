@@ -1019,6 +1019,7 @@ bool TemporalUpscaler::RecordReactive(vk::ImageView color_view) {
     const auto& settings = BbSettings::Get();
     const std::array<float, 3> params{settings.reactive_scale, settings.reactive_max,
                                       settings.reactive_threshold};
+    auto* recorder=&scheduler;
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         const vk::ImageMemoryBarrier2 to_write{
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -1051,10 +1052,9 @@ bool TemporalUpscaler::RecordReactive(vk::ImageView color_view) {
              .descriptorType = vk::DescriptorType::eStorageImage,
              .pImageInfo = &mask_info},
         }};
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
-        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0,
-                                    writes);
-        cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0,
+        recorder->BindPipeline(cmdbuf,vk::PipelineBindPoint::eCompute, pipeline);
+        recorder->PushDescriptors(cmdbuf,vk::PipelineBindPoint::eCompute, layout, 0,writes);
+        recorder->PushConstants(cmdbuf,layout, vk::ShaderStageFlagBits::eCompute, 0,
                              sizeof(params), params.data());
         cmdbuf.dispatch((w + 7) / 8, (h + 7) / 8, 1);
         const vk::ImageMemoryBarrier2 to_read{

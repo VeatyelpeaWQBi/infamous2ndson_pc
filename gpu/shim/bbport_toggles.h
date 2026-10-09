@@ -126,6 +126,10 @@ inline thread_local std::uintptr_t fault_instruction{};
 inline thread_local std::uint64_t write_data_bytes{};
 inline std::atomic<std::uint64_t> readback_prefetches{0},readback_prefetch_hits{0};
 inline std::atomic<std::uint64_t> clean_arena_read_hits{0};
+inline std::atomic<std::uint64_t> buffer_sync_memo_hits{0},buffer_sync_memo_misses{0};
+inline std::atomic<std::uint64_t> pipeline_bind_memo_hits{0},pipeline_bind_memo_misses{0};
+inline std::atomic<std::uint64_t> upload_worker_wait_ns{0},upload_jobs{0},upload_protect_ranges{0};
+inline std::atomic<std::uint64_t> readback_queue_copies{0},readback_queue_fallbacks{0};
 inline std::atomic<std::uint64_t> descriptor_bind_ns{0};
 inline const bool buffer_profiling=[] {
     const char* value=std::getenv("BB_BUFFER_PROFILE"); return value && value[0]=='1';

@@ -14,8 +14,8 @@ inline constexpr const char* Columns =
     "buffer_clamp_ns,buffer_stream_ns,buffer_arena_ns,buffer_hazard_ns,buffer_stream_calls,buffer_arena_calls,"
     "buffer_residency_ns,buffer_sync_ns,buffer_alias_ns,fault_slot_wait_ns,frame_ahead_wait_ns,stream_reuse_wait_ns,"
     "buffer_readback_wait_ns,image_readback_wait_ns,gds_store_wait_ns,buffer_readback_calls,buffer_readback_bytes,readback_prefetches,readback_prefetch_hits,clean_arena_read_hits,descriptor_bind_ns,"
-    "readback_guest_wait_ns,readback_gpu_wait_ns,readback_begin_roundtrip_ns,readback_complete_roundtrip_ns,readback_retries";
-using Counters = std::array<std::uint64_t,53>;
+    "readback_guest_wait_ns,readback_gpu_wait_ns,readback_begin_roundtrip_ns,readback_complete_roundtrip_ns,readback_retries,buffer_sync_memo_hits,buffer_sync_memo_misses,pipeline_bind_memo_hits,pipeline_bind_memo_misses,upload_worker_wait_ns,upload_jobs,upload_protect_ranges,readback_queue_copies,readback_queue_fallbacks";
+using Counters = std::array<std::uint64_t,62>;
 static_assert([] {
     std::size_t count=1;
     for(const char* p=Columns;*p;++p) if(*p==',') ++count;

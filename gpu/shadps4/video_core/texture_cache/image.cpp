@@ -246,16 +246,28 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
     memo.valid=false;
     auto& last_state = backing->state;
     auto& subresource_states = backing->subresource_states;
+    static const bool dirty_ranges=[] {const auto* f=std::getenv("BB_IMAGE_DIRTY_RANGES");return f&&f[0]=='1';}();
+    const bool dirty_enabled=dirty_ranges&&allow_read_memo;
+    constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
+        vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eMemoryWrite;
+    const auto needs_barrier=[&](const State& state) {
+        return state.layout!=dst_layout||state.access_mask!=dst_mask||bool(state.access_mask&write_flags);
+    };
 
     const bool needs_partial_transition =
         subres_range &&
         (subres_range->base != SubresourceBase{} || subres_range->extent != info.resources);
     const bool partially_transited = !subresource_states.empty();
+    if(dirty_enabled&&needs_partial_transition&&!partially_transited&&!needs_barrier(last_state)) {
+        last_state.pl_stage|=dst_stage;return;
+    }
 
     if (needs_partial_transition || partially_transited) {
         if (!partially_transited) {
             subresource_states.resize(info.resources.levels * info.resources.layers);
             std::fill(subresource_states.begin(), subresource_states.end(), last_state);
+            backing->partial_base_state=last_state;
+            backing->dirty_subresources.clear();backing->dirty_overflow=false;
         }
 
         // In case of partial transition, we need to change the specified subresources only.
@@ -272,10 +284,7 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                                            subres_range->base.layer + subres_range->extent.layers)
                 : std::views::iota(0u, info.resources.layers);
 
-        if(BbStats::enabled) BbStats::image_subresource_checks.fetch_add(
-            u64(mips.size())*layers.size(),std::memory_order_relaxed);
-        for (u32 mip : mips) {
-            for (u32 layer : layers) {
+        const auto transition=[&](u32 mip,u32 layer) {
                 // NOTE: these loops may produce a lot of small barriers.
                 // If this becomes a problem, we can optimize it by merging adjacent barriers.
                 const auto subres_idx = mip * info.resources.layers + layer;
@@ -308,12 +317,27 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                     state.layout = dst_layout;
                     state.access_mask = dst_mask;
                     state.pl_stage = dst_stage;
+                    if(dirty_enabled&&needs_partial_transition&&!backing->dirty_overflow&&
+                       std::ranges::find(backing->dirty_subresources,subres_idx)==backing->dirty_subresources.end()) {
+                        if(backing->dirty_subresources.size()<64)backing->dirty_subresources.push_back(subres_idx);
+                        else backing->dirty_overflow=true;
+                    }
                 }
-            }
+        };
+        if(dirty_enabled&&!needs_partial_transition&&!backing->dirty_overflow&&
+           !needs_barrier(backing->partial_base_state)) {
+            if(BbStats::enabled)BbStats::image_subresource_checks.fetch_add(backing->dirty_subresources.size(),std::memory_order_relaxed);
+            for(const auto index:backing->dirty_subresources)
+                transition(index/info.resources.layers,index%info.resources.layers);
+        } else {
+            if(BbStats::enabled) BbStats::image_subresource_checks.fetch_add(
+                u64(mips.size())*layers.size(),std::memory_order_relaxed);
+            for(u32 mip:mips)for(u32 layer:layers)transition(mip,layer);
         }
 
         if (!needs_partial_transition) {
             subresource_states.clear();
+            backing->dirty_subresources.clear();backing->dirty_overflow=false;
         }
     } else { // Full resource transition
         constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |

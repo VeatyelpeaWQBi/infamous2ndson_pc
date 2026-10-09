@@ -4,6 +4,7 @@
 #include <xxhash.h>
 #include "video_core/renderer_vulkan/ui_composition.h"
 #include "bbport_toggles.h"
+#include "video_core/renderer_vulkan/vk_empty_work.h"
 #include "bbport_visibility_trace.h"
 #include "bbport_diagnostics.h"
 #include "video_core/renderer_vulkan/stencil_reference.h"
@@ -908,6 +909,8 @@ bool Rasterizer::FilterDrawPasses() const {
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* prepared) {
     RENDERER_TRACE;
     BbStats::draws.fetch_add(1, std::memory_order_relaxed);
+    static const bool skip_empty=[] {const auto* f=std::getenv("BB_SKIP_EMPTY_WORK");return f&&f[0]=='1';}();
+    if(skip_empty&&EmptyDraw(Regs().num_indices,Regs().num_instances.NumInstances())) return;
     // bbport debugging: BB_IMAGE_DUMP_TRIGGER=<file> holding hex guest addresses, one per line;
     // the images registered there are written to BB_CAPTURE_DIR (TextureCache::DumpImagesAt).
     if (static const char* trigger = std::getenv("BB_IMAGE_DUMP_TRIGGER"); trigger) {
@@ -1145,8 +1148,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     const auto* diagnostic_ps=pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
     const u64 diagnostic_vs_hash=vs_info.pgm_hash;
     const u64 diagnostic_ps_hash=diagnostic_ps ? diagnostic_ps->pgm_hash : 0;
+    auto* pipeline_recorder = &scheduler;
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        pipeline_recorder->BindGraphicsPipeline(cmdbuf, handle);
         BbDiagnostics::RecordDraw(num_indices,num_instances,is_indexed,u64(VkPipeline(handle)),
                                   diagnostic_vs_hash,diagnostic_ps_hash);
         if (is_indexed) {
@@ -1296,8 +1300,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     // writer must wait for the indirect consumer even when shader resources do not alias it.
     runtime.TrackIndirectRead(buffer,base,stride*max_count);
     if (count_address) runtime.TrackIndirectRead(count_buffer,count_offset,4);
+    auto* pipeline_recorder = &scheduler;
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        pipeline_recorder->BindGraphicsPipeline(cmdbuf, handle);
         if (is_indexed) {
             if (counts) {
                 cmdbuf.drawIndexedIndirectCount(args, args_offset, counts, counts_offset, max_count,
@@ -1355,6 +1360,8 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
     BbStats::dispatches.fetch_add(1, std::memory_order_relaxed);
+    static const bool skip_empty=[] {const auto* f=std::getenv("BB_SKIP_EMPTY_WORK");return f&&f[0]=='1';}();
+    if(skip_empty&&EmptyDispatch(CsRegs().dim_x,CsRegs().dim_y,CsRegs().dim_z)) return;
     // bbport: like draws, handed to the draw recording thread after the pipeline selection.
     const bool pipelined = UseDrawPipe() && !BbToggle::Disabled(BbToggle::PipelinedDispatch);
     if (!pipelined) {
@@ -1414,8 +1421,9 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     if (FrameCapture::Active()) {
         FrameCapture::Dispatch(cs.pgm_hash, dim_x, dim_y, dim_z);
     }
+    auto* compute_recorder=&scheduler;
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        compute_recorder->BindPipeline(cmdbuf,vk::PipelineBindPoint::eCompute, handle);
         BbDiagnostics::Record("dispatch",dim_x,dim_y,dim_z,u64(VkPipeline(handle)));
         cmdbuf.dispatch(dim_x, dim_y, dim_z);
     });
@@ -1467,8 +1475,9 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
     const vk::Pipeline handle = pipeline->Handle();
     const vk::Buffer args = buffer->Handle();
     const u64 args_offset = base;
+    auto* compute_recorder=&scheduler;
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        compute_recorder->BindPipeline(cmdbuf,vk::PipelineBindPoint::eCompute, handle);
         cmdbuf.dispatchIndirect(args, args_offset);
     });
     runtime.TrackIndirectRead(buffer,base,size);
@@ -1791,9 +1800,9 @@ void Rasterizer::EmitVertexBuffers() {
     if (dynamic_input) {
         scheduler.Record([bindings = scheduler.RecordData(std::span<const vk::VertexInputBindingDescription2EXT>{v.bindings.data(), v.bindings.size()}),
                           attributes = scheduler.RecordData(std::span<const vk::VertexInputAttributeDescription2EXT>{
-                              v.attributes.data(), v.attributes.size()})](
+                              v.attributes.data(), v.attributes.size()}),recorder=&scheduler](
                              vk::CommandBuffer cmdbuf) {
-            cmdbuf.setVertexInputEXT(bindings, attributes);
+            recorder->SetVertexInput(cmdbuf,bindings, attributes);
         });
     }
     if (num_buffers == 0) {
@@ -2147,6 +2156,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                              Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data, u32& write_index) {
     BbStats::SampledTimer<2> buffer_timer{BbStats::buffer_bind_ns};
+    // BDA shaders can write outside their declared descriptors; no range shortcut for them.
+    if(stage.uses_dma)runtime.UnknownBufferWrite();
     const u64 alignment = instance.StorageMinAlignment();
     for (u32 buffer_index = 0; buffer_index < stage.buffers.size(); ++buffer_index) {
         const auto& desc = stage.buffers[buffer_index];

@@ -19,6 +19,8 @@
 #include <vk_mem_alloc.h>
 #include "bbport_diagnostics.h"
 #include "video_core/buffer_cache/cpu_word_summary.h"
+#include "video_core/buffer_cache/memory_tracker.h"
+#include "video_core/buffer_cache/cpu_buffer_memo.h"
 #include "video_core/buffer_cache/fault_buffer_limits.h"
 #include "video_core/buffer_cache/readback_hint.h"
 #include "video_core/buffer_cache/cpu_backing_hash.h"
@@ -49,6 +51,119 @@
 #include "particle_shader_regression.h"
 #include "gcn_analysis.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
+#include "video_core/renderer_vulkan/vk_recorded_bindings.h"
+#include "video_core/renderer_vulkan/vk_shader_params_memo.h"
+#include "video_core/renderer_vulkan/vk_specialization_memo.h"
+#include "video_core/renderer_vulkan/vk_empty_work.h"
+#include "video_core/renderer_vulkan/vk_readback_queue.h"
+
+static void readback_writer_history_cpu() {
+    Vulkan::BufferWriterHistory history;
+    history.WriteRange(1,64,64,2);history.WriteRange(1,128,64,2);
+    assert(history.LastWriter(1,80,16)==2&&history.LastWriter(1,160,16)==2);
+    assert(history.LastWriter(2,80,16)==0&&history.LastWriter(1,0,64)==0);
+    history.WriteRange(1,96,32,3);assert(history.LastWriter(1,100,4)==3);
+    assert(history.LastWriter(1,160,4)==2);
+    history.Unknown(4);assert(history.LastWriter(2,0,4)==4);
+    for(u64 i=0;i<5000;++i)history.WriteRange(1,i*128,64,5+i);
+    assert(history.LastWriter(1,0,4)>=5); // Overflow loses precision, never a required dependency.
+    assert(history.LastWriter(1,~u64{0}-4,8)==~u64{0});
+    std::puts("Readback writers: overlap, other buffers, BDA fallback and bounded history overflow PASS");
+}
+static void readback_queue_gpu() {
+    _putenv_s("BB_READBACK_QUEUE","1");
+    Vulkan::Instance instance(0,false);assert(instance.GetReadbackQueue());
+    Vulkan::Scheduler scheduler(instance,false);Vulkan::Runtime runtime(instance,scheduler);
+    VideoCore::Buffer source(instance,0,4096,VideoCore::MemoryType::DeviceLocal);
+    VideoCore::Buffer result(instance,0,4096,VideoCore::MemoryType::HostCached);
+    Vulkan::ReadbackQueue reader(instance,scheduler);
+    const vk::BufferCopy copy{0,0,4096};
+    runtime.FillBuffer(&source,0,4096,0x12345678);
+    const u64 a=scheduler.CurrentTick();scheduler.Flush();
+    assert(runtime.LastBufferWriter(&source,0,4096)==a);
+    const u64 first=reader.Copy(source.Handle(),result.Handle(),std::span{&copy,1},a);
+    // A new graphics write must wait for the copy: cannot overwrite its source early.
+    runtime.FillBuffer(&source,0,4096,0x87654321);
+    const u64 b=scheduler.CurrentTick();scheduler.Flush();
+    reader.SemaphoreState().Wait(first);result.Invalidate(0,4096);
+    assert(*reinterpret_cast<const u32*>(result.mapped_data.data())==0x12345678);
+    const u64 second=reader.Copy(source.Handle(),result.Handle(),std::span{&copy,1},b);
+    reader.SemaphoreState().Wait(second);result.Invalidate(0,4096);
+    assert(*reinterpret_cast<const u32*>(result.mapped_data.data())==0x87654321);
+    scheduler.Finish();
+    std::puts("Two real Vulkan queues: producer visibility and read-before-overwrite ordering PASS");
+}
+
+static void recorded_bindings_cpu() {
+    Vulkan::RecordedBindings state;
+    const vk::PipelineLayout layout{VkPipelineLayout(1)};
+    const vk::Pipeline graphics{VkPipeline(2)},compute{VkPipeline(3)};
+    assert(!state.SkipPipeline(vk::PipelineBindPoint::eGraphics,graphics));
+    assert(state.SkipPipeline(vk::PipelineBindPoint::eGraphics,graphics));
+    assert(!state.SkipPipeline(vk::PipelineBindPoint::eCompute,compute));
+    assert(state.SkipPipeline(vk::PipelineBindPoint::eGraphics,graphics));
+    u32 value=7;
+    assert(!state.SkipPush(layout,vk::ShaderStageFlagBits::eVertex,0,4,&value));
+    assert(state.SkipPush(layout,vk::ShaderStageFlagBits::eVertex,0,4,&value));
+    value=8;assert(!state.SkipPush(layout,vk::ShaderStageFlagBits::eVertex,0,4,&value));
+    assert(!state.SkipPush(layout,vk::ShaderStageFlagBits::eVertex|vk::ShaderStageFlagBits::eCompute,0,4,&value));
+    assert(!state.SkipPush(layout,vk::ShaderStageFlagBits::eVertex,0,4,&value));
+    vk::DescriptorBufferInfo buffer{vk::Buffer{VkBuffer(4)},32,64};
+    vk::WriteDescriptorSet write{.dstBinding=0,.descriptorCount=1,
+        .descriptorType=vk::DescriptorType::eStorageBuffer,.pBufferInfo=&buffer};
+    const auto apply=[&] {return state.SkipDescriptors(vk::PipelineBindPoint::eGraphics,layout,0,std::span{&write,1});};
+    assert(!apply());assert(apply());
+    // Same pointer, changed contents must miss; a new pointer with equal contents must hit.
+    buffer.offset=64;assert(!apply());
+    auto equal_buffer=buffer;write.pBufferInfo=&equal_buffer;assert(apply());
+    write.dstArrayElement=1;assert(!apply());
+    state.ForgetDescriptors(vk::PipelineBindPoint::eGraphics);assert(!apply());
+    vk::VertexInputBindingDescription2EXT binding{.binding=0,.stride=16,.inputRate=vk::VertexInputRate::eVertex,.divisor=1};
+    vk::VertexInputAttributeDescription2EXT attribute{.location=0,.binding=0,.format=vk::Format::eR32Sfloat,.offset=0};
+    assert(!state.SkipVertex(std::span{&binding,1},std::span{&attribute,1}));
+    assert(state.SkipVertex(std::span{&binding,1},std::span{&attribute,1}));
+    attribute.offset=4;assert(!state.SkipVertex(std::span{&binding,1},std::span{&attribute,1}));
+    state.Forget();assert(!apply());assert(!state.SkipPipeline(vk::PipelineBindPoint::eGraphics,graphics));
+    std::puts("Recorded Vulkan state: owned descriptor contents, mixed-stage invalidation and command reset PASS");
+}
+
+static void shader_memos_cpu() {
+    alignas(256) std::array<u32,64> code{};code[0]=0xBEEB03FF;code[1]=3;
+    auto* binary=std::construct_at(reinterpret_cast<AmdGpu::BinaryInfo*>(code.data()+8));
+    binary->signature=AmdGpu::BinaryInfo::signature_ref;binary->length=16;binary->shader_hash=42;
+    AmdGpu::ShaderProgram registers{};registers.address=reinterpret_cast<uintptr_t>(code.data())>>8;
+    Vulkan::ShaderParamsMemo params;
+    assert(params.Get(registers,1,1).hash==42);
+    binary->shader_hash=43;registers.user_data[0]=9;
+    const auto hit=params.Get(registers,1,1);assert(hit.hash==42&&hit.user_data[0]==9);
+    assert(params.Get(registers,2,1).hash==43);
+    binary->length=20;assert(params.Get(registers,2,2).code.size()==5);
+    Shader::Info info{};info.hw_stage=Shader::HwStage::Compute;info.sw_stage=Shader::SwStage::Compute;
+    AmdGpu::Buffer sharp{};sharp.base_address=0x1000;sharp.num_records=16;sharp.stride=4;
+    Shader::BufferResource resource{};resource.sharp_fetch.immediates=std::bit_cast<std::array<u32,4>>(sharp);
+    info.buffers.push_back(resource);
+    const auto key=Vulkan::SpecializationInput(info);
+    sharp.base_address=0x2000;info.buffers[0].sharp_fetch.immediates=std::bit_cast<std::array<u32,4>>(sharp);
+    assert(key==Vulkan::SpecializationInput(info));
+    sharp.stride=8;info.buffers[0].sharp_fetch.immediates=std::bit_cast<std::array<u32,4>>(sharp);
+    assert(key!=Vulkan::SpecializationInput(info));
+    Shader::RuntimeInfo runtime{};Shader::StageSpecialization spec{};
+    Vulkan::SpecializationMemo specialization;const auto current=Vulkan::SpecializationInput(info);
+    specialization.Store(info,runtime,{},current,spec,2);
+    assert(specialization.Matches(info,runtime,{},current,spec));
+    Shader::Backend::Bindings changed{};changed.buffer=1;
+    assert(!specialization.Matches(info,runtime,changed,current,spec));
+    std::array<u32,80> fetch{};AmdGpu::UserData userdata{};
+    const auto* pointer=fetch.data();std::memcpy(userdata.data(),&pointer,sizeof(pointer));
+    info.user_data=userdata;info.has_fetch_shader=true;spec.fetch_shader_data.emplace();
+    spec.fetch_shader_data->size=sizeof(fetch);
+    specialization.Store(info,runtime,{},current,spec,3);
+    assert(specialization.Matches(info,runtime,{},current,spec));
+    fetch[70]=1;assert(!specialization.Matches(info,runtime,{},current,spec));
+    assert(Vulkan::EmptyDraw(0,1)&&Vulkan::EmptyDraw(1,0)&&!Vulkan::EmptyDraw(~0u,~0u));
+    assert(Vulkan::EmptyDispatch(1,0,1)&&!Vulkan::EmptyDispatch(1024,1024,4096));
+    std::puts("Shader metadata and specialization: fresh user data, epochs, resource formats and complete fetch code PASS");
+}
 
 static void gpu_profile_async() {
     _putenv_s("BB_GPU_PROFILE","1");
@@ -936,7 +1051,8 @@ static void textures() {
     }
     vmaDestroyBuffer(instance.GetAllocator(),staging,allocation);
 }
-static void image_read_memo() {
+static void image_read_memo(bool dirty=false) {
+    if(dirty)_putenv_s("BB_IMAGE_DIRTY_RANGES","1");
     using namespace Vulkan;
     Instance instance(0,false); Scheduler scheduler(instance); Runtime runtime(instance,scheduler);
     Common::SlotVector<VideoCore::ImageView> views;
@@ -952,13 +1068,44 @@ static void image_read_memo() {
         actual.clear(); expected.clear();
         cached.GetBarriers(actual,layout,access,stage,subset);
         reference.GetBarriers(expected,layout,access,stage,subset,false);
-        assert(actual.size()==expected.size());
-        for(size_t i=0;i<actual.size();++i) {
-            auto a=actual[i],b=expected[i]; a.image=b.image;
-            assert(a==b);
+        const auto expanded=[&](const auto& barriers) {
+            std::vector<vk::ImageMemoryBarrier2> result;
+            for(auto barrier:barriers) {
+                const auto range=barrier.subresourceRange;barrier.image=nullptr;
+                if(barrier.srcStageMask&vk::PipelineStageFlagBits2::eAllCommands)
+                    barrier.srcStageMask=vk::PipelineStageFlagBits2::eAllCommands;
+                const u32 levels=range.levelCount==VK_REMAINING_MIP_LEVELS?info.resources.levels-range.baseMipLevel:range.levelCount;
+                const u32 layers=range.layerCount==VK_REMAINING_ARRAY_LAYERS?info.resources.layers-range.baseArrayLayer:range.layerCount;
+                for(u32 m=0;m<levels;++m)for(u32 l=0;l<layers;++l) {
+                    barrier.subresourceRange.baseMipLevel=range.baseMipLevel+m;
+                    barrier.subresourceRange.baseArrayLayer=range.baseArrayLayer+l;
+                    barrier.subresourceRange.levelCount=1;barrier.subresourceRange.layerCount=1;
+                    result.push_back(barrier);
+                }
+            }
+            std::ranges::sort(result,{},[](const auto& b){return b.subresourceRange.baseMipLevel*64+b.subresourceRange.baseArrayLayer;});
+            return result;
+        };
+        if(dirty) assert(expanded(actual)==expanded(expected));
+        else {
+            assert(actual.size()==expected.size());
+            for(size_t i=0;i<actual.size();++i) {
+                auto a=actual[i],b=expected[i];a.image=b.image;assert(a==b);
+            }
         }
     };
     check(Layout::eShaderReadOnlyOptimal,Access::eShaderRead,Stage::eAllCommands,range);
+    if(dirty) {
+        // Homogeneous reads avoid allocation; a few changed layers use the dirty list,
+        // and more than 64 changed subresources must return to the complete scan.
+        for(u32 l=0;l<64;++l) {
+            check(Layout::eGeneral,Access::eShaderWrite,Stage::eAllCommands,VideoCore::SubresourceRange{{1,l},{1,1}});
+            check(Layout::eGeneral,Access::eShaderWrite,Stage::eAllCommands,VideoCore::SubresourceRange{{2,l},{1,1}});
+        }
+        check(Layout::eShaderReadOnlyOptimal,Access::eShaderRead,Stage::eAllCommands,{});
+        check(Layout::eGeneral,Access::eShaderWrite,Stage::eAllCommands,VideoCore::SubresourceRange{{3,4},{1,1}});
+        check(Layout::eShaderReadOnlyOptimal,Access::eShaderRead,Stage::eAllCommands,{});
+    }
     assert(!actual.empty());
     check(Layout::eShaderReadOnlyOptimal,Access::eShaderRead,Stage::eAllCommands,range);
     assert(actual.empty());
@@ -1007,6 +1154,7 @@ static void descriptor_pack_cpu() {
 }
 static void fault_decode_gpu(u32 chunk,bool packed=false,bool indirect=false) {
     using namespace Vulkan;
+    if(packed) _putenv_s("BB_REDUNDANT_BINDS","1");
     Instance instance(0,false);Scheduler scheduler(instance,packed);const auto device=instance.GetDevice();
     constexpr u32 WordCount=2048,InputBytes=WordCount*4;
     VideoCore::Buffer input(instance,0,InputBytes,VideoCore::MemoryType::HostUncached);
@@ -1066,9 +1214,11 @@ static void fault_decode_gpu(u32 chunk,bool packed=false,bool indirect=false) {
             const auto bytes=Vulkan::DescriptorPackingSize(writes);assert(bytes);
             const auto owned=Vulkan::PackDescriptorWrites(writes,
                 scheduler.RecordBytes(*bytes,alignof(vk::WriteDescriptorSet)));
-            scheduler.Record([handle=*pipeline,layout=*layout,owned,chunk](vk::CommandBuffer c) {
-                c.bindPipeline(vk::PipelineBindPoint::eCompute,handle);
-                c.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,layout,0,owned);
+            scheduler.Record([owner=&scheduler,handle=*pipeline,layout=*layout,owned,chunk](vk::CommandBuffer c) {
+                owner->BindPipeline(c,vk::PipelineBindPoint::eCompute,handle);
+                owner->PushDescriptors(c,vk::PipelineBindPoint::eCompute,layout,0,owned);
+                owner->BindPipeline(c,vk::PipelineBindPoint::eCompute,handle);
+                owner->PushDescriptors(c,vk::PipelineBindPoint::eCompute,layout,0,owned);
                 c.dispatch((WordCount+64*chunk-1)/(64*chunk),1,1);
             });
             // A stale pointer would bind a valid but empty input, failing the
@@ -1098,6 +1248,136 @@ static void fault_decode_gpu(u32 chunk,bool packed=false,bool indirect=false) {
     assert(VideoCore::StoredFaultCount(~0ull,1024)==1023);
     device.destroyShaderModule(module);
     std::puts("Real GPU fault decoder: clean bitmap, bounded output, overflow retry and high-address fault PASS");
+}
+static void graphics_binding_memo() {
+    Vulkan::GraphicsBindingMemo memo;
+    unsigned emitted=0;
+    // Interleaved pipelines and independent command buffers must retain the
+    // last real graphics binding, not merely the last submitted guest draw.
+    for (const auto [cmd,pipe] : std::array<std::pair<u64,u64>,8>{
+        {{1,10},{1,10},{1,20},{1,10},{1,10},{2,10},{2,10},{1,10}}})
+        emitted += memo.NeedsBind(cmd,pipe);
+    assert(emitted==5);
+    memo.Invalidate(); // Raw helper used the same command buffer.
+    assert(memo.NeedsBind(1,10));
+    assert(!memo.NeedsBind(1,10));
+    memo.Invalidate(); // Pool reset/reuses the same VkCommandBuffer handle.
+    assert(memo.NeedsBind(1,10));
+    assert(memo.NeedsBind(0,0) && memo.NeedsBind(0,0));
+    std::puts("Graphics bind memo: pipeline changes, raw helpers and command-buffer reuse PASS");
+}
+static void upload_protection_cpu() {
+    constexpr VAddr Base=0x2000000000ull;
+    constexpr u64 Page=4096;
+    auto* memory=static_cast<u8*>(VirtualAlloc(reinterpret_cast<void*>(Base),4*Page,
+        MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));assert(memory);
+    std::atomic<DWORD> protection_thread{};
+    const DWORD producer=GetCurrentThreadId();
+    VideoCore::PageManager pages{[&](VAddr address,u64 bytes,u32 perms) {
+        DWORD old;const DWORD mode=(perms&2)?PAGE_READWRITE:(perms&1)?PAGE_READONLY:PAGE_NOACCESS;
+        assert(VirtualProtect(reinterpret_cast<void*>(address),bytes,mode,&old));
+        protection_thread=GetCurrentThreadId();
+    }};
+    const auto perms=[&](u64 offset) {MEMORY_BASIC_INFORMATION q{};
+        assert(VirtualQuery(memory+offset,&q,sizeof(q)));return q.Protect;};
+    VideoCore::UploadWorker worker(pages);
+    VideoCore::RegionBits two;two.SetRange(0,2);
+    assert(pages.BeginDeferredProtection());
+    pages.UpdatePageWatchersForRegion<true,false>(Base,two);
+    assert(perms(0)==PAGE_READWRITE); // Not protected while the region transaction is open.
+    memory[0]=0x22;memory[Page]=0x33;
+    auto batch=pages.EndDeferredProtection();assert(!batch.empty());
+    std::array<u8,2> copied{};
+    worker.Queue(std::move(batch),[&]{copied={memory[0],memory[Page]};});worker.Wait();
+    assert(copied[0]==0x22&&copied[1]==0x33);
+    assert(perms(0)==PAGE_READONLY&&perms(Page)==PAGE_READONLY);
+    assert(protection_thread.load()!=producer);
+    // Stronger GPU read protection and adjacent readonly pages must stay distinct.
+    VideoCore::RegionBits first;first.Set(0);
+    assert(pages.BeginDeferredProtection());
+    pages.UpdatePageWatchersForRegion<true,true>(Base,first);
+    worker.Queue(pages.EndDeferredProtection());worker.Wait();
+    assert(perms(0)==PAGE_NOACCESS&&perms(Page)==PAGE_READONLY);
+    pages.UpdatePageWatchersForRegion<false,true>(Base,first);
+    pages.UpdatePageWatchersForRegion<false,false>(Base,two);
+    assert(perms(0)==PAGE_READWRITE);
+    // A queued older protect must not undo a newer guest write/unprotect.
+    assert(pages.BeginDeferredProtection());
+    pages.UpdatePageWatchersForRegion<true,false>(Base,first);
+    auto stale=pages.EndDeferredProtection();
+    pages.UpdatePageWatchersForRegion<false,false>(Base,first);
+    worker.Queue(std::move(stale));worker.Wait();assert(perms(0)==PAGE_READWRITE);
+    std::atomic<unsigned> copied_jobs{};
+    { VideoCore::UploadWorker draining(pages);
+      for(unsigned i=0;i<128;++i) draining.Queue({},[&]{++copied_jobs;}); }
+    assert(copied_jobs==128);
+    assert(VirtualFree(memory,0,MEM_RELEASE));
+    std::puts("Upload protection: native permissions, copy order, stale batches and shutdown drain PASS");
+}
+static void upload_submit_gpu() {
+    Vulkan::Instance instance(0,false);Vulkan::Scheduler scheduler(instance);
+    Vulkan::Runtime runtime(instance,scheduler);
+    VideoCore::PageManager pages{[](VAddr,u64,u32){std::abort();}};
+    VideoCore::UploadWorker worker(pages);
+    VideoCore::Buffer source(instance,0,4096,VideoCore::MemoryType::HostCached);
+    VideoCore::Buffer result(instance,0,4096,VideoCore::MemoryType::HostCached);
+    std::memset(source.mapped_data.data(),0,4096);source.Flush(0,4096);
+    scheduler.SetUploadWaiter([&]{worker.Wait();},[&]{return worker.Fence();});
+    worker.Queue({},[&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        *reinterpret_cast<u32*>(source.mapped_data.data())=0x98765432;source.Flush(0,4096);
+    });
+    const vk::BufferCopy copy{0,0,4096};runtime.CopyBuffer(&source,&result,std::span{&copy,1});
+    scheduler.Finish();result.Invalidate(0,4096);
+    assert(*reinterpret_cast<const u32*>(result.mapped_data.data())==0x98765432);
+    std::atomic<bool> copied{},signaled{};
+    worker.Queue({},[&] {std::this_thread::sleep_for(std::chrono::milliseconds(30));copied=true;});
+    scheduler.SignalAfterHostCopies([&] {assert(copied.load());signaled=true;});
+    scheduler.WaitDeferredSignals();assert(signaled.load());
+    scheduler.SetUploadWaiter({});
+    std::puts("Real Vulkan submission waits for deferred uploads before reading staging data PASS");
+}
+static void cpu_buffer_sync_memo() {
+    _putenv_s("BB_BUFFER_SYNC_MEMO", "1");
+    _putenv_s("BB_HOT_PAGES", "0");
+    VideoCore::PageManager pages{nullptr};
+    auto tracker = std::make_unique<VideoCore::MemoryTracker>(pages);
+    constexpr VAddr Base = 8 * VideoCore::TRACKER_HIGHER_PAGE_SIZE;
+    constexpr u64 Region = VideoCore::TRACKER_HIGHER_PAGE_SIZE;
+    std::array<u64,2> versions{};
+    assert(!tracker->GetCpuVersions(Base, 65536, versions));
+    assert(tracker->IsRegionCpuModified(Base, 65536)); // Creates production tracker.
+    assert(tracker->GetCpuVersions(Base, 65536, versions) && versions[1] == 0);
+    char first{}, second{};
+    const auto* arena = reinterpret_cast<const VideoCore::Buffer*>(&first);
+    const auto* replacement = reinterpret_cast<const VideoCore::Buffer*>(&second);
+    VideoCore::CpuBufferMemo memo{Base,65536,arena,versions};
+    assert(memo.Matches(Base,65536,versions,arena,arena));
+    assert(!memo.Matches(Base+1,65536,versions,arena,arena));
+    assert(!memo.Matches(Base,65535,versions,arena,arena));
+    assert(!memo.Matches(Base,65536,versions,replacement,replacement));
+    assert(!memo.Matches(Base,65536,versions,arena,replacement));
+    assert(!memo.Matches(Base,65536,versions,nullptr,nullptr));
+    // Pages start writable/dirty: no guest protection or fake runtime is used.
+    // Even repeated writes to an already dirty range must invalidate a token.
+    tracker->MarkRegionAsCpuModified(Base+4096,4096);
+    std::array<u64,2> after{};
+    assert(tracker->GetCpuVersions(Base,65536,after) && after != versions);
+    assert(!memo.Matches(Base,65536,after,arena,arena));
+    tracker->MarkRegionAsCpuModified(Base+4096,4096);
+    assert(tracker->GetCpuVersions(Base,65536,versions) && versions != after);
+    assert(!tracker->GetCpuVersions(Base+Region-4096,8192,after));
+    tracker->IsRegionCpuModified(Base+Region,4096);
+    assert(tracker->GetCpuVersions(Base+Region-4096,8192,after));
+    const auto crossing = after;
+    tracker->MarkRegionAsCpuModified(Base+Region,4096);
+    assert(tracker->GetCpuVersions(Base+Region-4096,8192,after));
+    assert(after[0] == crossing[0] && after[1] != crossing[1]);
+    assert(!tracker->GetCpuVersions(Base,2*Region+1,after));
+    assert(!tracker->GetCpuVersions(Base,0,after));
+    assert(!tracker->GetCpuVersions(~u64{0}-10,32,after));
+    assert(!tracker->GetCpuVersions((u64{1}<<40)-1,2,after));
+    std::puts("Readonly buffer sync memo: guest writes, crossing regions, arena migration and bounds PASS");
 }
 static void cpu_word_summary() {
     VideoCore::RegionBits bits;
@@ -1152,10 +1432,19 @@ int main(int argc,char** argv) {
     // A failed automated assertion must be reported to CTest, not wait in a
     // Windows dialog. These settings affect only this test process.
     SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX);
-    if(argc==2 && !std::strcmp(argv[1],"--lru-gc")) {lru_gc_cpu();return 0;}
-    if(argc==2 && !std::strcmp(argv[1],"--texture-gc")) {VideoCore::TextureCacheTestAccess::Run();return 0;}
     _set_error_mode(_OUT_TO_STDERR);
     _set_abort_behavior(_WRITE_ABORT_MSG,_WRITE_ABORT_MSG|_CALL_REPORTFAULT);
+    if(argc==2 && !std::strcmp(argv[1],"--image-dirty-ranges-gpu")) {image_read_memo(true);return 0;}
+    if(argc==2 && !std::strcmp(argv[1],"--readback-writer-history-cpu")) {readback_writer_history_cpu();return 0;}
+    if(argc==2 && !std::strcmp(argv[1],"--readback-queue-gpu")) {readback_queue_gpu();return 0;}
+    if(argc==2 && !std::strcmp(argv[1],"--recorded-bindings-cpu")) {recorded_bindings_cpu();return 0;}
+    if(argc==2 && !std::strcmp(argv[1],"--shader-memos-cpu")) {shader_memos_cpu();return 0;}
+    if(argc==2 && !std::strcmp(argv[1],"--upload-protection-cpu")) {upload_protection_cpu();return 0;}
+    if(argc==2 && !std::strcmp(argv[1],"--upload-submit-gpu")) {upload_submit_gpu();return 0;}
+    if(argc==2 && !std::strcmp(argv[1],"--graphics-binding-memo")) {graphics_binding_memo();return 0;}
+    if(argc==2 && !std::strcmp(argv[1],"--cpu-buffer-sync-memo")) {cpu_buffer_sync_memo();return 0;}
+    if(argc==2 && !std::strcmp(argv[1],"--lru-gc")) {lru_gc_cpu();return 0;}
+    if(argc==2 && !std::strcmp(argv[1],"--texture-gc")) {VideoCore::TextureCacheTestAccess::Run();return 0;}
     if(argc==2 && !std::strcmp(argv[1],"--gpu-profile-async")) {
         gpu_profile_async();return 0;
     }

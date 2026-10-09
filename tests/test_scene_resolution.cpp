@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Exercises the production target/resolve path on Vulkan (Lavapipe works, no game/window).
 #include "vulkan_test.h"
+#include "windows_test.h"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -13,6 +14,11 @@
 #include <vk_mem_alloc.h>
 
 int main() {
+    SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX);
+    _set_error_mode(_OUT_TO_STDERR);
+    _set_abort_behavior(_WRITE_ABORT_MSG,_WRITE_ABORT_MSG|_CALL_REPORTFAULT);
+    _putenv_s("BB_PIPELINE_BIND_MEMO", "1");
+    _putenv_s("BB_SCENE_STENCIL_BITS", "1"); // Exercise real graphics resampling on NVIDIA too.
     using namespace Vulkan;
     Instance instance(0, false);
     // Calls emitted by this executable use a local dispatcher. libbbgpu.so initializes
@@ -198,4 +204,5 @@ int main() {
     std::puts("Scene targets: half-resolution mip level proxy roundtrip PASS");
     scheduler.Finish();
     vmaDestroyBuffer(instance.GetAllocator(),readback,allocation);
+    assert(BbStats::pipeline_bind_memo_misses.load()>0);
 }

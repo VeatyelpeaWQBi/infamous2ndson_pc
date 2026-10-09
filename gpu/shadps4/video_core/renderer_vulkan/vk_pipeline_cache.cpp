@@ -30,12 +30,21 @@
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/renderer_vulkan/vk_shader_params_memo.h"
+#include "video_core/buffer_cache/region_definitions.h"
 
 namespace Vulkan {
 
 using Shader::HwStage;
 using Shader::Output;
 using Shader::SwStage;
+template<typename Registers>
+static Shader::ShaderParams StageParams(const Registers& regs) {
+    static const bool enabled=[]{const auto* f=std::getenv("BB_SHADER_PARAMS_MEMO");return f&&f[0]=='1';}();
+    if(!enabled)return AmdGpu::GetParams(regs);
+    thread_local ShaderParamsMemo memo;
+    return memo.Get(regs,VideoCore::CurrentUploadEpoch(),VideoCore::CurrentHostWriteGen());
+}
 
 constexpr static auto SpirvVersion1_6 = 0x00010600U;
 
@@ -158,7 +167,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
         info.hw.gs.in_vertex_data_size = regs.vgt_esgs_ring_itemsize;
         info.hw.gs.out_vertex_data_size = regs.vgt_gs_vert_itemsize[0];
         info.hw.gs.mode = regs.vgt_gs_mode.mode;
-        const auto params_vc = AmdGpu::GetParams(regs.vs_program);
+        const auto params_vc = StageParams(regs.vs_program);
         info.hw.gs.vs_copy = params_vc.code;
         info.hw.gs.vs_copy_hash = params_vc.hash;
         DumpShader(info.hw.gs.vs_copy, info.hw.gs.vs_copy_hash, Shader::HwStage::Vertex, 0,
@@ -412,7 +421,7 @@ const GraphicsPipeline* PipelineCache::TryPreparedPipeline(const PreparedDraw& p
         if (!pgm || !pgm->Address<u32*>()) {
             return nullptr;
         }
-        const auto params = AmdGpu::GetParams(*pgm);
+        const auto params = StageParams(*pgm);
         if (params.hash != stage.hash) {
             return nullptr;
         }
@@ -445,6 +454,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     if (!RefreshGraphicsKey(sel)) {
         return nullptr;
     }
+    static const bool key_memo=[] {const auto* flag=std::getenv("BB_PIPELINE_KEY_MEMO");return flag&&flag[0]=='1';}();
+    if(key_memo&&last_graphics_pipeline&&last_graphics_key==sel.graphics_key) return last_graphics_pipeline;
     const auto [it, is_new] = graphics_pipelines.try_emplace(sel.graphics_key);
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(sel.graphics_key);
@@ -471,7 +482,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         }
         sel.fetch_shader.reset();
     }
-    return it->second.get();
+    last_graphics_key=sel.graphics_key;last_graphics_pipeline=it->second.get();
+    return last_graphics_pipeline;
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
@@ -704,7 +716,7 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
             return false;
         }
 
-        const auto params = AmdGpu::GetParams(*pgm);
+        const auto params = StageParams(*pgm);
         std::optional<Shader::Gcn::FetchShaderData> fetch_shader_;
         std::tie(sel.infos[stage_out_idx], sel.modules[stage_out_idx], fetch_shader_,
                  key.stage_hashes[stage_out_idx]) =
@@ -809,7 +821,7 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
 bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
-    const auto cs_params = AmdGpu::GetParams(cs_pgm);
+    const auto cs_params = StageParams(cs_pgm);
     std::tie(sel.infos[0], sel.modules[0], sel.fetch_shader, compute_key.value) =
         GetProgram(sel, HwStage::Compute, SwStage::Compute, cs_params, binding);
     return true;
@@ -934,6 +946,21 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
     info.RefreshFlatBuf();
+    static const bool specialization_memo=[] {const auto* f=std::getenv("BB_SPEC_MEMO");return f&&f[0]=='1';}();
+    const bool memoize=specialization_memo&&sw_stage!=SwStage::TessellationControl&&sw_stage!=SwStage::TessellationEval;
+    SpecializationWords inputs;const auto start=binding;
+    if(memoize) {
+        inputs=SpecializationInput(info);
+        for(const auto& cached:program->specialization_memos) {
+            if(cached.permutation>=program->modules.size())continue;
+            auto& selected=program->modules[cached.permutation];
+            if(cached.Matches(info,runtime_info,binding,inputs,selected.spec)) {
+                info.AddBindings(binding);
+                return std::make_tuple(&info,selected.module,selected.spec.fetch_shader_data,
+                                       HashCombine(params.hash,cached.permutation));
+            }
+        }
+    }
     auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
 
     size_t perm_idx = program->modules.size();
@@ -962,12 +989,15 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
         perm_idx = std::distance(program->modules.begin(), it);
         perm_hash = HashCombine(params.hash, perm_idx);
     }
+    if(memoize)program->specialization_memos[program->specialization_cursor++%16].Store(
+        info,runtime_info,start,std::move(inputs),program->modules[perm_idx].spec,perm_idx);
     return std::make_tuple(&program->info, module,
                            program->modules[perm_idx].spec.fetch_shader_data, perm_hash);
 }
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,
                                                              std::span<const u32> spv_code) {
+    last_graphics_pipeline=nullptr;
     std::optional<vk::ShaderModule> new_module{};
     for (const auto& [_, program] : program_cache) {
         for (auto& m : program->modules) {

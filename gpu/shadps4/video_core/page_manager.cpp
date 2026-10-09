@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <boost/container/small_vector.hpp>
+#include <utility>
 #include "bbport_toggles.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -41,10 +42,19 @@
 
 namespace VideoCore {
 
+namespace {
+struct DeferredProtection {
+    const PageManager* owner{};
+    PageManager::ProtectionBatch ranges;
+};
+thread_local DeferredProtection deferred_protection;
+}
+
 constexpr size_t PM_PAGE_SIZE = 4_KB;
 constexpr size_t PM_PAGE_BITS = 12;
 
 struct PageManager::Impl {
+    const PageManager* owner{};
     struct PageState {
         u8 num_write_watchers : 7;
         // At the moment only buffer cache can request read watchers.
@@ -106,6 +116,14 @@ struct PageManager::Impl {
     }
 
     virtual void Protect(VAddr address, size_t size, Core::MemoryPermission perms) = 0;
+    virtual bool IsMapped(VAddr address, size_t size) const {
+        return rasterizer->IsMapped(address,size);
+    }
+    void ProtectOrDefer(VAddr address, size_t size, Core::MemoryPermission perms) {
+        if (deferred_protection.owner && deferred_protection.owner == owner) {
+            deferred_protection.ranges.push_back({address,size});
+        } else Protect(address,size,perms);
+    }
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
@@ -150,7 +168,7 @@ struct PageManager::Impl {
             if (range_bytes > 0) {
                 RENDERER_TRACE;
                 // Perform pending (un)protect action
-                Protect(range_begin << PM_PAGE_BITS, range_bytes, perms);
+                ProtectOrDefer(range_begin << PM_PAGE_BITS, range_bytes, perms);
                 range_bytes = 0;
                 potential_range_bytes = 0;
             }
@@ -159,7 +177,7 @@ struct PageManager::Impl {
         // Iterate requested pages
         const u64 aligned_addr = page << PM_PAGE_BITS;
         const u64 aligned_end = page_end << PM_PAGE_BITS;
-        if (!rasterizer->IsMapped(aligned_addr, aligned_end - aligned_addr)) {
+        if (!IsMapped(aligned_addr, aligned_end - aligned_addr)) {
             LOG_WARNING(Render,
                         "Tracking memory region {:#x} - {:#x} which is not fully GPU mapped.",
                         aligned_addr, aligned_end);
@@ -221,7 +239,7 @@ struct PageManager::Impl {
             if (range_bytes > 0) {
                 RENDERER_TRACE;
                 // Perform pending (un)protect action
-                Protect((range_begin << PM_PAGE_BITS), range_bytes, perms);
+                ProtectOrDefer((range_begin << PM_PAGE_BITS), range_bytes, perms);
                 range_bytes = 0;
                 potential_range_bytes = 0;
             }
@@ -449,6 +467,52 @@ PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
     LOG_INFO(Config, "Memory tracking method: signals");
 #endif
     impl = std::make_unique<SignalImpl>(rasterizer_);
+    impl->owner=this;
+}
+
+PageManager::PageManager(ProtectionCallback callback) {
+    struct CallbackImpl final : Impl {
+        ProtectionCallback callback;
+        explicit CallbackImpl(ProtectionCallback fn):callback{std::move(fn)} {}
+        bool IsMapped(VAddr,u64) const override {return true;}
+        void Protect(VAddr a,u64 bytes,Core::MemoryPermission p) override {
+            callback(a,bytes,u32(p));
+        }
+    };
+    impl=std::make_unique<CallbackImpl>(std::move(callback));impl->owner=this;
+}
+
+bool PageManager::BeginDeferredProtection() {
+    if (deferred_protection.owner) return false;
+    deferred_protection.owner=this;return true;
+}
+PageManager::ProtectionBatch PageManager::TakeDeferredProtection() {
+    ASSERT(deferred_protection.owner==this);
+    return std::exchange(deferred_protection.ranges,{});
+}
+PageManager::ProtectionBatch PageManager::EndDeferredProtection() {
+    auto runs=TakeDeferredProtection();deferred_protection.owner=nullptr;return runs;
+}
+void PageManager::RefreshDeferredProtection(std::span<const ProtectionRange> ranges) const {
+    for (const auto& run:ranges) {
+        ASSERT(run.size && run.address<(u64{1}<<Impl::ADDRESS_BITS) &&
+               run.size<=(u64{1}<<Impl::ADDRESS_BITS)-run.address);
+        size_t page=run.address>>PM_PAGE_BITS;
+        const size_t end=Common::DivCeil(run.address+run.size,PM_PAGE_SIZE);
+        while(page<end) {
+            const size_t region=page/PAGES_PER_LOCK;
+            const size_t stop=std::min(end,(region+1)*PAGES_PER_LOCK);
+            std::scoped_lock lock{impl->locks[region]};
+            while(page<stop) {
+                const size_t first=page++;
+                const auto perms=impl->cached_pages[first].Perms();
+                while(page<stop && impl->cached_pages[page].Perms()==perms) ++page;
+                // Recheck current watchers while holding their lock. A queued
+                // old protection must never undo a more recent CPU unprotect.
+                impl->Protect(first<<PM_PAGE_BITS,(page-first)<<PM_PAGE_BITS,perms);
+            }
+        }
+    }
 }
 
 PageManager::~PageManager() = default;

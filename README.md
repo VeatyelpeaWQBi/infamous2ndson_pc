@@ -7,8 +7,8 @@ are outside its development and verification scope.
 **Current stage: Second Son gameplay compatibility and performance investigation.**
 Windows executables build; user testing has confirmed gameplay and controller input, and
 local captures show restored fire/smoke bodies. Stable 50–60 FPS with complete effects has
-not been achieved. Latest checks: 186 Python cases and 31 native CTest checks pass;
-16 real Vulkan integration checks also passed for the renderer changes. Legacy Linux/AppImage
+not been achieved. Latest checks: 190 Python cases and 34 native CTest checks pass;
+17 real Vulkan integration checks also passed for the renderer changes. Legacy Linux/AppImage
 packaging tests are excluded. No complete play-through is verified.
 All adaptation is in the runtime engine; original game programs, assets and shader packages
 remain read-only. Translated caches and isolated benchmark data are stored under `out/`.
@@ -20,6 +20,7 @@ remain read-only. Translated caches and isolated benchmark data are stored under
 - [Second Son adaptation and first game test / 首轮适配与游戏测试](docs/INFAMOUS_ADAPTATION.2026-10-06.zh-CN.md)
 - [Development rules](AGENTS.md) / [agent.md](agent.md)
 - [Reverse analysis, actual-game measurements and limits / 反编译与性能实测](docs/INFAMOUS_REVERSE_ANALYSIS.2026-10-09.zh-CN.md)
+- [Selected upstream changes and verification / 指定上级改动合入记录](docs/UPSTREAM_SELECTED_MERGE.2026-10-09.zh-CN.md)
 
 Entry points: `build.bat --check`, `build.bat --build-tests`, `test.bat`, and `test.bat --gpu`.
 `test.bat --python-only` runs the Python subset without compiling the runtime.

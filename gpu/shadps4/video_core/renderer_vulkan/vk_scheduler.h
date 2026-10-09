@@ -18,6 +18,8 @@
 #include <queue>
 
 #include "bbport_toggles.h"
+#include "video_core/renderer_vulkan/vk_graphics_binding_memo.h"
+#include "video_core/renderer_vulkan/vk_recorded_bindings.h"
 #include "common/assert.h"
 #include "common/interval_set.h"
 #include "common/unique_function.h"
@@ -74,11 +76,13 @@ struct SubmitInfo {
     u32 num_signal_semas;
 
     void AddWait(vk::Semaphore semaphore, u64 tick = 1) {
+        ASSERT(num_wait_semas<wait_semas.size());
         wait_semas[num_wait_semas] = semaphore;
         wait_ticks[num_wait_semas++] = tick;
     }
 
     void AddSignal(vk::Semaphore semaphore, u64 tick = 1) {
+        ASSERT(num_signal_semas<signal_semas.size());
         signal_semas[num_signal_semas] = semaphore;
         signal_ticks[num_signal_semas++] = tick;
     }
@@ -707,6 +711,11 @@ public:
     void SetSubmitCallback(SubmitFunc&& on_submit) {
         this->on_submit = std::move(on_submit);
     }
+    void SetUploadWaiter(std::function<void()> wait,
+                         std::function<std::function<void()>()> fence={}) {
+        upload_waiter=std::move(wait);upload_fence=std::move(fence);
+    }
+    void SetReadbackDependency(vk::Semaphore semaphore,u64 tick) {readback_semaphore=semaphore;readback_tick=tick;}
 
     /// Returns the current render state.
     const RenderState& GetRenderState() const {
@@ -729,8 +738,24 @@ public:
             direct_recordings.fetch_add(1, std::memory_order_relaxed);
             TraceDirectRecording(__builtin_return_address(0));
         }
+        // Raw command-buffer users can bind arbitrary graphics pipelines.
+        // SyncRecording above transfers ownership back before resetting state.
+        graphics_binding_memo.Invalidate();
+        recorded_bindings.Forget();
         return current_cmdbuf;
     }
+
+    // Call inside the recorded closure, never while building deferred work.
+    // Compute has independent Vulkan binding state and is deliberately uncached.
+    void BindGraphicsPipeline(vk::CommandBuffer cmd, vk::Pipeline pipeline);
+    void BindPipeline(vk::CommandBuffer cmd,vk::PipelineBindPoint point,vk::Pipeline pipeline);
+    void PushConstants(vk::CommandBuffer cmd,vk::PipelineLayout layout,vk::ShaderStageFlags stages,
+                       u32 offset,u32 size,const void* values);
+    void PushDescriptors(vk::CommandBuffer cmd,vk::PipelineBindPoint point,vk::PipelineLayout layout,
+                         u32 set,std::span<const vk::WriteDescriptorSet> writes);
+    void SetVertexInput(vk::CommandBuffer cmd,std::span<const vk::VertexInputBindingDescription2EXT> b,
+                        std::span<const vk::VertexInputAttributeDescription2EXT> a);
+    void ForgetDescriptors(vk::PipelineBindPoint point) {recorded_bindings.ForgetDescriptors(point);}
 
     /// BB_RECORDER_TRACE=1: prints the most frequent CommandBuffer() callers every 2000 calls.
     static void TraceDirectRecording(void* caller);
@@ -906,7 +931,12 @@ private:
     Semaphore work_semaphore;
     CommandPool command_pool;
     DynamicState dynamic_state;
+    GraphicsBindingMemo graphics_binding_memo; // Owned by the recording thread.
+    RecordedBindings recorded_bindings;
     SubmitFunc on_submit{};
+    std::function<void()> upload_waiter;
+    std::function<std::function<void()>()> upload_fence;
+    vk::Semaphore readback_semaphore{};u64 readback_tick{};
     vk::CommandBuffer current_cmdbuf;
     std::condition_variable_any event_cv;
     struct PendingOp {

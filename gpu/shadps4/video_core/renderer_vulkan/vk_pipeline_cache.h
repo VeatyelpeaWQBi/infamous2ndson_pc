@@ -14,6 +14,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
+#include "video_core/renderer_vulkan/vk_specialization_memo.h"
 
 template <>
 struct std::hash<vk::ShaderModule> {
@@ -51,6 +52,8 @@ struct Program {
 
     Shader::Info info;
     ModuleList modules{};
+    std::array<SpecializationMemo,16> specialization_memos{};
+    u32 specialization_cursor{};
     size_t last_used = 0; ///< bbport: permutation of the previous lookup, compared first
     /// bbport: `info` as translated, for draw-preparation workers (they must not read `info`,
     /// whose user data the GPU thread rewrites every draw). Guarded by programs_mutex.
@@ -201,6 +204,8 @@ private:
     PipelineSelection sel{}; ///< GPU thread selection state
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+    GraphicsPipelineKey last_graphics_key{};
+    const GraphicsPipeline* last_graphics_pipeline{};
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

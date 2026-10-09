@@ -45,6 +45,7 @@ public:
 
     /// Waits for a tick to be hit on the GPU
     void Wait(u64 tick);
+    bool WaitFor(u64 tick,u64 timeout_ns);
 
 protected:
     const Instance& instance;

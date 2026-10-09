@@ -43,6 +43,9 @@ struct TextureCacheTestAccess {
         }
         cache.gc_tick=200;cache.trigger_gc_memory=0;cache.pressure_gc_memory=0;
         cache.critical_gc_memory=~u64{0};
+        // The production pressure report resets its interval eviction counters.
+        // Keep that report outside this assertion; do not depend on machine uptime.
+        cache.gc_report_time=std::chrono::steady_clock::now();
         cache.GarbageCollectImages();
         assert(cache.gc_evictions==2 && cache.gc_kept==32);
         scheduler.Finish();
