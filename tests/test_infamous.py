@@ -35,6 +35,9 @@ class InfamousNativeTests(unittest.TestCase):
     def test_scoped_resolver_rejects_wrong_library_versions_and_symbol_kinds(self):
         self.run_case('--identities')
 
+    def test_cpu_upload_does_not_wait_on_protected_gpu_page(self):
+        self.run_case('--cpu-upload-backing')
+
     def test_event_flags_wake_cancel_and_delete_blocked_threads(self):
         self.run_case('--eventflags')
 

@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-from game_profiles import select_profile,native_environment
+from game_profiles import select_profile,native_environment,project_game_dir
 from windows_tools import require_windows,msys_root
 
 ROOT=Path(__file__).resolve().parent.parent
@@ -24,10 +24,10 @@ def main():
     if not 1<=args.seconds<=120: parser.error('seconds must be between 1 and 120')
     if args.continue_game and (not args.gpu or args.seconds<=16):
         parser.error('--continue-game requires --gpu and more than 16 seconds')
-    game=ROOT/'patches/CUSA00309'; out=ROOT/'out/CUSA00309'
+    game=project_game_dir(ROOT); out=ROOT/'out/CUSA00309'
     for path in (ROOT/'out/bb-probe.exe',out/'boot-linked.bin',out/'content.bin',out/'patches.bin'):
         if not path.is_file(): parser.error(f'Missing existing artifact: {path}')
-    env=dict(os.environ); native_environment(select_profile(game),ROOT,env)
+    env=dict(os.environ); env['BB_GAME_DIR']=str(game); native_environment(select_profile(game),ROOT,env)
     state=ROOT/'out/infamous-diagnostic-profile'
     env.update(BB_USER_DIR=str(state/'user'),BB_GPU_USER_DIR=str(state/'gpu'),BB_CONFIG=str(state/'settings.ini'))
     if args.gpu: env['BB_CAPTURE_FRAME']=str(ROOT/'out/infamous-presented.bmp')

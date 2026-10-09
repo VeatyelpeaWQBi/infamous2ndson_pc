@@ -84,6 +84,37 @@ def read_frames(path):
         return fields, rows, malformed
 
 
+def merge_native_journal(native, journal):
+    """Join different sequence origins using unchanged frame content, not millisecond ticks.
+
+    Multiple catch-up flips can share a tick. A tick-keyed merge would silently lose
+    samples and can even hide the slow frame preceding those catch-up flips.
+    This function is read-only; callers decide where to publish analysis artifacts.
+    """
+    if not native or not journal:
+        return list(native or journal)
+    fields=sorted(set(native[0])-{'sequence','dropped_frames'})
+    if fields!=sorted(set(journal[0])-{'sequence','dropped_frames'}):
+        raise ValueError('Native recording and journal schemas differ')
+    signatures={}
+    for row in journal:
+        signatures.setdefault(tuple(row[k] for k in fields),[]).append(row['sequence'])
+    offsets={matches[0]-row['sequence'] for row in native
+             if len(matches:=signatures.get(tuple(row[k] for k in fields),[]))==1}
+    if len(offsets)!=1:
+        raise ValueError('Cannot prove a unique native/journal sequence origin')
+    offset=offsets.pop()
+    result={row['sequence']:{k:row[k] for k in ('sequence',*fields)} for row in journal}
+    for source in native:
+        row={k:source[k] for k in ('sequence',*fields)}
+        row['sequence']+=offset
+        old=result.get(row['sequence'])
+        if old is not None and old!=row:
+            raise ValueError('Conflicting frame content at matched sequence')
+        result[row['sequence']]=row
+    return [result[key] for key in sorted(result)]
+
+
 def recover(session):
     session = Path(session).resolve()
     status = json.loads((session / 'status.json').read_text(encoding='utf-8'))
@@ -228,12 +259,19 @@ def stats(rows):
 
 def analyze(path):
     _, rows, invalid = read_frames(path)
+    journal=Path(path).with_suffix('.cache.csv')
+    journal_joined=False
+    if not Path(path).name.endswith('.cache.csv') and journal.is_file():
+        _, persisted,journal_invalid=read_frames(journal)
+        rows=merge_native_journal(rows,persisted)
+        invalid+=journal_invalid
+        journal_joined=True
     first = rows[0]['tick_ms'] if rows else 0
     windows = {}
     for row in rows:
         windows.setdefault((row['tick_ms']-first)//10000, []).append(row)
     return {'interval_source': 'guest_flip_host_clock', 'gpu_execution_time_available': False,
-            'malformed_rows': invalid, 'overall': stats(rows),
+            'malformed_rows': invalid, 'journal_joined_read_only':journal_joined,'overall': stats(rows),
             'groups': {'under_20ms': stats([r for r in rows if r['interval_ns'] < 20000000]),
                        '20_to_33_3ms': stats([r for r in rows if 20000000 <= r['interval_ns'] < 1e9/30]),
                        'over_33_3ms': stats([r for r in rows if r['interval_ns'] >= 1e9/30]),

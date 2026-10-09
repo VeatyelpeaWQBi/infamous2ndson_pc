@@ -3,7 +3,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
-from game_profiles import console_locale,validate_console_locale
+from game_profiles import console_locale,validate_console_locale,project_game_dir
 
 ROOT=Path(__file__).resolve().parent.parent
 LANGUAGES=(('繁體中文（香港）',10,'chinese'),('English',1,'english'),('한국어（韩语）',9,'korean'))
@@ -74,7 +74,7 @@ class LanguageMenu:
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--data',type=Path,default=ROOT)
-    parser.add_argument('--game',type=Path,default=ROOT/'patches/CUSA00309')
+    parser.add_argument('--game',type=Path,default=project_game_dir(ROOT))
     args=parser.parse_args()
     try:
         import tkinter as tk

@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include "common/slot_vector.h"
+#include "texture_gc_regression.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/ir/ir_emitter.h"
 #include <spirv/unified1/spirv.hpp11>
@@ -20,6 +21,7 @@
 #include "video_core/buffer_cache/cpu_word_summary.h"
 #include "video_core/buffer_cache/fault_buffer_limits.h"
 #include "video_core/buffer_cache/readback_hint.h"
+#include "video_core/buffer_cache/cpu_backing_hash.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/host_shaders/fault_buffer_process_comp.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
@@ -44,6 +46,31 @@
 #include "video_core/renderer_vulkan/vk_descriptor_pack.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "bbport_benchmark_control.h"
+#include "particle_shader_regression.h"
+#include "gcn_analysis.h"
+#include "video_core/renderer_vulkan/vk_gpu_profiler.h"
+
+static void gpu_profile_async() {
+    _putenv_s("BB_GPU_PROFILE","1");
+    Vulkan::Instance instance(0,false);
+    Vulkan::Scheduler scheduler(instance,false);
+    Vulkan::GpuProfiler::Init(instance,scheduler);
+    auto* profiler=Vulkan::GpuProfiler::Get();assert(profiler);
+    // Keep all timestamps in an unsubmitted command buffer. The fifth frame
+    // must skip instrumentation instead of waiting for results or resetting
+    // queries referenced by that buffer (the old four-frame heuristic hangs).
+    const auto start=std::chrono::steady_clock::now();
+    for(unsigned frame=0;frame<20;++frame) {
+        profiler->Mark(1,[]{return std::string{"unsubmitted diagnostic work"};});
+        profiler->BeginFrame();
+    }
+    assert(std::chrono::steady_clock::now()-start<std::chrono::milliseconds(500));
+    scheduler.Finish();
+    profiler->BeginFrame();
+    profiler->Mark(2,[]{return std::string{"reused completed diagnostic storage"};});
+    profiler->BeginFrame();scheduler.Finish();profiler->BeginFrame();
+    std::puts("GPU profiler skips in-flight query storage without waiting PASS");
+}
 
 static void runtime_benchmark_control(const std::filesystem::path& directory) {
     std::filesystem::create_directories(directory);
@@ -63,10 +90,22 @@ static void runtime_benchmark_control(const std::filesystem::path& directory) {
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
     assert(!control.Poll([&](bool value){++calls;return value;},[&]{++snapshots;}));
     assert(calls==1); // Retry cannot toggle recording twice.
-    std::ofstream(path)<<"2 snapshot\n";std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    control.Poll([&](bool value){++calls;return value;},[&]{++snapshots;});assert(snapshots==1);
-    std::ofstream(path)<<"3 quit\n";std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    assert(control.Poll([&](bool value){++calls;return value;},[&]{++snapshots;}));
+    const auto wait_command=[&](auto complete) {
+        // GetTickCount64 has coarser granularity than sleep_for: a 25ms sleep
+        // does not guarantee the production 20ms polling gate has advanced.
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(1);
+        bool quit=false;
+        do {
+            quit|=control.Poll([&](bool value){++calls;return value;},[&]{++snapshots;});
+            if(complete(quit)) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        } while(std::chrono::steady_clock::now()<deadline);
+        assert(false && "benchmark command acknowledgement timed out");
+    };
+    std::ofstream(path)<<"2 snapshot\n";
+    wait_command([&](bool quit){assert(!quit);return snapshots==1;});
+    std::ofstream(path)<<"3 quit\n";
+    wait_command([](bool quit){return quit;});
     _putenv_s("BB_BENCH_CONTROL","");
     std::puts("Actual-present history / owned control acknowledgements / idempotency / bounded input validation PASS");
 }
@@ -79,15 +118,21 @@ static void readback_prefetch_gpu() {
     Vulkan::Scheduler scheduler(instance);
     Vulkan::Runtime runtime(instance, scheduler);
     Buffer source(instance, 0, 4096, MemoryType::DeviceLocal);
-    Buffer snapshot(instance, 0, 4096, MemoryType::HostCached);
+    auto snapshot=std::make_unique<Buffer>(instance,0,4096,MemoryType::HostCached);
     Buffer unrelated(instance, 0, 4096, MemoryType::DeviceLocal);
     ReadbackHint hint;
     hint.page = 0x1000;
     const vk::BufferCopy copy{0, 0, 4096};
     runtime.FillBuffer(&source, 0, 4096, 0xa5a5a5a5);
-    runtime.CopyBuffer(&source, &snapshot, std::span{&copy, 1});
+    runtime.CopyBuffer(&source, snapshot.get(), std::span{&copy, 1});
     hint.Captured(scheduler.CurrentTick());
     scheduler.Flush();
+
+    // Transfer ownership while the earlier copy can still be in flight. A
+    // later prefetch uses different storage and cannot overwrite the reader's.
+    const auto reader_tick=hint.Detach();
+    auto reader_snapshot=std::move(snapshot);
+    snapshot=std::make_unique<Buffer>(instance,0,4096,MemoryType::HostCached);
 
     vk::SemaphoreTypeCreateInfo timeline{.semaphoreType = vk::SemaphoreType::eTimeline};
     auto [result, gate] = instance.GetDevice().createSemaphoreUnique({.pNext = &timeline});
@@ -100,8 +145,8 @@ static void readback_prefetch_gpu() {
 
     std::atomic<bool> completed{false};
     std::thread reader([&] {
-        scheduler.Wait(hint.tick);
-        snapshot.Invalidate(0, 4096);
+        scheduler.GetWorkSemaphore()->Wait(reader_tick);
+        reader_snapshot->Invalidate(0, 4096);
         completed.store(true, std::memory_order_release);
     });
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -117,17 +162,18 @@ static void readback_prefetch_gpu() {
     reader.join();
     scheduler.Wait(later_tick);
     assert(independent && later_pending);
-    for (const auto byte : snapshot.mapped_data) assert(byte == 0xa5);
+    for (const auto byte : reader_snapshot->mapped_data) assert(byte == 0xa5);
 
     hint.Write(0x1100, 4);
     assert(!hint.Valid()); // A newer write rejects the old snapshot.
     runtime.FillBuffer(&source, 0, 4096, 0x11111111);
-    runtime.CopyBuffer(&source, &snapshot, std::span{&copy, 1});
+    runtime.CopyBuffer(&source, snapshot.get(), std::span{&copy, 1});
     hint.Captured(scheduler.CurrentTick());
     scheduler.Flush();
     scheduler.Wait(hint.tick);
-    snapshot.Invalidate(0, 4096);
-    for (const auto byte : snapshot.mapped_data) assert(byte == 0x11);
+    snapshot->Invalidate(0, 4096);
+    for (const auto byte : snapshot->mapped_data) assert(byte == 0x11);
+    for (const auto byte : reader_snapshot->mapped_data) assert(byte == 0xa5);
     hint.Consumed();
     assert(!hint.Valid());
     std::puts("GPU readback snapshot: early timeline completion, later-work independence and fresh bytes PASS");
@@ -662,6 +708,13 @@ static void frame_capture(const std::filesystem::path& directory) {
     }
     FrameCapture::Buffer(0x789,0,0x900000,constants,16);
     FrameCapture::Dispatch(0x789,4,2,1);
+    // GPU particle frames contain hundreds of alternating emitters. Preserve the
+    // late transparent consumer rather than stopping at the old 256-entry cap.
+    for(u32 i=0;i<300;++i) FrameCapture::Dispatch(0x1000+i,1,1,1);
+    scene.resources.layers=16;scene.resources.levels=2;
+    FrameCapture::BeginPass(&scene_ptr,1,nullptr);
+    FrameCapture::Draw(0xf1,0xf2,0,0);
+    FrameCapture::CaptureDrawState(0xf3,0xf1,0xf2,"indirect counts=GPU_owned blend=1 src=1 dst=1");
     FrameCapture::BeginPass(&display_ptr,1,nullptr);
     assert(!FrameCapture::Active());
     std::filesystem::path report;
@@ -675,7 +728,9 @@ static void frame_capture(const std::filesystem::path& directory) {
     assert(text.find("COMPUTE dispatches 1")!=std::string::npos);
     assert(text.find("buffer stage 0000000000000789 slot 0 at 0x900000 size 16")!=std::string::npos);
     assert(text.find("samples 0x100000")!=std::string::npos);
-    assert(text.find("DEBUG_FRAME_END passes=3")!=std::string::npos);
+    assert(text.find("DEBUG_FRAME_END passes=304")!=std::string::npos);
+    assert(text.find("DRAW_STATE key=0xf3 vs=00000000000000f1 ps=00000000000000f2 indirect")!=std::string::npos);
+    assert(text.find("layers=16 levels=2")!=std::string::npos);
     assert(text.size()<2*1024*1024);
     std::puts("Frame capture: trigger, complete frame boundaries, sampled resources, bounded constants PASS");
 }
@@ -950,13 +1005,16 @@ static void descriptor_pack_cpu() {
     writes[0].pNext=&buffers;assert(!Vulkan::DescriptorPackingSize(writes));
     std::puts("Descriptor owned snapshot: arrays, all info types, source mutation and unsupported extension PASS");
 }
-static void fault_decode_gpu(u32 chunk,bool packed=false) {
+static void fault_decode_gpu(u32 chunk,bool packed=false,bool indirect=false) {
     using namespace Vulkan;
     Instance instance(0,false);Scheduler scheduler(instance,packed);const auto device=instance.GetDevice();
     constexpr u32 WordCount=2048,InputBytes=WordCount*4;
     VideoCore::Buffer input(instance,0,InputBytes,VideoCore::MemoryType::HostUncached);
     VideoCore::Buffer output(instance,0,64,VideoCore::MemoryType::HostCached);
     VideoCore::Buffer blank(instance,0,InputBytes,VideoCore::MemoryType::HostUncached);
+    Runtime runtime(instance,scheduler);
+    VideoCore::Buffer args(instance,0,12,VideoCore::MemoryType::DeviceLocal);
+    VideoCore::Buffer args_source(instance,0,12,VideoCore::MemoryType::HostUncached);
     std::memset(blank.mapped_data.data(),0,InputBytes);blank.Flush(0,InputBytes);
     const std::array<vk::DescriptorSetLayoutBinding,2> bindings{{
         {.binding=0,.descriptorType=vk::DescriptorType::eStorageBuffer,.descriptorCount=1,.stageFlags=vk::ShaderStageFlagBits::eCompute},
@@ -980,7 +1038,7 @@ static void fault_decode_gpu(u32 chunk,bool packed=false) {
     std::memset(words,0,InputBytes);
     for(unsigned i=0;i<64;++i) words[i*32]=1;
     words[WordCount-1]|=1u<<31;input.Flush(0,InputBytes);
-    for(unsigned pass=0;pass<12;++pass) {
+    for(unsigned pass=0;pass<(indirect ? 24u : 12u);++pass) {
         std::memset(output.mapped_data.data(),0,64);output.Flush(0,64);
         const vk::MemoryBarrier2 before{.srcStageMask=vk::PipelineStageFlagBits2::eAllCommands|vk::PipelineStageFlagBits2::eHost,
             .srcAccessMask=vk::AccessFlagBits2::eShaderWrite|vk::AccessFlagBits2::eHostWrite,
@@ -989,7 +1047,22 @@ static void fault_decode_gpu(u32 chunk,bool packed=false) {
             c.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount=1,.pMemoryBarriers=&before});
         });
         ib.buffer=input.Handle();
-        if(packed) {
+        if(indirect) {
+            auto* values=reinterpret_cast<u32*>(args_source.mapped_data.data());
+            values[0]=(pass%2==0) ? (WordCount+64*chunk-1)/(64*chunk) : 0;
+            values[1]=values[2]=1;args_source.Flush(0,12);
+            if(pass) assert(runtime.IsBufferAccessed(&args,0,12,true));
+            const vk::BufferCopy copy{0,0,12};
+            runtime.CopyBuffer(&args_source,&args,std::span{&copy,1});
+            assert(runtime.IsBufferAccessed(&args,0,12));
+            runtime.FlushBarriers();
+            runtime.TrackIndirectRead(&args,0,12);
+            assert(runtime.IsBufferAccessed(&args,0,12,true));
+            auto cmd=scheduler.CommandBuffer();
+            cmd.bindPipeline(vk::PipelineBindPoint::eCompute,*pipeline);
+            cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,*layout,0,writes);
+            cmd.dispatchIndirect(args.Handle(),0);
+        } else if(packed) {
             const auto bytes=Vulkan::DescriptorPackingSize(writes);assert(bytes);
             const auto owned=Vulkan::PackDescriptorWrites(writes,
                 scheduler.RecordBytes(*bytes,alignof(vk::WriteDescriptorSet)));
@@ -1052,11 +1125,59 @@ static void cpu_word_summary() {
     assert(!summary.MightBeDirty(0,64));assert(summary.MightBeDirty(64,65));
     std::puts("CPU dirty-word summary: mixed writes, uploads and word boundaries PASS");
 }
+static void cpu_backing_hash() {
+    std::vector<u8> backing(3*65536);
+    for(size_t i=0;i<backing.size();++i) backing[i]=u8(i*13+(i>>8));
+    void* guest=VirtualAlloc(nullptr,backing.size(),MEM_COMMIT|MEM_RESERVE,PAGE_NOACCESS);
+    assert(guest);
+    const VAddr base=reinterpret_cast<VAddr>(guest);
+    VideoCore::CpuBackingHasher hasher;
+    const auto copy=[&](VAddr source,u8* output,u64 bytes) {
+        assert(source>=base && source-base+bytes<=backing.size());
+        std::memcpy(output,backing.data()+source-base,bytes);
+    };
+    for(const size_t size:{size_t{0},size_t{1},size_t{65535},size_t{65536},size_t{65537},backing.size()-7}) {
+        assert(hasher.Hash(base+7,size,copy)==XXH3_64bits(backing.data()+7,size));
+    }
+    const u64 before=hasher.Hash(base,backing.size(),copy);
+    backing[65536]^=0x5a;
+    assert(hasher.Hash(base,backing.size(),copy)!=before);
+    assert(hasher.Hash(base,backing.size(),copy)==XXH3_64bits(backing.data(),backing.size()));
+    MEMORY_BASIC_INFORMATION info{};
+    assert(VirtualQuery(guest,&info,sizeof(info)) && info.Protect==PAGE_NOACCESS);
+    assert(VirtualFree(guest,0,MEM_RELEASE));
+    std::puts("CPU backing checksum: protected guest view, chunk boundaries and changed bytes PASS");
+}
 int main(int argc,char** argv) {
+    // A failed automated assertion must be reported to CTest, not wait in a
+    // Windows dialog. These settings affect only this test process.
+    SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX);
+    if(argc==2 && !std::strcmp(argv[1],"--lru-gc")) {lru_gc_cpu();return 0;}
+    if(argc==2 && !std::strcmp(argv[1],"--texture-gc")) {VideoCore::TextureCacheTestAccess::Run();return 0;}
+    _set_error_mode(_OUT_TO_STDERR);
+    _set_abort_behavior(_WRITE_ABORT_MSG,_WRITE_ABORT_MSG|_CALL_REPORTFAULT);
+    if(argc==2 && !std::strcmp(argv[1],"--gpu-profile-async")) {
+        gpu_profile_async();return 0;
+    }
+    if(argc==4 && !std::strcmp(argv[1],"--gcn-disassemble")) {
+        gcn_disassemble(argv[2],argv[3]);return 0;
+    }
+    if(argc==2 && !std::strcmp(argv[1],"--cpu-backing-hash")) {cpu_backing_hash();return 0;}
     if(argc==2 && !std::strcmp(argv[1],"--descriptor-pack")) {descriptor_pack_cpu();return 0;}
     if(argc==2 && !std::strcmp(argv[1],"--descriptor-pack-gpu")) {fault_decode_gpu(1,true);return 0;}
+    if(argc==2 && !std::strcmp(argv[1],"--indirect-buffer-gpu")) {fault_decode_gpu(1,false,true);return 0;}
     if(argc==2 && !std::strcmp(argv[1],"--readback-prefetch-gpu")) {readback_prefetch_gpu();return 0;}
+    if(argc==2 && !std::strcmp(argv[1],"--particle-shader-cpu")) { particle_shader_cpu(); return 0; }
+    if(argc==2 && !std::strcmp(argv[1],"--particle-shader-gpu")) { particle_shader_gpu(); return 0; }
     if(argc==2 && !std::strcmp(argv[1],"--readback-hint")) {
+        VideoCore::ReadbackPrefetchGate gate;
+        assert(gate.Ready(0,1000000));
+        gate.Queued(0);
+        assert(!gate.Ready(999999,1000000) && gate.Ready(1000000,1000000));
+        assert(gate.Ready(1,0)); // Disabled gate preserves per-dispatch prefetch.
+        assert(gate.Ready(1000001,1000000)); // No work queued: do not postpone readiness.
+        gate.Queued(1000001);
+        assert(!gate.Ready(1500000,1000000));
         VideoCore::ReadbackHint hint;hint.page=0x1000;assert(!hint.Valid());
         hint.Captured(3);assert(hint.Valid() && hint.Matches(0x1100,16));
         hint.Write(0x3000,4096);assert(hint.Valid());
@@ -1065,7 +1186,18 @@ int main(int argc,char** argv) {
         hint.Consumed();assert(!hint.Valid());
         hint.Captured(5);hint.Forget();assert(!hint.Valid() && !hint.Matches(0x1100,4));
         assert(hint.tick==5); // Storage remains pinned even when guest memory is unmapped.
+        hint.page=0x1000;hint.Captured(6);
+        const auto detached_tick=hint.Detach();
+        assert(detached_tick==6 && !hint.Valid() && hint.tick==0 && hint.page==0x1000);
+        hint.Captured(7);assert(hint.Valid()); // New buffer may be captured independently.
         struct Slot {VideoCore::ReadbackHint hint;u64 last_use{};};
+        std::array<Slot,5> windows{};
+        windows[0].hint.page=0x7100;windows[1].hint.page=0x7800;
+        windows[2].hint.page=0x8500;windows[3].hint.page=0x9000;
+        windows[4].hint.page=0x4500;
+        const auto merged=VideoCore::CoalescedReadbackWindows(0x3000,0x4000,0x2000,0x8800,0x1000,windows);
+        assert(merged.size()==2 && merged[0]==std::pair(VAddr{0x3000},VAddr{0x5000}) &&
+               merged[1]==std::pair(VAddr{0x7000},VAddr{0x8800}));
         std::array<Slot,3> slots{};
         for(size_t i=0;i<slots.size();++i) {
             slots[i].hint.page=0x1000*(i+1);slots[i].last_use=i+1;slots[i].hint.Captured(i+1);

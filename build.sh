@@ -109,6 +109,7 @@ else
     echo "Built $PWD/out/bb-probe.exe"
 fi
 if [[ $build_tests == 1 ]]; then
+    "$CC" "${cflags[@]}" -municode tools/win32_cpu_profile.c -o out/cpu-profile.exe
     # All runtime tests use the same Win32 source set and flags as the executable.
     "$CC" "${cflags[@]}" "${includes[@]}" -I. -Isrc tests/test_pad.c src/runtime_host.c src/runtime_debug.c src/win32_compat.c \
         "${libraries[@]}" -lws2_32 -lm -o out/pad-test.exe

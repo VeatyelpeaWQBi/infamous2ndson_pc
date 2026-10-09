@@ -342,6 +342,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         }(),
         .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
                               instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
+        .lds_barriers_multi_wave = [] {
+            const char* value = std::getenv("BB_PARTICLE_LDS_MULTI");
+            return !value || value[0] != '0';
+        }(),
         .needs_buffer_offsets = instance.StorageMinAlignment() > 4,
         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
@@ -365,8 +369,11 @@ std::atomic<u64> g_bb_perf_compile_ns, g_bb_perf_compiles;
 namespace {
 thread_local unsigned compile_depth;
 struct CompileTimer {
+    const char* phase;
+    u64 identity;
     bool outer = compile_depth++ == 0;
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    CompileTimer(const char* phase_,u64 identity_):phase{phase_},identity{identity_} {}
     ~CompileTimer() {
         const auto elapsed = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    std::chrono::steady_clock::now() - start)
@@ -375,6 +382,9 @@ struct CompileTimer {
         ++g_bb_compiles;
         --compile_depth;
         if (outer) { g_bb_perf_compile_ns += elapsed; ++g_bb_perf_compiles; }
+        if (elapsed>=5'000'000 && std::getenv("BB_DEBUG_DIR"))
+            std::fprintf(stderr,"SHADER_COMPILE phase=%s id=%016llx elapsed_ns=%llu outer=%u\n",
+                phase,static_cast<unsigned long long>(identity),static_cast<unsigned long long>(elapsed),unsigned(outer));
     }
 };
 } // namespace
@@ -439,7 +449,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(sel.graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
-        CompileTimer timer;
+        CompileTimer timer{"graphics_driver",pipeline_hash};
 
         GraphicsPipeline::SerializationSupport sdata{};
         auto cache_guard=pipeline_cache->Lock();
@@ -472,7 +482,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     if (is_new) {
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
-        CompileTimer timer;
+        CompileTimer timer{"compute_driver",pipeline_hash};
 
         ComputePipeline::SerializationSupport sdata{};
         auto cache_guard=pipeline_cache->Lock();
@@ -811,7 +821,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
-    CompileTimer timer;
+    CompileTimer timer{"translate_spirv",info.pgm_hash};
 
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
@@ -882,6 +892,15 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
             {program, params.hash, hw_stage, info.pgm_base, &info.flattened_ud_buf});
         return std::make_tuple(&info, it->module, it->spec.fetch_shader_data,
                                HashCombine(params.hash, perm_idx));
+    }
+
+    // Offline shader analysis must also see programs restored from the Vulkan
+    // cache. Dump only once per program, on the GPU thread, when explicitly enabled.
+    if (EmulatorSettings.IsDumpShaders()) {
+        static std::unordered_set<u64> dumped;
+        if (dumped.insert(params.hash).second) {
+            DumpShader(params.code, params.hash, hw_stage, 0, "bin");
+        }
     }
 
     auto it_pgm = program_cache.find(params.hash); // this thread is the only writer

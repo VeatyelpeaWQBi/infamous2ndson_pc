@@ -2,7 +2,8 @@
 // bbport: BB_GPU_PROFILE=1 — GPU time per render pass, dispatch and upscaler run. A timestamp is
 // written where each of them starts (and at the frame end); the time to the next timestamp is
 // charged to its label, barriers and copies recorded in between included. Results are read four
-// frames later and printed every 5 s: GPU ms per frame by label.
+// frames later without waiting, and printed every 5 s. Intervals include queue idle,
+// barriers and transfers; these are not isolated shader execution times.
 
 #pragma once
 
@@ -58,7 +59,7 @@ public:
 private:
     GpuProfiler(const Instance& instance, Scheduler& scheduler);
     void WriteTimestamp(u64 key);
-    void Collect(u32 slice);
+    bool Collect(u32 slice);
     void Print();
 
     static constexpr u32 NumSlices = 4;
@@ -73,6 +74,7 @@ private:
     std::array<std::vector<u64>, NumSlices> keys; ///< label of each timestamp but the last
     std::array<u32, NumSlices> used{};
     std::array<bool, NumSlices> pending{};
+    std::array<u64, NumSlices> completion_ticks{};
     std::unordered_map<u64, std::string> described;
     struct Total {
         double ms = 0;

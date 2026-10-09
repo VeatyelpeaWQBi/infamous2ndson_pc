@@ -6,6 +6,7 @@
 #include "bbport_copy.h"
 #include "bbport_platform.h"
 #include "bbport_toggles.h"
+#include "bbport_visibility_trace.h"
 #include <cstdio>
 #include <boost/preprocessor/stringize.hpp>
 
@@ -29,6 +30,23 @@ namespace AmdGpu {
 
 static const char* dcb_task_name{"DCB_TASK"};
 static const char* ccb_task_name{"CCB_TASK"};
+
+// Bounded diagnostics for a compatibility gap: query results below are
+// synthesized, not sampled from Vulkan. Establish whether the title uses
+// these packets before changing visibility or adding GPU query waits.
+static void TraceVisibilityPacket(const char* kind, u64 address, u64& count) {
+    static const bool enabled=[] {
+        const char* value=std::getenv("BB_OCCLUSION_TRACE");
+        return value && value[0]=='1';
+    }();
+    if(!enabled) return;
+    ++count;
+    if((count & (count-1))==0) {
+        std::fprintf(stderr,"VISIBILITY_PACKET kind=%s count=%llu address=%#llx\n",
+                     kind,static_cast<unsigned long long>(count),
+                     static_cast<unsigned long long>(address));
+    }
+}
 
 #define MAX_NAMES 56
 static_assert(Liverpool::NumComputeRings <= MAX_NAMES);
@@ -311,6 +329,7 @@ void RunDmaData(Vulkan::Rasterizer& rasterizer, const u8* data) {
 
 void SignalFlip(Vulkan::Rasterizer& rasterizer, const u8*) {
     rasterizer.WaitDeferredSignals();
+    rasterizer.OnGuestFlip();
     Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
 }
 
@@ -906,6 +925,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break; // registers: ApplyGraphicsRegisterPacket
             }
             case PM4ItOpcode::SetPredication: {
+                static u64 predication_packets{};
+                TraceVisibilityPacket("set_predication",0,predication_packets);
                 LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION");
                 break;
             }
@@ -1118,6 +1139,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                         static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                         u64* results = event->Address<u64*>();
+                        BbVisibilityTrace::Result(reinterpret_cast<u64>(results));
+                        static u64 occlusion_packets{};
+                        TraceVisibilityPacket("pixel_pipe_stat_dump",
+                                              reinterpret_cast<u64>(results),occlusion_packets);
                         for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
                             *results = pixel_counter | OcclusionCounterValidMask;
                         }

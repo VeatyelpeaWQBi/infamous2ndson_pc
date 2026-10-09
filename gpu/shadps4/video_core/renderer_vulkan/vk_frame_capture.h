@@ -39,6 +39,7 @@ public:
     static void BeginPass(const VideoCore::ImageInfo* const* colors, u32 num_colors,
                           const VideoCore::ImageInfo* depth);
     static void Draw(u64 vs_hash, u64 ps_hash, u32 num_indices, u32 num_instances);
+    static void CaptureDrawState(u64 pipeline_key,u64 vs_hash,u64 ps_hash,const char* text);
     static void Dispatch(u64 cs_hash, u32 x, u32 y, u32 z);
     static void Sampled(const VideoCore::ImageInfo& info, bool storage);
     /// Contents of a bound buffer (first 1 KiB), kept for small passes and a pass's first draw.

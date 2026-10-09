@@ -8,6 +8,10 @@ BLOODBORNE_IDS = frozenset(('CUSA00207', 'CUSA00208', 'CUSA00900', 'CUSA01363', 
 SECOND_SON_SHA256 = '2d1ca79630d7bbe6fa29575f59aa7996d43071d74ac8e4f7d40137967d9039ab'
 SECOND_SON_LOCALE = dict(region='HK',system_language=10,timezone_minutes=480,confirm_button='circle')
 
+def project_game_dir(root):
+    """Read-only game location shared by Windows launch and diagnosis entry points."""
+    return Path(root) / 'game' / 'CUSA00309'
+
 def console_locale(data):
     path=Path(data)/'infamous-locale.json'
     locale=dict(SECOND_SON_LOCALE)
@@ -51,7 +55,7 @@ def native_environment(profile, data, env):
                 'BB_UPSCALE_BEFORE_CS', 'BB_PATCHES', 'BB_PRESET_FILE', 'BB_TOGGLE_FILE', 'BB_DMEM_MB'):
         env.pop(key, None)
     state = Path(data) / 'profiles' / profile['title_id']
-    source=Path(env.get('BB_GAME_DIR',Path(data)/'patches'/profile['title_id']))/'art/cache/all_shaders.xpps'
+    source=Path(env.get('BB_GAME_DIR',project_game_dir(data)))/'art/cache/all_shaders.xpps'
     locale=console_locale(data)
     # Mailbox and FIFO synchronize presentation; disallow tearing modes for this title.
     if env.get('BB_PRESENT_MODE') not in ('Mailbox','Fifo'):
@@ -60,6 +64,14 @@ def native_environment(profile, data, env):
     # Actual-game A/B: avoid draining unrelated GPU work for hot CPU readbacks,
     # and present ready frames between guest vblank ticks with a 60 FPS ceiling.
     env.setdefault('BB_READBACK_PREFETCH','1')
+    # Restored fire/smoke requires CPU reads to observe GPU feedback. Measured
+    # with complete effects, using page-versioned asynchronous readback.
+    env.setdefault('BB_READBACKS','2')
+    env.setdefault('BB_READBACK_WINDOW_KIB','4096')
+    env.setdefault('BB_READBACK_COALESCE','1')
+    env.setdefault('BB_ASYNC_READBACK','1')
+    env.setdefault('BB_CLEAN_ARENA_READ','1')
+    env.setdefault('BB_DESCRIPTOR_PACK','1')
     env.setdefault('BB_FPS_LIMIT','60')
     env.setdefault('BB_CPU_WORD_SUMMARY','1')
     env.update(BB_GAME_PROFILE='infamous', BB_UPSCALER='none', BB_DEBUG_MOTION='0',

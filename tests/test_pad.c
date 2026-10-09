@@ -7,6 +7,18 @@
 static int capture;
 static BbMouseMotion mouse;
 static int recording_toggle_count;
+static HANDLE feedback_entered,feedback_release;
+static volatile LONG feedback_test_armed,feedback_calls,feedback_last_low,feedback_last_high;
+static bool SDLCALL slow_feedback(void *userdata,Uint16 low,Uint16 high) {
+    (void)userdata;
+    InterlockedIncrement(&feedback_calls);
+    InterlockedExchange(&feedback_last_low,low); InterlockedExchange(&feedback_last_high,high);
+    if (InterlockedExchange(&feedback_test_armed,0)) {
+        SetEvent(feedback_entered);
+        assert(WaitForSingleObject(feedback_release,2000)==WAIT_OBJECT_0);
+    }
+    return true;
+}
 static int test_recording_toggle(void) { return ++recording_toggle_count & 1; }
 int bbgpu_overlay_captures_input(void) { return capture; }
 void bbgpu_mouse_motion_read(BbMouseMotion *state) { *state=mouse; mouse.dx=mouse.dy=0; }
@@ -20,6 +32,15 @@ static void inject(const char *path, const char *tokens) {
     assert(f);
     fputs(tokens,f);
     fclose(f);
+    SDL_Delay(25);
+}
+static void inject_at(const char *path,const char *tokens,uint64_t stamp) {
+    inject(path,tokens);
+    HANDLE file=CreateFileA(path,FILE_WRITE_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                            NULL,OPEN_EXISTING,0,NULL);
+    assert(file!=INVALID_HANDLE_VALUE);
+    FILETIME time={(DWORD)stamp,(DWORD)(stamp>>32)};
+    assert(SetFileTime(file,NULL,NULL,&time));CloseHandle(file);
     SDL_Delay(25);
 }
 static void test_motion_math(void) {
@@ -130,6 +151,24 @@ int main(int argc,char **argv) {
     assert(pad_read_state(1,&data)==0 && data.touch_count==1 && data.touches[0].x==1440);
     inject(path,"");
     assert(pad_read_state(1,&data)==0 && data.buttons==0 && data.touch_count==0);
+    test_setenv("BB_BENCHMARK_INPUT","1");
+    inject(path,"rx=180");
+    HANDLE input_locked=CreateFileA(path,GENERIC_READ,0,NULL,OPEN_EXISTING,0,NULL);
+    assert(input_locked!=INVALID_HANDLE_VALUE);
+    assert(pad_read_state(1,&data)==0 && data.right_x==128);
+    CloseHandle(input_locked);
+    SDL_Delay(25);
+    assert(pad_read_state(1,&data)==0 && data.right_x==180);
+    FILETIME input_time;GetSystemTimeAsFileTime(&input_time);
+    uint64_t input_stamp=(((uint64_t)input_time.dwHighDateTime<<32)|input_time.dwLowDateTime);
+    input_stamp=(input_stamp/10000000-2)*10000000+1000000;
+    inject_at(path,"rx=180",input_stamp);
+    assert(pad_read_state(1,&data)==0 && data.right_x==180);
+    inject_at(path,"rx=181",input_stamp+1000000); // Same size and whole second.
+    assert(pad_read_state(1,&data)==0 && data.right_x==181);
+    test_setenv("BB_BENCHMARK_INPUT","");
+    inject(path,"");
+    assert(pad_read_state(1,&data)==0 && data.right_x==128);
     mouse=(BbMouseMotion){.active=1,.left=1,.reset=1};
     assert(pad_motion_state(1,2)==ERR_INVALID_ARG && pad_motion_state(2,1)==ERR_INVALID_HANDLE);
     assert(pad_read_state(1,&data)==0 && (data.buttons&BTN_R2) && data.r2==255);
@@ -179,6 +218,7 @@ int main(int argc,char **argv) {
     desc.product_id=0x6189;
     desc.ntouchpads=1;
     desc.touchpads=&touch;
+    desc.Rumble=slow_feedback;
     SDL_JoystickID id=SDL_AttachVirtualJoystick(&desc);
     assert(id!=0);
     SDL_Joystick *joystick=SDL_OpenJoystick(id);
@@ -209,11 +249,52 @@ int main(int argc,char **argv) {
     SDL_UpdateJoysticks();
     SDL_UpdateGamepads();
     assert(pad_read_state(1,&data)==0 && data.touch_count==1 && data.touches[0].x==480);
+    /* Queuing repeated output before each input read must not freeze input.
+     * Pause consumption with an owned mailbox to make the pending state
+     * deterministic, rather than relying on worker scheduling. */
+    PadFeedback queued={0};host_mutex_init(&queued.mutex);
+    queued.started=1;queued.wake=CreateEventW(NULL,FALSE,FALSE,NULL);
+    assert(queued.wake);
+    pad_feedback_submit(&queued,id,0,0);
+    assert(!pad_feedback_busy(&queued) && queued.serial==1);
+    for(unsigned i=0;i<200;++i) pad_feedback_submit(&queued,id,0,0);
+    assert(queued.serial==1 && !pad_feedback_busy(&queued));
+    assert(SDL_SetJoystickVirtualButton(joystick,SDL_GAMEPAD_BUTTON_SOUTH,true));
+    assert(SDL_SetJoystickVirtualAxis(joystick,SDL_GAMEPAD_AXIS_LEFTX,24000));
+    SDL_UpdateJoysticks();SDL_UpdateGamepads();
+    PadFeedback *live=&feedback; // The live mailbox has no pending device IO here.
+    assert(!pad_feedback_busy(live));
+    assert(pad_read_state(1,&data)==0 && (data.buttons & BTN_CROSS) && data.left_x>200);
+    CloseHandle(queued.wake);
+    /* The virtual backend blocks while SDL holds its joystick lock. Neither the
+     * guest output API nor a concurrent input read may wait for that driver. */
+    feedback_entered=CreateEventW(NULL,TRUE,FALSE,NULL);
+    feedback_release=CreateEventW(NULL,TRUE,FALSE,NULL);
+    assert(feedback_entered && feedback_release);
+    InterlockedExchange(&feedback_test_armed,1);
+    uint8_t motors[2]={120,80};
+    const uint64_t queued_at=host_monotonic_ns();
+    assert(pad_vibration(1,motors)==0);
+    assert(host_monotonic_ns()-queued_at<50000000);
+    assert(WaitForSingleObject(feedback_entered,2000)==WAIT_OBJECT_0);
+    const uint64_t read_at=host_monotonic_ns();
+    assert(pad_read_state(1,&data)==0 && data.touch_count==1 && data.touches[0].x==480);
+    assert(host_monotonic_ns()-read_at<50000000 && pad_feedback_busy(&feedback));
+    for (int i=0;i<200;++i) { motors[0]=(uint8_t)i; assert(pad_vibration(1,motors)==0); }
+    motors[0]=motors[1]=0; assert(pad_vibration(1,motors)==0);
+    SetEvent(feedback_release);
+    const uint64_t stop_deadline=GetTickCount64()+2000;
+    while (pad_feedback_busy(&feedback) && GetTickCount64()<stop_deadline) SDL_Delay(1);
+    assert(!pad_feedback_busy(&feedback));
+    assert(feedback_last_low==0 && feedback_last_high==0 && feedback_calls<=3);
+    assert(pad_vibration(1,NULL)==ERR_INVALID_ARG && pad_vibration(2,motors)==ERR_INVALID_HANDLE);
+    feedback_shutdown();
+    CloseHandle(feedback_entered); CloseHandle(feedback_release);
     SDL_CloseJoystick(joystick);
     if (gamepad) SDL_CloseGamepad(gamepad);
     gamepad=NULL;
     assert(SDL_DetachVirtualJoystick(id));
     SDL_Quit();
     unlink(path);
-    puts("PASS: pad ABI, mouse motion/shake/reset/sensors, legacy+motion replay, touch and overlay capture");
+    puts("PASS: pad ABI/motion/touch; blocked vibration backend, nonblocking input and latest stop coalescing");
 }

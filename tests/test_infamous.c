@@ -9,6 +9,30 @@
 #define P(n) n "#libScePlayGo:1#libScePlayGo:256#F"
 #define TRACE "NWtTN10cJzE#libSceLibcInternalExt:1#libSceLibcInternal:257#F"
 void runtime_restart(void) { abort(); } // no guest restart is allowed in a unit test
+extern void runtime_memory_gpu_protect(uintptr_t,uint64_t,int,int);
+static void cpu_upload_backing(void) {
+    typedef int32_t (ABI *Map)(void**,uint64_t,int,int);
+    typedef int32_t (ABI *Release)(void*,uint64_t);
+    void* memory=NULL;
+    assert(GET(Map,"IWIBBdTHit4#p#J")(&memory,32768,3,0)==0 && memory);
+    memset(memory,0x5a,32768);
+    runtime_memory_gpu_protect((uintptr_t)memory,16384,0,0);
+    MEMORY_BASIC_INFORMATION info;
+    assert(VirtualQuery(memory,&info,sizeof(info))==sizeof(info) && info.Protect==PAGE_NOACCESS);
+    unsigned char* snapshot=malloc(32768);assert(snapshot);
+    runtime_memory_read_backing((uintptr_t)memory,snapshot,32768);
+    for(unsigned i=0;i<32768;++i) assert(snapshot[i]==0x5a);
+    assert(VirtualQuery(memory,&info,sizeof(info))==sizeof(info) && info.Protect==PAGE_NOACCESS);
+    assert(GET(Release,"teiItL2boFw#p#J")((unsigned char*)memory+16384,16384)==0);
+    runtime_memory_read_backing((uintptr_t)memory,snapshot,32768);
+    for(unsigned i=0;i<32768;++i) assert(snapshot[i]==(i<16384 ? 0x5a : 0));
+    snapshot[0]=0x22;
+    runtime_memory_read_backing(UINTPTR_MAX-3,snapshot,8);assert(snapshot[0]==0x22);
+    runtime_memory_gpu_protect((uintptr_t)memory,16384,1,1);
+    assert(GET(Release,"teiItL2boFw#p#J")(memory,16384)==0);
+    free(snapshot);
+    puts("CPU-owned upload mirror: protected page, protection retained, sparse hole and overflow PASS");
+}
 static void identities(void) {
     uintptr_t sem=runtime_resolve("188x57JYp0g#p#J",0);
     assert(sem && sem==runtime_resolve(K("188x57JYp0g"),0));
@@ -348,8 +372,12 @@ static void save_dialog_contract(void) {
     puts("PASS: SaveDataDialog GetResult identity, ABI, lifecycle and non-destructive acknowledgement");
 }
 int main(int argc,char **argv) {
+    SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX);
+    _set_error_mode(_OUT_TO_STDERR);
+    _set_abort_behavior(_WRITE_ABORT_MSG,_WRITE_ABORT_MSG|_CALL_REPORTFAULT);
     runtime_start(1);
-    if (argc>1 && !strcmp(argv[1],"--identities")) identities();
+    if (argc>1 && !strcmp(argv[1],"--cpu-upload-backing")) cpu_upload_backing();
+    else if (argc>1 && !strcmp(argv[1],"--identities")) identities();
     else if (argc>1 && !strcmp(argv[1],"--eventflags")) eventflags();
     else if (argc>2 && !strcmp(argv[1],"--playgo")) playgo(argv[2]);
     else if (argc>2 && !strcmp(argv[1],"--bad-playgo")) bad_playgo(argv[2]);

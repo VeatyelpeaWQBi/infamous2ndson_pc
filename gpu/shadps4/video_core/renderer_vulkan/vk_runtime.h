@@ -96,6 +96,7 @@ public:
                           bool check_read_access = false);
 
     void FlushBarriers();
+    void TrackIndirectRead(const VideoCore::Buffer* buffer,u64 offset,u64 size);
 
     /// bbport: runs before this thread changes image state (layouts, pending image
     /// barriers): the rasterizer joins its texture binding helper there (BindHelper).

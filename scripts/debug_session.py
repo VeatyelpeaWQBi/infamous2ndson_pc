@@ -155,6 +155,8 @@ def collect(command,cwd,base,profile,env=None):
                   'snapshot_slots':8,'snapshot_mark_slots':4,'snapshot_followup_slots':4,'snapshot_followups':3,'snapshot_interval_ms':1000,
                   'snapshot_manual_only':env.get('BB_CAPTURE_MANUAL_ONLY')=='1'},
         'settings':{key:env.get(key) for key in ('BB_GAME_PROFILE','BB_SHADER_SOURCE','BB_SHADER_BUNDLE','BB_IMAGE_READ_MEMO','BB_FLAT_DATA_MEMO','BB_PRESENT_MODE','BB_HDR','BB_FSR1','BB_UPSCALER','BB_GPU_PROFILE','BB_PREP_PRIORITY','BB_PIPELINE_CACHE','BB_DRAW_PIPE','BB_TEXTURE_HELPER','BB_VK_RECORD_THREAD','BB_FPS','BB_FPS_LIMIT','BB_VBLANK_HZ','BB_FRAMES_AHEAD','BB_CPU_WORD_SUMMARY','BB_BUFFER_PROFILE','BB_FAULT_CHUNK_WORDS','BB_READBACK_WINDOW_KIB','BB_READBACK_TRACE','BB_READBACK_PREFETCH','BB_READBACK_LRU','BB_CLEAN_ARENA_READ','BB_DESCRIPTOR_PACK',
+            'BB_DUMP_SHADERS','BB_ASYNC_PREFETCH','BB_READBACK_PREFETCH_INTERVAL_US','BB_READBACK_SPECULATIVE','BB_OCCLUSION_TRACE','BB_HW_WATCH','BB_BIND_TIMER_STRIDE','BB_FAULT_WINDOW','BB_READBACKS','BB_READBACK_FENCE_BATCH','BB_READBACK_COALESCE','BB_ASYNC_READBACK','BB_PARTICLE_LDS_MULTI',
+            'BB_BENCHMARK_INPUT','BB_PAD_FILE','BB_PAD_REPLAY','BB_INDIRECT_TRACK','BB_PARTICLE_GDS_SYNC',
             'BB_REGION','BB_LANGUAGE','BB_TIMEZONE_MINUTES','BB_ENTER_BUTTON','BB_PERF_STATS','BB_F10_DEEP')}}
     save_json(session/'manifest.json',manifest)
     executable=Path(command[0])
@@ -254,6 +256,9 @@ def collect(command,cwd,base,profile,env=None):
     # Finalize outside the dead game process: works for _exit(), host/guest faults and forced
     # termination, where the in-process recording toggle/destructors cannot run.
     save_json(session/'status.json',result)
+    import faulthandler
+    faulthandler.enable()
+    faulthandler.dump_traceback_later(15,repeat=True)
     try:
         recording_journal.checkpoint()
         from recover_performance_recording import recover, analyze
@@ -274,6 +279,7 @@ def collect(command,cwd,base,profile,env=None):
         result['performance_report_error']=str(error)
     save_json(session/'status.json',result); save_json(base/'active.json',result)
     print(f'Debug session ended: exit={status}; records: {session}',flush=True)
+    faulthandler.cancel_dump_traceback_later()
     return status
 
 def control(base,action):

@@ -137,6 +137,34 @@ void BufferCache::ExtendWriteFault(VAddr device_addr) {
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
+    static const bool async_readback=[] {
+        const char* value=std::getenv("BB_ASYNC_READBACK");return value && value[0]=='1';
+    }();
+    if(async_readback && !is_write && !assume_locks) {
+        for(unsigned attempt=0;attempt<3;++attempt) {
+            std::shared_ptr<PendingReadback> readback;
+            {
+                BbStats::Timer timer{BbStats::readback_begin_roundtrip_ns};
+                liverpool->SendCommand<true>([&] {readback=BeginReadback(device_addr,size);});
+            }
+            if(!readback) return;
+            // Use the semaphore directly: Scheduler::Wait can flush the active
+            // command buffer and must not be called by a guest fault thread.
+            {
+                BbStats::WaitTimer timer{BbStats::buffer_readback_wait_ns,&BbStats::readback_guest_wait_ns};
+                scheduler.GetWorkSemaphore()->Wait(readback->tick);
+            }
+            bool complete=false;
+            {
+                BbStats::Timer timer{BbStats::readback_complete_roundtrip_ns};
+                liverpool->SendCommand<true>([&] {complete=CompleteReadback(readback);});
+            }
+            if(complete) return;
+            BbStats::readback_retries.fetch_add(1,std::memory_order_relaxed);
+        }
+        // Repeated GPU writes need a serialized snapshot for forward progress.
+        // CPU writes and GPU-internal calls always retain the existing path.
+    }
     const auto original_ip=BbStats::fault_instruction;
     const auto write_bytes=BbStats::write_data_bytes;
     const auto flush_request = [this, device_addr, size, is_write,assume_locks,original_ip,write_bytes] {
@@ -172,7 +200,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         static const u64 WindowSize = [] {
             const char* value=std::getenv("BB_READBACK_WINDOW_KIB");
             const u64 kib=value ? std::strtoull(value,nullptr,10) : 512;
-            return std::bit_ceil(std::clamp<u64>(kib,4,512))*1024;
+            return std::bit_ceil(std::clamp<u64>(kib,4,4096))*1024;
         }();
         const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
         const VAddr window_start =
@@ -191,11 +219,122 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     }
 }
 
+std::shared_ptr<BufferCache::PendingReadback> BufferCache::BeginReadback(VAddr address,u64 size) {
+    if(!memory_tracker->IsRegionGpuModified(address,size)) return {};
+    static const bool async_prefetch=[] {
+        const char* value=std::getenv("BB_ASYNC_PREFETCH");return value && value[0]=='1';
+    }();
+    if(async_prefetch) {
+        for(auto& slot:readback_slots) {
+            auto& hint=slot.hint;
+            if(!hint.Matches(address,size) || !hint.Valid() || !slot.buffer ||
+               IsRegionCpuModified(hint.page,4096) || texture_cache.HasImageOverlap(hint.page,4096)) continue;
+            const auto* arena=GetArena(hint.page>>block_shift,(hint.page+4095)>>block_shift);
+            auto readback=std::make_shared<PendingReadback>();
+            readback->arena_base=arena->cpu_addr;readback->request=address;readback->request_size=size;
+            readback->version=ReadbackVersion{{{hint.page,hint.page+4096}}};
+            // Publish GPU-owned bytes only, never overwrite the rest of a page
+            // with arena contents that may not mirror its CPU-owned backing.
+            gpu_modified_ranges.ForEachInRange(hint.page,4096,[&](VAddr begin,VAddr end) {
+                readback->copies.push_back({begin-arena->cpu_addr,begin-hint.page,end-begin});
+            });
+            readback->tick=hint.Detach();readback->bytes=4096;
+            readback->buffer=std::move(slot.buffer);
+            slot.last_use=++readback_use_serial;
+            pending_readback_versions.push_back(&readback->version);
+            BbStats::readback_prefetch_hits.fetch_add(1,std::memory_order_relaxed);
+            // The exact existing GPU copy is now owned by the fault request.
+            // The guest waits for its tick; the GPU command thread keeps working.
+            return readback;
+        }
+    }
+    if(TryPrefetchedReadback(address,size)) return {};
+    NoteReadbackPage(address);
+    const auto* arena=GetArena(address>>block_shift,(address+size-1)>>block_shift);
+    static const u64 window=[] {
+        const char* value=std::getenv("BB_READBACK_WINDOW_KIB");
+        return std::bit_ceil(std::clamp<u64>(value ? std::strtoull(value,nullptr,10) : 512,4,4096))*1024;
+    }();
+    const auto begin=std::max<VAddr>(Common::AlignDown(address,window),arena->cpu_addr);
+    const auto end=std::min<VAddr>(std::max<VAddr>(begin+window,address+size),arena->cpu_addr+arena->size_bytes);
+    auto readback=std::make_shared<PendingReadback>();readback->arena_base=arena->cpu_addr;
+    readback->request=address;readback->request_size=size;
+    static const bool coalesce=[] {
+        const char* value=std::getenv("BB_READBACK_COALESCE");return value && value[0]=='1';
+    }();
+    readback->version.windows=coalesce
+        ? CoalescedReadbackWindows(begin,end,arena->cpu_addr,arena->cpu_addr+arena->size_bytes,window,readback_slots)
+        : std::vector<std::pair<VAddr,VAddr>>{{begin,end}};
+    readback->version.Capture();
+    for(const auto [start,finish]:readback->version.windows) {
+        memory_tracker->ForEachDownloadRange<false>(start,finish-start,[&](VAddr dirty,u64 bytes) {
+            gpu_modified_ranges.ForEachInRange(dirty,bytes,[&](VAddr first,VAddr last) {
+                readback->copies.push_back({first-arena->cpu_addr,readback->bytes,last-first});
+                readback->bytes=Common::AlignUp(readback->bytes+last-first,u64{64});
+            });
+        });
+    }
+    if(!readback->bytes) return {};
+    // Each pending snapshot owns its host allocation until its exact GPU tick
+    // completes. Ring staging may be reused while the guest waits.
+    const auto spare=std::find_if(readback_pool.begin(),readback_pool.end(),[&](const auto& buffer) {
+        return buffer->size_bytes>=readback->bytes;
+    });
+    if(spare!=readback_pool.end()) {
+        readback_pool_bytes-=(*spare)->size_bytes;
+        readback->buffer=std::move(*spare);readback_pool.erase(spare);
+    } else readback->buffer=std::make_unique<Buffer>(instance,0,readback->bytes,MemoryType::HostCached);
+    pending_readback_versions.push_back(&readback->version);
+    runtime.CopyBuffer(arena,readback->buffer.get(),readback->copies);
+    readback->tick=scheduler.CurrentTick();scheduler.Flush();
+    BbStats::buffer_readback_calls.fetch_add(1,std::memory_order_relaxed);
+    BbStats::buffer_readback_bytes.fetch_add(readback->bytes,std::memory_order_relaxed);
+    return readback;
+}
+
+bool BufferCache::CompleteReadback(const std::shared_ptr<PendingReadback>& readback) {
+    std::erase(pending_readback_versions,&readback->version);
+    const auto recycle=[&] {
+        if(readback_pool.size()<8 && readback_pool_bytes+readback->buffer->size_bytes<=64_MB) {
+            readback_pool_bytes+=readback->buffer->size_bytes;
+            readback_pool.push_back(std::move(readback->buffer));
+        }
+    };
+    readback->buffer->Invalidate(0,readback->bytes);
+    for(const auto& copy:readback->copies) {
+        const auto address=readback->arena_base+copy.srcOffset;
+        readback->version.ForEachCurrentRange(address,copy.size,[&](VAddr begin,VAddr end) {
+            memory->TryWriteBacking(std::bit_cast<u8*>(begin),
+                readback->buffer->mapped_data.data()+copy.dstOffset+begin-address,end-begin);
+        });
+    }
+    for(const auto [start,finish]:readback->version.windows) {
+      readback->version.ForEachCurrentRange(start,finish-start,[&](VAddr begin,VAddr end) {
+        gpu_modified_ranges.Subtract(begin,end-begin);
+        memory_tracker->UnmarkRegionAsGpuModified(begin,end-begin);
+        NoteReadbackWrite(begin,end-begin); // Reject older overlapping snapshots.
+      });
+    }
+    const bool complete=!memory_tracker->IsRegionGpuModified(readback->request,readback->request_size);
+    recycle();return complete;
+}
+
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     const VAddr arena_base = arena->cpu_addr;
-    memory_tracker->ForEachDownloadRange<false>(device_addr, size, [&](u64 address, u64 size) {
+    static const bool coalesce=[] {
+        const char* value=std::getenv("BB_READBACK_COALESCE");return value && value[0]=='1';
+    }();
+    auto windows=std::vector<std::pair<VAddr,VAddr>>{{device_addr,device_addr+size}};
+    if(coalesce) {
+        const char* value=std::getenv("BB_READBACK_WINDOW_KIB");
+        const u64 window=std::bit_ceil(std::clamp<u64>(value ? std::strtoull(value,nullptr,10) : 512,4,4096))*1024;
+        windows=CoalescedReadbackWindows(device_addr,device_addr+size,arena_base,
+                                         arena_base+arena->size_bytes,window,readback_slots);
+    }
+    for(const auto [begin,end]:windows) {
+      memory_tracker->ForEachDownloadRange<false>(begin, end-begin, [&](u64 address, u64 size) {
         const auto add_download = [&](VAddr start, VAddr end) {
             const u64 new_offset = start - arena_base;
             const u64 new_size = end - start;
@@ -211,11 +350,12 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         };
         gpu_modified_ranges.ForEachInRange(address, size, add_download);
         gpu_modified_ranges.Subtract(address, size);
-    });
+      });
+    }
     if (total_size_bytes == 0) {
         return;
     }
-    NoteReadbackWrite(device_addr,size); // An on-demand readback changes CPU/GPU ownership.
+    for(const auto [begin,end]:windows) NoteReadbackWrite(begin,end-begin);
     BbStats::buffer_readback_calls.fetch_add(1,std::memory_order_relaxed);
     BbStats::buffer_readback_bytes.fetch_add(total_size_bytes,std::memory_order_relaxed);
     const auto download = staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached);
@@ -223,7 +363,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         copy.dstOffset += download.offset;
     }
     runtime.CopyBuffer(arena, download.buffer, copies);
-    {BbStats::WaitTimer timer{BbStats::buffer_readback_wait_ns};scheduler.Finish();}
+    {BbStats::WaitTimer timer{BbStats::buffer_readback_wait_ns,&BbStats::readback_gpu_wait_ns};scheduler.Finish();}
 
     download.buffer->Invalidate(download.offset, download.size);
     for (const auto& copy : copies) {
@@ -231,7 +371,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         memory->TryWriteBacking(dst_addr, download.mapped + (copy.dstOffset - download.offset),
                                 copy.size);
     }
-    memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
+    for(const auto [begin,end]:windows) memory_tracker->UnmarkRegionAsGpuModified(begin,end-begin);
 }
 
 namespace {
@@ -324,7 +464,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         NoteHotUse(device_addr, size);
     }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
-    if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
+    if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size) &&
+        !(is_texel_buffer && texture_cache.HasImageOverlap(device_addr,size))) {
         static const bool clean_arena=[] {
             const char* value=std::getenv("BB_CLEAN_ARENA_READ");return value && value[0]=='1';
         }();
@@ -456,6 +597,7 @@ void BufferCache::NoteReadbackPage(VAddr address) {
     victim->last_use=++readback_use_serial;
 }
 void BufferCache::NoteReadbackWrite(VAddr address,u64 size) {
+    for(auto* version:pending_readback_versions) version->Write(address,size);
     if(!ReadbackPrefetchEnabled()) return;
     for(auto& slot:readback_slots) if(slot.hint.page) slot.hint.Write(address,size);
 }
@@ -463,8 +605,30 @@ void BufferCache::InvalidateReadbackHints() {
     if(!ReadbackPrefetchEnabled()) return;
     for(auto& slot:readback_slots) if(slot.hint.page) slot.hint.Write(slot.hint.page,4096);
 }
-void BufferCache::PrefetchReadbacks() {
+void BufferCache::PrefetchReadbacks(bool fence_boundary) {
     if(!ReadbackPrefetchEnabled()) return;
+    // Keep demand-page learning and coalesced readbacks active when measuring
+    // the cost of speculative copies. BB_READBACK_PREFETCH=0 disables both and
+    // cannot isolate the extra GPU submissions made here.
+    static const bool speculative=[] {
+        const char* value=std::getenv("BB_READBACK_SPECULATIVE");
+        return !value || value[0]!='0';
+    }();
+    if(!speculative) return;
+    // Precise mode can expose many counters per emitter. A diagnostic option
+    // batches learned snapshots at guest synchronization points instead of
+    // repeatedly capturing versions invalidated by subsequent dispatches.
+    static const bool at_fences=[] {
+        const char* value=std::getenv("BB_READBACK_FENCE_BATCH");return value && value[0]=='1';
+    }();
+    if(fence_boundary!=at_fences) return;
+    static const u64 interval_ns=[] {
+        const char* value=std::getenv("BB_READBACK_PREFETCH_INTERVAL_US");
+        return std::clamp<u64>(value ? std::strtoull(value,nullptr,10) : 0,0,10000)*1000;
+    }();
+    const u64 now_ns=interval_ns ? std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() : 0;
+    if(!fence_boundary && !readback_prefetch_gate.Ready(now_ns,interval_ns)) return;
     bool queued=false;
     for(auto& slot:readback_slots) {
         auto& hint=slot.hint;
@@ -480,7 +644,10 @@ void BufferCache::PrefetchReadbacks() {
         queued=true;
         BbStats::readback_prefetches.fetch_add(1,std::memory_order_relaxed);
     }
-    if(queued) scheduler.Flush(); // Signal snapshots before unrelated later rendering can extend their wait.
+    if(queued) {
+        readback_prefetch_gate.Queued(now_ns);
+        scheduler.Flush(); // Signal snapshots before unrelated later rendering can extend their wait.
+    }
 }
 bool BufferCache::TryPrefetchedReadback(VAddr address,u64 size) {
     if(!ReadbackPrefetchEnabled()) return false;
@@ -488,7 +655,7 @@ bool BufferCache::TryPrefetchedReadback(VAddr address,u64 size) {
         auto& hint=slot.hint;
         if(!hint.Matches(address,size) || !hint.Valid() || !slot.buffer || IsRegionCpuModified(hint.page,4096)) continue;
         if(texture_cache.HasImageOverlap(hint.page,4096)) continue;
-        {BbStats::WaitTimer timer{BbStats::buffer_readback_wait_ns};scheduler.Wait(hint.tick);}
+        {BbStats::WaitTimer timer{BbStats::buffer_readback_wait_ns,&BbStats::readback_gpu_wait_ns};scheduler.Wait(hint.tick);}
         slot.buffer->Invalidate(0,4096);
         bool copied=true;
         gpu_modified_ranges.ForEachInRange(hint.page,4096,[&](VAddr a,VAddr b) {

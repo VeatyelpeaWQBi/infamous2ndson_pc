@@ -182,7 +182,10 @@ static int split_at(uintptr_t a) {
     if (i==vma_count || vmas[i].start>=a) return 0;
     Vma right=vmas[i];
     right.start=a;
-    if (right.kind==KIND_DIRECT) right.phys+=a-vmas[i].start;
+    // Windows flexible mappings use the same backing section as direct ones.
+    // Keeping the left offset on a split redirected readbacks/uploads to the
+    // beginning of the allocation and could zero the surviving half on unmap.
+    if (right.kind!=KIND_RESERVED) right.phys+=a-vmas[i].start;
     vmas[i].end=a;
     return vma_insert(i+1,right);
 }
@@ -618,7 +621,25 @@ void runtime_memory_set_gpu_hooks(GpuRange map, GpuRange unmap, GpuRange invalid
     write_unlock();
     flush_hooks();
 }
-/* Writes through the backing view; 0 when part of the range has no backing. */
+/* Upstream 312ed755: upload reads bypass GPU protection. Gaps/reservations
+ * read as zero. Never use this helper to satisfy a real guest GPU readback. */
+void runtime_memory_read_backing(uintptr_t address,void *data,uint64_t size) {
+    /* Local boundary hardening retained around the upstream algorithm. */
+    if (size>UINTPTR_MAX-address || (size && !data)) return;
+    unsigned char *out=data;
+    read_lock();
+    for(uintptr_t at=address,end=address+size;at<end;) {
+        size_t i=vma_index(at);
+        int mapped=i<vma_count && vmas[i].start<=at;
+        uintptr_t next=i==vma_count ? end : mapped ? vmas[i].end : vmas[i].start;
+        if(next>end) next=end;
+        if(mapped && vmas[i].kind!=KIND_RESERVED)
+            memcpy(out+(at-address),backing_base+vmas[i].phys+(at-vmas[i].start),next-at);
+        else memset(out+(at-address),0,next-at);
+        at=next;
+    }
+    read_unlock();
+}
 int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t size) {
     read_lock();
     int ok=1;

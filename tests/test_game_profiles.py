@@ -20,16 +20,31 @@ def sfo_fixture(title):
 
 
 class GameProfiles(unittest.TestCase):
+    def test_relocated_game_resource_path_and_explicit_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            expected=Path(tmp)/'game/CUSA00309'
+            self.assertEqual(game_profiles.project_game_dir(tmp),expected)
+            env={};game_profiles.native_environment({'id':'infamous','title_id':'CUSA00309'},tmp,env)
+            self.assertEqual(Path(env['BB_SHADER_SOURCE']),expected/'art/cache/all_shaders.xpps')
+            env={'BB_GAME_DIR':str(Path(tmp)/'custom/CUSA00309')}
+            game_profiles.native_environment({'id':'infamous','title_id':'CUSA00309'},tmp,env)
+            self.assertEqual(Path(env['BB_SHADER_SOURCE']),Path(env['BB_GAME_DIR'])/'art/cache/all_shaders.xpps')
     def test_infamous_readback_and_pacing_defaults_keep_explicit_diagnostic_overrides(self):
         with tempfile.TemporaryDirectory() as tmp:
             env={};game_profiles.native_environment({'id':'infamous','title_id':'CUSA00309'},tmp,env)
             self.assertEqual(env['BB_READBACK_PREFETCH'],'1')
             self.assertEqual(env['BB_FPS_LIMIT'],'60')
             self.assertEqual(env['BB_CPU_WORD_SUMMARY'],'1')
-            env={'BB_READBACK_PREFETCH':'0','BB_FPS_LIMIT':'0','BB_CPU_WORD_SUMMARY':'0'}
+            self.assertEqual(env['BB_READBACKS'],'2')
+            for key in ('BB_ASYNC_READBACK','BB_READBACK_COALESCE','BB_CLEAN_ARENA_READ','BB_DESCRIPTOR_PACK'):
+                self.assertEqual(env[key],'1')
+            self.assertEqual(env['BB_READBACK_WINDOW_KIB'],'4096')
+            env={'BB_READBACK_PREFETCH':'0','BB_FPS_LIMIT':'0','BB_CPU_WORD_SUMMARY':'0','BB_READBACKS':'1','BB_ASYNC_READBACK':'0'}
             game_profiles.native_environment({'id':'infamous','title_id':'CUSA00309'},tmp,env)
             for key in ('BB_READBACK_PREFETCH','BB_FPS_LIMIT','BB_CPU_WORD_SUMMARY'):
                 self.assertEqual(env[key],'0')
+            self.assertEqual(env['BB_READBACKS'],'1')
+            self.assertEqual(env['BB_ASYNC_READBACK'],'0')
             other={};game_profiles.native_environment({'id':'bloodborne'},tmp,other)
             self.assertFalse(other)
     def test_infamous_presentation_is_synchronized_and_memo_override_preserved(self):

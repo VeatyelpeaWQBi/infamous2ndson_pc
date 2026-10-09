@@ -9,12 +9,26 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import debug_session
-from recover_performance_recording import RecordingJournal, read_frames, recover, analyze
+from recover_performance_recording import RecordingJournal, read_frames, recover, analyze, merge_native_journal
 
 HEADER = 'sequence,tick_ms,interval_ns,dropped_frames,draws,compile_count,bind_ns\n'
 
 
 class PerformanceRecordingTests(unittest.TestCase):
+    def test_wrapped_recording_join_preserves_same_tick_slow_and_catchup_frames(self):
+        journal=[{'sequence':i+100,'tick_ms':1000+i//2,'interval_ns':223000000 if i==3 else i*100,
+                  'draws':i,'dropped_frames':0} for i in range(1,7)]
+        native=[{k:(r[k]-100 if k=='sequence' else r[k]) for k in r if k!='dropped_frames'}
+                for r in journal[2:]]
+        native.append({'sequence':7,'tick_ms':1004,'interval_ns':700,'draws':7})
+        result=merge_native_journal(native,journal)
+        self.assertEqual([r['sequence'] for r in result],list(range(101,108)))
+        self.assertEqual(result[2]['interval_ns'],223000000)
+        self.assertEqual(len(result),7)
+        conflicting=[dict(r) for r in native]; conflicting[0]['draws']=999
+        with self.assertRaises(ValueError): merge_native_journal(conflicting,journal)
+        self.assertEqual(journal[0]['sequence'],101)
+
     def test_binding_detail_survives_recording_and_legacy_data_stays_readable(self):
         with tempfile.TemporaryDirectory() as tmp:
             path=Path(tmp)/'recording.csv'

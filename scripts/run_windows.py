@@ -6,7 +6,7 @@ out/bb-probe.exe. Uses existing Windows Python and the MSYS2 CLANG64 toolchain.
     run.bat [--game-dir DIR] [bb-probe options...]
 
 The game folder: --game-dir, else BB_GAME_DIR, else the last one used (out/game_dir.txt), else
-patches/CUSA00309 inside this project.
+game/CUSA00309 inside this project.
 Unless BB_PREBUILT=1
 the port is (re)built first through MSYS2 (build.sh in the CLANG64 environment)."""
 import os
@@ -16,7 +16,8 @@ import subprocess
 import sys
 from mods import remove_overlay
 from windows_tools import build as windows_build, msys_root, require_windows
-from game_profiles import select_profile, native_environment
+from game_profiles import select_profile, native_environment, project_game_dir
+from settings_defaults import DEFAULTS
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / 'scripts'
@@ -42,12 +43,12 @@ def build():
 
 def settings_value(config, key):
     if not config.is_file():
-        return None
+        return DEFAULTS.get(key)
     for line in config.read_text(errors='replace').splitlines():
         name, _, value = line.partition('=')
         if name.strip() == key:
             return value.strip()
-    return None
+    return DEFAULTS.get(key)
 
 
 def main():
@@ -67,7 +68,7 @@ def main():
     remembered = out / 'game_dir.txt'
     if not game and remembered.is_file():
         game = remembered.read_text(encoding='utf-8').strip()
-    game = Path(game) if game else ROOT / 'patches/CUSA00309'
+    game = Path(game) if game else project_game_dir(ROOT)
     if not (game / 'eboot.bin').is_file():
         sys.exit(f'No eboot.bin in {game} (pass --game-dir or set BB_GAME_DIR).')
     original = game.resolve()
@@ -111,7 +112,7 @@ def main():
             build()
         live = '0'
         if scaled_output:
-            live = os.environ.get('BB_LIVE_RES') or settings_value(config, 'live_resolution') or '0'
+            live = os.environ.get('BB_LIVE_RES') or settings_value(config, 'live_resolution')
             if live == 'auto':
                 caps = ROOT / 'out/bb-gpu-capabilities.exe'
                 live = run([caps, '--live-resolution'], capture=True, check=False) or '0'

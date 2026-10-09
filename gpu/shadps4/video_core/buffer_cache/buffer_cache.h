@@ -14,6 +14,7 @@
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/buffer_cache/readback_hint.h"
+#include "video_core/buffer_cache/readback_version.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 
 namespace AmdGpu {
@@ -91,7 +92,7 @@ public:
     /// Finds a buffer for the specified region.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
                                                              bool is_written,
-                                                             bool is_texel_buffer = false);
+                                                           bool is_texel_buffer = false);
 
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
@@ -102,9 +103,10 @@ public:
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
     void ForgetReadbacks(VAddr addr,u64 size) {
+        for(auto* version:pending_readback_versions) version->Write(addr,size);
         for(auto& slot:readback_slots) if(slot.hint.Overlaps(addr,size)) slot.hint.Forget();
     }
-    void PrefetchReadbacks();
+    void PrefetchReadbacks(bool fence_boundary=false);
     void InvalidateReadbackHints();
 
     /// Processes the fault buffer.
@@ -135,6 +137,22 @@ private:
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
+    // AYOUB1080p 153a5aa's wait-on-guest-thread design, integrated with local
+    // upload ownership and version checks instead of importing its scheduler.
+    struct PendingReadback {
+        ReadbackVersion version;
+        std::unique_ptr<Buffer> buffer;
+        std::vector<vk::BufferCopy> copies;
+        VAddr arena_base{};
+        VAddr request{};
+        u64 request_size{};
+        u64 bytes{},tick{};
+    };
+    std::shared_ptr<PendingReadback> BeginReadback(VAddr address,u64 size);
+    bool CompleteReadback(const std::shared_ptr<PendingReadback>& readback);
+    std::vector<ReadbackVersion*> pending_readback_versions; // GPU thread only.
+    std::vector<std::unique_ptr<Buffer>> readback_pool;
+    u64 readback_pool_bytes{}; // At most 64 MiB of completed host allocations.
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
@@ -170,6 +188,7 @@ private:
     struct ReadbackSlot {ReadbackHint hint;std::unique_ptr<Buffer> buffer;u64 last_use{};};
     std::array<ReadbackSlot,8> readback_slots{};
     u64 readback_use_serial{};
+    ReadbackPrefetchGate readback_prefetch_gate;
     bool ReadbackPrefetchEnabled() const;
     bool TryPrefetchedReadback(VAddr address,u64 size);
     void NoteReadbackPage(VAddr address);

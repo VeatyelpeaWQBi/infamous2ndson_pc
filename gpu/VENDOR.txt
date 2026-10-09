@@ -32,3 +32,56 @@ Local Second Son startup fixes (2026-10-06): vk_scheduler.h grows recording
   scheduler/rasterizer/presenter record executed command context and present
   counters, and assert.cpp attempts a fault-time flush. Presenter readback is
   interval-limited, overwrites one BMP, and caps diagnostic images at 1080p.
+
+Selected Second Son backports (2026-10-08, user-requested source comparison):
+  shadPS4 v.0.19.0 c7e065d1b415be16c23e260a21f1dd8bbfc4cb57 and
+  shadPS4-AYOUB1080p 153a5aa7f6b6be0e547d46719b793cb5145571d7
+  (https://github.com/weshayoub92/shadPS4-AYOUB1080p, GPL-2.0-or-later):
+  multi-wave LDS barriers, legacy MAC/MAD multiplication semantics, dynamic
+  unnormalized sampler recognition, 1D atomic coordinates, local GDS lane-use
+  replacement. Local GDS integration additionally corrects intermediate consume
+  user selection. ShaderBinaryVersion 8 rejects earlier translated modules.
+  buffer_cache integrates the fork's wait-on-guest-thread readback design with
+  owned/page-versioned snapshots and bounded recycling; the CUSA00309 launch
+  profile enables BB_ASYNC_READBACK together with precise readbacks.
+  The fork's scheduler, cross-queue machinery, shader-skipping policy and game
+  address patches are not imported. Original game files remain read-only.
+  See docs/INFAMOUS_REFERENCE_COMPARISON.2026-10-08.zh-CN.md.
+
+Local reverse-analysis tooling and measurement fixes (2026-10-09):
+  vk_gpu_profiler recycles timestamp query slices only after their exact GPU
+  submission completes; it does not wait for queries or reset in-flight slots.
+  vk_pipeline_cache can export original GCN even on a translated-cache hit
+  when BB_DUMP_SHADERS=1. The offline test decoder uses the existing production
+  GCN decoder. No game program or shader package is changed.
+  BB_READBACK_SPECULATIVE is a diagnostic control for speculative copies only;
+  demand-page learning, precise ownership and coalesced downloads stay active.
+  Experimental async-prefetch/interval controls remain off by default after
+  negative end-to-end measurements. The GPU dirty-reuse experiment was removed
+  after an A/B/B/A run showed no reproducible gain.
+  See docs/INFAMOUS_REVERSE_ANALYSIS.2026-10-09.zh-CN.md for evidence and limits.
+  Local opt-in BB_BIND_TIMER_STRIDE samples five high-frequency bind/select
+  diagnostic timers with independent PRNG streams; default 1 keeps exact timing.
+  Real-game repeats reduced command-thread CPU cost but did not establish FPS
+  gains. Synchronization waits and frame intervals remain exact.
+  Readback telemetry separates guest-thread waits from GPU command-thread waits
+  and records command round trips/retries without changing synchronization.
+  BB_OCCLUSION_TRACE is bounded, default-off query consumer diagnostics; it does
+  not replace query results or remove game rendering.
+
+User-selected yumlevi/bloodborne_pc windows-port changes (2026-10-09):
+  dfa0dcfd499561cb55bf736645e03c6dd17d10b1: shared bbport.ini defaults/effects
+  table, consumed by engine, Windows setup and local Windows launcher. Relative
+  include paths support standalone tests; existing Second Son title/env overrides
+  remain effective. Linux launcher changes are outside this project's scope.
+  312ed755f9ce3d015fa2909cbcd7064c22d4221f: precise-mode CopySparseMemory
+  uploads read runtime_memory_read_backing. Removed the local CopyCpuUpload /
+  runtime_memory_copy_cpu_upload implementation and migrated all upload callers.
+  The upstream backing-view algorithm retains a local overflow/null guard;
+  real guest reads still use precise readbacks and page-version validation.
+  d7a53a5bf835484648dbff427d3061b8aa7e68da: LRU invoke_result_t early-stop
+  fix, actual-eviction budgeting and kept-tiled-image reporting. Regression tests
+  exercise the real LRU and TextureCache collector (metadata-only registered
+  images on a Vulkan-backed fixture; no guest memory access).
+  No full upstream merge, unified cross-platform launcher or Russian menu
+  translation was imported. Game files remain read-only.

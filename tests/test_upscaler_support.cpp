@@ -15,7 +15,19 @@ int main() {
     test_unsetenv("BB_UPSCALER");
     test_unsetenv("BB_UPSCALE_PRESET");
     test_unsetenv("BB_RENDER_RES");
+    test_unsetenv("BB_SHOW_FPS");
+    test_unsetenv("BB_MENU_LANGUAGE");
     auto& s = Get();
+    // Missing keys must reset to the shared table, not retain previous menu values.
+    {FILE* file=std::fopen(path,"w");assert(file);std::fclose(file);}
+    s.sharpness=1.8f;s.show_fps=true;s.menu_language=MenuRussian;
+    Load();assert(s.upscaler==UpscalerFsr3 && s.preset==NativeAA);
+    assert(s.sharpness==0.3f && !s.show_fps && s.menu_language==MenuEnglish);
+    {FILE* file=std::fopen(path,"w");assert(file);
+     std::fputs("show_fps=1\nsharpness=0.75\nmenu_language=ru\n",file);std::fclose(file);}
+    Load();assert(s.show_fps && s.sharpness==0.75f && s.menu_language==MenuRussian);
+    test_setenv("BB_SHOW_FPS","0");Load();assert(!s.show_fps);
+    test_unsetenv("BB_SHOW_FPS");
     s.upscaler = UpscalerTaa;
     s.preset = Performance;
     assert(RenderPreset() == NativeAA && s.preset == Performance);

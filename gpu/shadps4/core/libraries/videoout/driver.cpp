@@ -317,7 +317,8 @@ void VideoOutDriver::Flip(const Request& req) {
             buffer_stream_calls.load(),buffer_arena_calls.load(),buffer_residency_ns.load(),buffer_sync_ns.load(),buffer_alias_ns.load(),
             fault_slot_wait_ns.load(),frame_ahead_wait_ns.load(),stream_reuse_wait_ns.load(),
             buffer_readback_wait_ns.load(),image_readback_wait_ns.load(),gds_store_wait_ns.load(),
-            buffer_readback_calls.load(),buffer_readback_bytes.load(),readback_prefetches.load(),readback_prefetch_hits.load(),clean_arena_read_hits.load(),descriptor_bind_ns.load()});
+            buffer_readback_calls.load(),buffer_readback_bytes.load(),readback_prefetches.load(),readback_prefetch_hits.load(),clean_arena_read_hits.load(),descriptor_bind_ns.load(),
+            readback_guest_wait_ns.load(),readback_gpu_wait_ns.load(),readback_begin_roundtrip_ns.load(),readback_complete_roundtrip_ns.load(),readback_retries.load()});
     }
     // Numeric bounded telemetry replaces verbose per-stall text and preserves
     // cumulative counters; do not exchange/reset them underneath Frame().

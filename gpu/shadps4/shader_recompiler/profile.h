@@ -50,6 +50,8 @@ struct Profile {
     /// bbport: NVIDIA without fragment shader barycentrics (Pascal and older).
     bool needs_integer_interpolation_fix{};
     bool needs_lds_barriers{};
+    // bbport: AYOUB1080p 153a5aa, GCN wave64 split across host subgroups.
+    bool lds_barriers_multi_wave{};
     bool needs_buffer_offsets{};
     bool needs_unorm_fixup{};
     bool needs_clip_distance_emulation{};

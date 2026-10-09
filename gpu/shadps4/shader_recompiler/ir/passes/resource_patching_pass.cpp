@@ -400,7 +400,7 @@ static void RemoveAppendBufferLaneOffset(IR::Inst& vx) {
     IR::U1 exec{vx.Arg(1)};
     const auto uses = vx.Uses();
     for (auto use : uses) {
-        const auto& [user, operand] = use;
+        auto& [user, operand] = use;
         if (user->GetOpcode() == IR::Opcode::MaskedBitCount32) {
             // First pattern
             ASSERT(vx.GetOpcode() == IR::Opcode::DataAppend);
@@ -435,7 +435,9 @@ static void RemoveAppendBufferLaneOffset(IR::Inst& vx) {
         ASSERT(!vy.IsEmpty() && !vy.IsImmediate());
         auto zero_const = IsMbcntWithExec(vy, true, exec);
         ASSERT(!zero_const.IsEmpty() && zero_const.IsImmediate() && zero_const.U32() == 0u);
-        vz.Inst()->ReplaceUsesWithAndRemove(IR::Value{u32{0u}});
+        // bbport: upstream v0.19.0 / AYOUB1080p 153a5aa. Remove the lane
+        // offset from this append/consume use only; it can serve other users.
+        user->SetArg(1 - operand, IR::Value{u32{0u}});
     }
 }
 

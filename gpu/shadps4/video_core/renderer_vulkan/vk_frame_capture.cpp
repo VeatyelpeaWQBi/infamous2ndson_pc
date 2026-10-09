@@ -21,6 +21,7 @@ struct Target {
     VAddr address{};
     vk::Format format{};
     u32 width{}, height{};
+    u32 depth{},layers{},levels{},type{};
     bool operator==(const Target&) const = default;
 };
 
@@ -34,6 +35,7 @@ struct Entry {
     std::vector<std::pair<Target, bool>> sampled; ///< textures (false) and storage images (true)
     std::string note;
     std::vector<std::string> buffers; ///< dumped constants, per draw
+    std::vector<std::pair<u64,std::string>> draw_states;
 };
 
 // GPU thread only.
@@ -47,7 +49,9 @@ std::vector<PendingBuffer> pending_buffers;
 size_t buffer_bytes = 0;
 size_t geometry_buffer_bytes = 0;
 bool truncated = false;
-constexpr size_t MaxEntries = 256, MaxBufferBytes = 128 * 1024;
+constexpr size_t MaxEntries = 2048, MaxBufferBytes = 128 * 1024;
+constexpr size_t MaxDrawStates = 1024;
+size_t draw_states=0;
 
 void AddBuffers(Entry& entry,bool priority=false) {
     // Constants of full-screen passes (post-processing: camera matrices) and of the first draw
@@ -77,14 +81,16 @@ std::array<std::atomic<VAddr>, 16> display_list{};
 std::atomic<u32> display_count{0};
 
 Target ToTarget(const VideoCore::ImageInfo& info) {
-    return {info.guest_address, info.pixel_format, info.size.width, info.size.height};
+    return {info.guest_address, info.pixel_format, info.size.width, info.size.height,
+            info.size.depth,info.resources.layers,info.resources.levels,u32(info.type)};
 }
 
 std::string Describe(const Target& t) {
     if (!t.address) {
         return "-";
     }
-    return std::format("{:#x} {} {}x{}", t.address, vk::to_string(t.format), t.width, t.height);
+    return std::format("{:#x} {} {}x{} depth={} layers={} levels={} type={}",
+        t.address,vk::to_string(t.format),t.width,t.height,t.depth,t.layers,t.levels,t.type);
 }
 
 void AddSampled(Entry& entry) {
@@ -139,6 +145,8 @@ void Write(VAddr presented) {
         if (!e.note.empty()) {
             std::fprintf(f, "  note: %s\n", e.note.c_str());
         }
+        for (const auto& [key,text]:e.draw_states) std::fprintf(f,"  DRAW_STATE key=%#llx %s\n",
+            static_cast<unsigned long long>(key),text.c_str());
         for (const auto& b : e.buffers) {
             std::fprintf(f, "%s\n", b.c_str());
         }
@@ -221,6 +229,7 @@ void FrameCapture::BeginPass(const VideoCore::ImageInfo* const* colors, u32 num_
         pending_buffers.clear();
         pass_open = false;
         buffer_bytes = 0;
+        draw_states=0;
         geometry_buffer_bytes = 0;
         truncated = false;
         state.store(Recording, std::memory_order_release);
@@ -254,6 +263,16 @@ void FrameCapture::Draw(u64 vs_hash, u64 ps_hash, u32 num_indices, u32 num_insta
     AddShader(e, ps_hash);
     AddSampled(e);
     AddBuffers(e,num_indices<=6 && num_instances==1);
+}
+
+void FrameCapture::CaptureDrawState(u64 pipeline_key,u64 vs_hash,u64 ps_hash,const char* text) {
+    if (state.load(std::memory_order_relaxed)!=Recording || entries.empty() || entries.back().compute) return;
+    auto& list=entries.back().draw_states;
+    if (std::ranges::find(list,pipeline_key,[](const auto& item){return item.first;})!=list.end()) return;
+    if (draw_states>=MaxDrawStates || list.size()>=64) { truncated=true;return; }
+    ++draw_states;
+    list.emplace_back(pipeline_key,std::format("vs={:016x} ps={:016x} {}",vs_hash,ps_hash,
+        std::string_view{text,std::min<size_t>(std::strlen(text),512)}));
 }
 
 void FrameCapture::Dispatch(u64 cs_hash, u32 x, u32 y, u32 z) {

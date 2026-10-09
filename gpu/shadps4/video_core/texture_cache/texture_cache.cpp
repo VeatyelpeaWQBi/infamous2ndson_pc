@@ -17,6 +17,7 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/buffer_cache/cpu_backing_hash.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -29,6 +30,17 @@ namespace VideoCore {
 
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
+
+static u64 HashCpuBacking(VAddr address,u64 size) {
+    // Texture mutex is held here. Reading protected guest pages can re-enter the
+    // buffer/texture caches and deadlock; the hash describes CPU upload changes,
+    // so use their unprotected backing version. GPU-owned image data is still
+    // obtained through ObtainBufferForImage, never this checksum.
+    thread_local CpuBackingHasher hasher;
+    return hasher.Hash(address,size,[](VAddr source,u8* data,u64 bytes) {
+        Core::Memory::Instance()->CopySparseMemory(source,data,bytes);
+    });
+}
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
@@ -230,7 +242,7 @@ void TextureCache::DumpImagesAt(VAddr address, const char* dir) {
 /// first check never matched). Such an image lies within the faulting page: cheap to hash
 /// whole, and a CPU write past its first pixels still counts.
 u64 TextureCache::MaybeDirtyHash(const Image& image) {
-    return XXH3_64bits(std::bit_cast<const u8*>(image.info.guest_address), image.info.guest_size);
+    return HashCpuBacking(image.info.guest_address,image.info.guest_size);
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
@@ -932,8 +944,7 @@ void TextureCache::RefreshImage(Image& image) {
         // had no reference, and the first CPU write anywhere in its page replaced the GPU's
         // contents with stale guest memory (a 1x1 exposure texture computed once: the
         // character creation preview went black after one frame).
-        const u8* mip_addr = std::bit_cast<u8*>(image.info.guest_address) + mip_offset;
-        const u64 mip_hash = XXH3_64bits(mip_addr, mip_size);
+        const u64 mip_hash = HashCpuBacking(image.info.guest_address+mip_offset,mip_size);
         if (is_gpu_modified && !is_gpu_dirty && image.mip_hashes[m] == mip_hash) {
             continue;
         }
@@ -1188,17 +1199,23 @@ void TextureCache::GarbageCollectImages() {
         if (num_deletions == 0) {
             return true;
         }
-        --num_deletions;
         auto& image = slot_images[image_id];
         const bool download = image.SafeToDownload();
         const bool tiled = image.info.IsTiled();
         if (tiled && download) {
             // This is a workaround for now. We can't handle non-linear image downloads.
+            ++gc_kept;
+            gc_kept_bytes += image.info.guest_size;
             return false;
         }
         if (download && !pressured) {
             return false;
         }
+        // bbport: only evictions count. The images kept above are not used any more, so they
+        // stay the oldest in the LRU; counted, they used up every run's deletions once there
+        // were 20 of them and nothing was evicted again (an 8 GB card stayed over its pressure
+        // limit all session with 0 evictions).
+        --num_deletions;
         if (download) {
             // bbport: synchronously, while the image still protects its pages. A deferred
             // write-back landed after FreeImage had unprotected them, over whatever the game
@@ -1224,11 +1241,13 @@ void TextureCache::GarbageCollectImages() {
 
     // Try to remove anything old enough and not high priority.
     configure(false);
+    gc_kept = gc_kept_bytes = 0;
     lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
 
     if (total_used_memory >= critical_gc_memory) {
         // If we are still over the critical limit, run an aggressive GC
         configure(true);
+        gc_kept = gc_kept_bytes = 0;
         lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
     }
     // bbport: evictions under memory pressure, at most every 5 s (BB_FRAME_STATS or not).
@@ -1236,11 +1255,13 @@ void TextureCache::GarbageCollectImages() {
         const auto now = std::chrono::steady_clock::now();
         if (now - gc_report_time >= std::chrono::seconds(5)) {
             std::printf("Texture cache: memory pressure, %llu of %llu MiB (critical %llu): "
-                        "%llu images evicted, %llu written back since the last report\n",
+                        "%llu images evicted, %llu written back since the last report; "
+                        "%llu old GPU-written tiled images kept (%llu MiB)\n",
                         (unsigned long long)(total_used_memory >> 20),
                         (unsigned long long)(pressure_gc_memory >> 20),
                         (unsigned long long)(critical_gc_memory >> 20),
-                        (unsigned long long)gc_evictions, (unsigned long long)gc_downloads);
+                        (unsigned long long)gc_evictions, (unsigned long long)gc_downloads,
+                        (unsigned long long)gc_kept, (unsigned long long)(gc_kept_bytes >> 20));
             gc_report_time = now;
             gc_evictions = gc_downloads = 0;
         }

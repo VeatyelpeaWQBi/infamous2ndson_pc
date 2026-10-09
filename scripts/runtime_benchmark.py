@@ -16,7 +16,7 @@ import threading
 import time
 
 from windows_tools import ROOT, require_windows, tool_environment
-from game_profiles import native_environment, select_profile
+from game_profiles import native_environment, select_profile, project_game_dir
 from performance_sim import check_game_stopped
 
 BASE = ROOT / 'out/runtime-benchmark'
@@ -66,8 +66,10 @@ def check_budget():
     return used
 
 
-def plan():
-    game = ROOT / 'patches/CUSA00309'
+def plan(checkpoint='fixed'):
+    if checkpoint not in ('fixed','current'):
+        raise ValueError('Unknown isolated checkpoint.')
+    game = project_game_dir(ROOT)
     profile = select_profile(game)
     inputs = {name: ROOT / 'out/CUSA00309' / name for name in
               ('boot-linked.bin', 'patches.bin', 'content.bin')}
@@ -85,7 +87,10 @@ def plan():
             'inputs': {name: str(path) for name, path in inputs.items()},
             'save_source': str(save), 'cache_source': str(gpu),
             'save_bytes': save_bytes, 'cache_bytes': cache_bytes, 'limit_bytes': LIMIT,
-            'output': str(BASE), 'scope': 'actual game process; static checkpoint and camera rotation'}
+            'output': str(BASE), 'checkpoint': checkpoint,
+            'seed_path':str(BASE / ('seed' if checkpoint=='fixed' else 'seed-current')),
+            'cache_output':str(BASE / ('gpu' if checkpoint=='fixed' else 'gpu-current')),
+            'scope': 'actual game process; static checkpoint and camera rotation'}
 
 
 def verify_base():
@@ -108,8 +113,8 @@ def remove_owned_child(name):
         shutil.rmtree(path)
 
 
-def prepare(allow):
-    description = plan()
+def prepare(allow,checkpoint='fixed'):
+    description = plan(checkpoint)
     if not allow:
         raise ValueError('Creating isolated saves/cache requires --allow-test-data (up to 512 MiB; no game files copied).')
     check_game_stopped()
@@ -117,18 +122,25 @@ def prepare(allow):
     BASE.mkdir(parents=True, exist_ok=True)
     if not (BASE / 'owner.json').exists():
         save_json(BASE / 'owner.json', {'owner': OWNER})
-    seed = BASE / 'seed'
+    seed = Path(description['seed_path'])
     if not seed.exists():
+        projected=check_budget()+description['save_bytes']+description['cache_bytes']
+        if checkpoint=='fixed': projected+=description['cache_bytes']
+        if projected>LIMIT:
+            raise ValueError('Checkpoint copies would exceed the authorized 512 MiB budget; existing data preserved.')
         seed.mkdir()
         shutil.copytree(description['save_source'], seed / 'user')
-        shutil.copytree(description['cache_source'], seed / 'gpu')
+        # The current-progress cache needs only one mutable output copy. Do not
+        # duplicate 100+ MiB of shaders merely to freeze a 330 KiB save seed.
+        if checkpoint=='fixed': shutil.copytree(description['cache_source'], seed / 'gpu')
         save_json(seed / 'manifest.json', {**description, 'save_fingerprint': fingerprint(seed / 'user'),
-                                          'cache_fingerprint': fingerprint(seed / 'gpu')})
+                                          'cache_fingerprint': fingerprint(seed / 'gpu' if checkpoint=='fixed' else description['cache_source'])})
     seed_manifest = json.loads((seed / 'manifest.json').read_text(encoding='utf-8'))
     if fingerprint(seed / 'user') != seed_manifest['save_fingerprint']:
         raise ValueError('Benchmark save seed has changed; refusing a different starting state.')
-    if not (BASE / 'gpu').exists():
-        shutil.copytree(seed / 'gpu', BASE / 'gpu')
+    cache=Path(description['cache_output'])
+    if not cache.exists():
+        shutil.copytree(seed / 'gpu' if checkpoint=='fixed' else description['cache_source'], cache)
     config = ROOT / 'profiles/CUSA00309/settings.ini'
     if config.is_file() and not (BASE / 'settings.ini').exists():
         shutil.copy2(config, BASE / 'settings.ini')
@@ -147,8 +159,9 @@ class Session:
         self.result = None
         self.thread = None
         env = tool_environment()
+        env['BB_GAME_DIR']=description['game']
         native_environment(description['profile'], ROOT, env)
-        env.update(BB_USER_DIR=str(BASE / 'user'), BB_GPU_USER_DIR=str(BASE / 'gpu'),
+        env.update(BB_USER_DIR=str(BASE / 'user'), BB_GPU_USER_DIR=description.get('cache_output',str(BASE / 'gpu')),
                    BB_CONFIG=str(BASE / 'settings.ini'), BB_PAD_FILE=str(self.pad),
                    BB_BENCHMARK_INPUT='1', BB_BENCH_CONTROL=str(self.control),
                    BB_PAD_RECORD='', BB_PAD_REPLAY='', BB_FRAME_STATS='0',
@@ -163,11 +176,12 @@ class Session:
                 with (run_dir / 'collector.log').open('w', encoding='utf-8') as log:
                     # collect is run in another Python process so its output cannot affect the controller.
                     spec = run_dir / 'launch.json'
-                    keys=('BB_GAME_PROFILE','BB_UPSCALER','BB_DEBUG_MOTION','BB_REGION','BB_LANGUAGE','BB_TIMEZONE_MINUTES',
+                    keys=('BB_GAME_PROFILE','BB_DUMP_SHADERS','BB_UPSCALER','BB_DEBUG_MOTION','BB_REGION','BB_LANGUAGE','BB_TIMEZONE_MINUTES',
                           'BB_ENTER_BUTTON','BB_DRAW_PIPE','BB_TEXTURE_HELPER','BB_PREP_PRIORITY','BB_SHADER_SOURCE','BB_LIVE_RES','BB_FPS','BB_FPS_LIMIT','BB_VBLANK_HZ',
-                          'BB_SHOW_FPS','BB_USER_DIR','BB_GPU_USER_DIR','BB_CONFIG','BB_USER_NAME','BB_PRESENT_MODE',
-                          'BB_FLAT_DATA_MEMO','BB_BENCHMARK_INPUT','BB_BENCH_CONTROL','BB_PAD_FILE','BB_PAD_RECORD','BB_PAD_REPLAY',
-                          'BB_FRAME_STATS','BB_PERF_STATS','BB_F10_DEEP','BB_BUFFER_PROFILE','BB_CPU_WORD_SUMMARY','BB_FRAMES_AHEAD','BB_FAULT_CHUNK_WORDS','BB_READBACK_WINDOW_KIB','BB_READBACK_TRACE','BB_READBACK_PREFETCH','BB_READBACK_LRU','BB_CLEAN_ARENA_READ','BB_DESCRIPTOR_PACK')
+                          'BB_SHOW_FPS','BB_USER_DIR','BB_GPU_USER_DIR','BB_CONFIG','BB_USER_NAME','BB_PRESENT_MODE','BB_GPU_PROFILE',
+                          'BB_FLAT_DATA_MEMO','BB_ASYNC_READBACK','BB_PARTICLE_LDS_MULTI','BB_BENCHMARK_INPUT','BB_BENCH_CONTROL','BB_PAD_FILE','BB_PAD_RECORD','BB_PAD_REPLAY',
+                          'BB_FRAME_STATS','BB_PERF_STATS','BB_F10_DEEP','BB_BUFFER_PROFILE','BB_CPU_WORD_SUMMARY','BB_FRAMES_AHEAD','BB_FAULT_CHUNK_WORDS','BB_READBACK_WINDOW_KIB','BB_READBACK_TRACE','BB_READBACK_PREFETCH','BB_READBACK_LRU','BB_READBACK_FENCE_BATCH','BB_READBACK_COALESCE','BB_CLEAN_ARENA_READ','BB_DESCRIPTOR_PACK','BB_INDIRECT_TRACK','BB_PARTICLE_GDS_SYNC','BB_READBACKS')
+                    keys+=('BB_ASYNC_PREFETCH','BB_READBACK_PREFETCH_INTERVAL_US','BB_READBACK_SPECULATIVE','BB_OCCLUSION_TRACE','BB_HW_WATCH','BB_BIND_TIMER_STRIDE','BB_FAULT_WINDOW',)
                     save_json(spec, {'command': command, 'env': {k: env[k] for k in keys if k in env},
                                     'base': str(run_dir / 'debug'), 'profile': description['profile']})
                     self.collector = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '_collect', str(spec)],
@@ -242,6 +256,9 @@ class Session:
             self.command('quit')
             self.thread.join(30)
         if self.alive():
+            state=load_json(self.session()/'status.json')
+            if state.get('finished'):
+                raise RuntimeError('Owned game exited; collector postprocessing did not finish. Completed native recordings were preserved.')
             raise RuntimeError('Owned benchmark game has not exited; diagnostic state preserved, no other process was stopped.')
         if self.error or self.result:
             raise RuntimeError(f'Actual benchmark process failed: {self.error or self.result}')
@@ -302,11 +319,68 @@ def frame_report(session, start, stop):
             'stable_60': valid and max(intervals) <= 17.2}
 
 
-def run_round(description, manifest, warmup, seconds, flat_memo):
+def input_report(session,start,stop,tokens):
+    """Verify the sampled input delivered to the game, not just the control file."""
+    expected=(0,128,128,180 if tokens=='rx=180' else 128,128,0,0,0)
+    samples={}
+    malformed=0
+    for name in ('input.txt.1','input.txt'):
+        path=Path(session)/name
+        if not path.is_file(): continue
+        for line in path.read_text(encoding='utf-8').splitlines():
+            try:
+                values=tuple(map(int,line.split()))
+                if len(values)!=10: raise ValueError()
+                if start<=values[0]<=stop: samples[(values[0],values[1])]=values[2:]
+            except ValueError: malformed+=1
+    matched=sum(value==expected for value in samples.values())
+    ratio=matched/len(samples) if samples else 0
+    # Pad telemetry is capped at 20 Hz. Require broad coverage, not one lucky poll.
+    ticks=[key[0] for key in samples]
+    span=max(ticks)-min(ticks) if ticks else 0
+    valid=(not malformed and len(samples)>=(stop-start)/1000*5 and ratio>=.95 and
+           span>=.9*(stop-start))
+    return {'expected':list(expected),'samples':len(samples),'matching_fraction':ratio,
+            'span_ms':span,'malformed_rows':malformed,'valid':valid}
+
+
+def preserve_phase_snapshot(session,start,stop,directory,name):
+    """Keep a fresh post-measurement image before the bounded native ring rotates."""
+    candidates=[]
+    for path in Path(session).glob('frame-snapshot-*.json'):
+        try:
+            metadata=load_json(path)
+            if start<=metadata['tick_ms']<=stop and path.with_suffix('.bmp').is_file():
+                candidates.append((metadata['tick_ms'],path))
+        except (OSError,ValueError,KeyError,TypeError): continue
+    if not candidates: return {'available':False,'note':'No fresh post-measurement image; scene not verified.'}
+    tick,path=max(candidates)
+    image=path.with_suffix('.bmp');output=Path(directory)/(name+'-post.bmp')
+    # Two bounded 1080p images remain within the existing authorized budget.
+    if check_budget()+image.stat().st_size>LIMIT: raise ValueError('Post-measurement image exceeds benchmark budget.')
+    shutil.copy2(image,output)
+    return {'available':True,'tick_ms':tick,'path':str(output),'scene_verified':False}
+
+
+def mark_cpu_profile_interference(report,session):
+    intervals=[load_json(path) for path in Path(session).glob('cpu-profile-*.json')]
+    intervals=[item for item in intervals if item.get('record_type')=='cpu-sampling-interval']
+    for phase in report['phases']:
+        phase['cpu_sampling_overlap']=any(
+            item['start_tick_ms']<=phase['stop_tick_ms'] and
+            phase['start_tick_ms']<=item['stop_tick_ms'] for item in intervals)
+    report['diagnostic_only']=any(p['cpu_sampling_overlap'] for p in report['phases'])
+    report['cpu_profile_intervals']=intervals
+    return report
+
+
+def run_round(description, manifest, warmup, seconds, flat_memo, cpu_profile=False):
     verify_base()
     check_game_stopped()
+    if cpu_profile and (warmup<45 or not (ROOT/'out/cpu-profile.exe').is_file()):
+        raise ValueError('CPU sampling requires warmup >=45s and build.bat --build-tests.')
     remove_owned_child('user')
-    shutil.copytree(BASE / 'seed/user', BASE / 'user')
+    shutil.copytree(Path(description.get('seed_path',BASE / 'seed')) / 'user', BASE / 'user')
     remove_owned_child('previous-run')
     if (BASE / 'run').exists():
         (BASE / 'run').replace(BASE / 'previous-run')
@@ -322,10 +396,19 @@ def run_round(description, manifest, warmup, seconds, flat_memo):
         session.wait(.25)
         session.script('')
         print(f'Loading fixed checkpoint; warmup {warmup}s (excluded from FPS).', flush=True)
-        session.wait(warmup)
+        if cpu_profile:
+            from profile_runtime_cpu import capture
+            deadline=time.monotonic()+warmup
+            session.wait(25)
+            print('Diagnostic CPU sampling for 5s during warmup (excluded from FPS).',flush=True)
+            capture(session.session(),session.session()/'cpu-profile.csv',5)
+            session.wait(max(0,deadline-time.monotonic()))
+        else:
+            session.wait(warmup)
         for name, tokens in (('checkpoint_static', ''), ('checkpoint_camera_rotation', 'rx=180')):
             session.script(tokens)
             session.command('snapshot')
+            (session.session() / 'render-frame-request').write_text('frame',encoding='ascii')
             session.wait(5)  # Include three delayed captures and worker drain before measuring.
             begin = session.command('record-start')
             if begin['recording'] != 1:
@@ -335,10 +418,25 @@ def run_round(description, manifest, warmup, seconds, flat_memo):
             end = session.command('record-stop')
             if end['recording'] != 0:
                 raise ValueError('F11 recording did not stop.')
-            session.wait(2)
+            # Inspect the scene after the held input has had time to act. The
+            # pre-measurement image may precede the first delivered input poll.
+            capture=session.command('snapshot')
+            session.wait(5) # All capture work remains outside FPS measurement.
             value = frame_report(session.session(), begin['tick_ms'], end['tick_ms'])
+            value['frame_timing_valid']=value['valid']
+            value['input']=input_report(session.session(),begin['tick_ms'],end['tick_ms'],tokens)
+            value['valid']=value['valid'] and value['input']['valid']
+            value['stable_50']=value['stable_50'] and value['input']['valid']
+            value['stable_60']=value['stable_60'] and value['input']['valid']
+            value['post_snapshot']=preserve_phase_snapshot(session.session(),capture['tick_ms'],
+                capture['tick_ms']+5000,run_dir,name)
             value.update(name=name, start_tick_ms=begin['tick_ms'], stop_tick_ms=end['tick_ms'])
             phases.append(value)
+            save_json(run_dir/'measurement-phases.json',{'phases':phases,
+                'game_sha256':description['profile']['source_sha256'],
+                'executable_sha256':digest(description['inputs']['executable']),
+                'save_seed':manifest['save_fingerprint'],'source_save_before':source_before,
+                'warmup_seconds':warmup,'phase_seconds':seconds})
             print(f'{name}: actual FPS {value["fps"]:.2f}, p95 {value["p95_ms"]:.2f}ms, valid={value["valid"]}', flush=True)
     finally:
         session.script('')
@@ -347,18 +445,25 @@ def run_round(description, manifest, warmup, seconds, flat_memo):
             raise ValueError('Original save changed while benchmark ran; report must not be accepted.')
     native_manifest = load_json(session.session() / 'manifest.json')
     check_budget()
-    return {'schema': OWNER, 'created_utc': datetime.now(timezone.utc).isoformat(),
+    report={'schema': OWNER, 'created_utc': datetime.now(timezone.utc).isoformat(),
             'executable_sha256': digest(description['inputs']['executable']),
             'game_sha256': description['profile']['source_sha256'], 'save_seed': manifest['save_fingerprint'],
             'warmup_seconds': warmup, 'phase_seconds': seconds, 'flat_data_memo': flat_memo,
+            'verification_strategy':'delivered-input-and-post-measurement-image-v1',
             'session': str(session.session()), 'native_manifest': native_manifest, 'phases': phases,
             'host': {'machine': platform.machine(), 'cpu': os.environ.get('PROCESSOR_IDENTIFIER',''), 'logical_cpus': os.cpu_count()},
             'source_save_unchanged': True,
             'scene_verified': False, 'note': 'Actual game FPS. Validate snapshots depict gameplay before accepting scene scores; no offline frame replay.'}
+    return mark_cpu_profile_interference(report,session.session())
 
 
 def compare(previous, current):
-    for field in ('schema','game_sha256','save_seed','warmup_seconds','phase_seconds','host'):
+    for report in (previous, current):
+        if report.get('diagnostic_only'):
+            raise ValueError('Diagnostic sampling overlaps measurement; refuse an optimization comparison.')
+        if report.get('native_manifest', {}).get('settings', {}).get('BB_HW_WATCH'):
+            raise ValueError('Hardware watchpoints perturb execution; refuse an optimization comparison.')
+    for field in ('schema','game_sha256','save_seed','warmup_seconds','phase_seconds','host','verification_strategy'):
         if previous.get(field)!=current.get(field):
             raise ValueError(f'Actual runtime reports differ in {field}; comparison refused.')
     if [p['name'] for p in previous['phases']]!=[p['name'] for p in current['phases']]:
@@ -380,6 +485,8 @@ def write_report(value):
     lines = ['# 实际游戏运行时帧率测试', '',
              '已运行真实游戏，使用隔离的固定存档；启动等待与预热不计入指定测量区间。', '',
              '| 场景 | FPS | 最低 1秒 FPS | 1% low | p95 ms | p99 ms | >50ms 帧 | 数据完整 |', '|---|---:|---:|---:|---:|---:|---:|---|']
+    if value.get('diagnostic_only'):
+        lines.insert(2,'诊断采样与测量重叠：本轮禁止用于性能收益比较。')
     for p in value['phases']:
         minimum=f'{p["minimum_1s_fps"]:.2f}' if p.get('minimum_1s_fps') is not None else '未测量'
         lines.append(f'| {p["name"]} | {p["fps"]:.2f} | {minimum} | {p["one_percent_low_fps"]:.2f} | {p["p95_ms"]:.2f} | '
@@ -399,19 +506,22 @@ def main():
     parser.add_argument('--warmup', type=int, default=45)
     parser.add_argument('--seconds', type=int, default=20)
     parser.add_argument('--flat-data-memo', type=int, choices=(0, 1), default=1)
+    parser.add_argument('--cpu-profile',action='store_true',help='sample the verified GPU thread for 5s during warmup; requires warmup >=45')
+    parser.add_argument('--checkpoint',choices=('fixed','current'),default='fixed',
+                        help='freeze current formal save in a separate read-only seed; original saves never modified')
     parser.add_argument('--compare',type=Path,help='compare a previous actual runtime report with identical save/workload')
     args = parser.parse_args()
     require_windows()
     if args.action == 'plan':
-        print(json.dumps(plan(), ensure_ascii=False, indent=2))
+        print(json.dumps(plan(args.checkpoint), ensure_ascii=False, indent=2))
         return 0
     if not 15 <= args.warmup <= 120 or not 10 <= args.seconds <= 90:
         parser.error('warmup 15..120 seconds; measurement 10..90 seconds')
-    description, manifest = prepare(args.allow_test_data)
+    description, manifest = prepare(args.allow_test_data,args.checkpoint)
     if args.action == 'prepare':
         print(f'Isolated benchmark seed prepared: {BASE}')
         return 0
-    value = run_round(description, manifest, args.warmup, args.seconds, args.flat_data_memo)
+    value = run_round(description, manifest, args.warmup, args.seconds, args.flat_data_memo,args.cpu_profile)
     if args.compare:
         try:
             value['comparison']=compare(load_json(args.compare),value)

@@ -162,6 +162,10 @@ public:
     void V_SUBREV_F32(const GcnInst& inst);
     void V_MUL_F32(const GcnInst& inst);
     void V_MUL_LEGACY_F32(const GcnInst& inst);
+    // bbport: AYOUB1080p 153a5aa, preserve GCN zero times Inf/NaN semantics.
+    void V_MAC_LEGACY_F32(const GcnInst& inst);
+    void V_MAD_LEGACY_F32(const GcnInst& inst);
+    IR::F32 LegacyMul(const IR::F32& src0, const IR::F32& src1);
     void V_MUL_I32_I24(const GcnInst& inst, bool is_signed);
     void V_MIN_F32(const GcnInst& inst, bool is_legacy = false);
     void V_MAX_F32(const GcnInst& inst, bool is_legacy = false);

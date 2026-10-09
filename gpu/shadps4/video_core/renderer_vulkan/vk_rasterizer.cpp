@@ -4,6 +4,7 @@
 #include <xxhash.h>
 #include "video_core/renderer_vulkan/ui_composition.h"
 #include "bbport_toggles.h"
+#include "bbport_visibility_trace.h"
 #include "bbport_diagnostics.h"
 #include "video_core/renderer_vulkan/stencil_reference.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
@@ -951,7 +952,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
     }
     const GraphicsPipeline* pipeline;
     {
-        BbStats::Timer timer{BbStats::pipeline_select_ns};
+        BbStats::SampledTimer<0> timer{BbStats::pipeline_select_ns};
         pipeline = pipeline_cache.GetGraphicsPipeline({}, prepared);
     }
     const PreparedDraw* used_prepared = pipeline_cache.UsedPrepared();
@@ -1167,6 +1168,15 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             u32(regs.polygon_control.cull_front),u32(regs.polygon_control.cull_back),
             viewport.xscale*2,viewport.yscale*2,viewport.zscale,viewport.zoffset);
         FrameCapture::Note(note.c_str());
+        const auto& blend=regs.blend_control[0];
+        const auto state_note=fmt::format("direct indexed={} indices={} instances={} primitive={} mrt={} mask0={} "
+            "blend={} src={} dst={} op={} alpha_separate={} alpha_src={} alpha_dst={} alpha_op={} z={} zw={} zfunc={}",
+            is_indexed,num_indices,num_instances,u32(regs.primitive_type),pipeline->GetGraphicsKey().mrt_mask,
+            regs.color_target_mask.GetMask(0),u32(blend.enable),u32(blend.color_src_factor),u32(blend.color_dst_factor),
+            u32(blend.color_func),u32(blend.separate_alpha_blend),u32(blend.alpha_src_factor),u32(blend.alpha_dst_factor),
+            u32(blend.alpha_func),u32(regs.depth_control.depth_enable),u32(regs.depth_control.depth_write_enable),
+            u32(regs.depth_control.depth_func));
+        FrameCapture::CaptureDrawState(u64(VkPipeline(handle)),diagnostic_vs_hash,diagnostic_ps_hash,state_note.c_str());
         if (const auto& bc = regs.blend_control[0]; bc.enable && regs.color_buffers[0]) {
             char note[128];
             std::snprintf(note, sizeof(note), "\n  blend ps %08x idx %u: src %u dst %u func %u z %u%u",
@@ -1187,6 +1197,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
                               u16 instance_sgpr_offset) {
     RENDERER_TRACE;
+    BbStats::draws.fetch_add(1,std::memory_order_relaxed);
     // bbport: like direct draws, handed to the recording thread after the pipeline selection
     // (else the GPU thread waited here for a whole frame of queued draws).
     const bool pipelined = UseDrawPipe() && FilterDrawPasses() &&
@@ -1281,6 +1292,10 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     const u64 args_offset = base;
     const vk::Buffer counts = count_address != 0 ? count_buffer->Handle() : vk::Buffer{};
     const u64 counts_offset = count_address != 0 ? count_offset : 0;
+    // Record these reads after flushing prior writes. A later compute/transfer
+    // writer must wait for the indirect consumer even when shader resources do not alias it.
+    runtime.TrackIndirectRead(buffer,base,stride*max_count);
+    if (count_address) runtime.TrackIndirectRead(count_buffer,count_offset,4);
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
         if (is_indexed) {
@@ -1296,6 +1311,41 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
             cmdbuf.drawIndirect(args, args_offset, max_count, stride);
         }
     });
+    if (FrameCapture::Active()) {
+        const auto& vs=pipeline->GetStage(Shader::SwStage::Vertex);
+        const auto* ps=pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        FrameCapture::Draw(vs.pgm_hash,ps ? ps->pgm_hash : 0,0,0);
+        const auto& blend=Regs().blend_control[0];
+        const auto note=fmt::format("indirect indexed={} args={:#x} count_address={:#x} max_draws={} stride={} "
+            "primitive={} mrt={} mask0={} blend={} src={} dst={} op={} z={} zw={} zfunc={} counts=GPU_owned",
+            is_indexed,indirect.args,count_address,max_count,stride,u32(Regs().primitive_type),
+            pipeline->GetGraphicsKey().mrt_mask,Regs().color_target_mask.GetMask(0),u32(blend.enable),
+            u32(blend.color_src_factor),u32(blend.color_dst_factor),u32(blend.color_func),
+            u32(Regs().depth_control.depth_enable),u32(Regs().depth_control.depth_write_enable),
+            u32(Regs().depth_control.depth_func));
+        FrameCapture::CaptureDrawState(u64(VkPipeline(handle)),vs.pgm_hash,ps ? ps->pgm_hash : 0,note.c_str());
+        // Explicit frame analysis only: copy the arguments on the GPU timeline.
+        // CPU backing snapshots are not valid evidence for GPU-written counts.
+        const u32 captured=std::min<u32>(stride*max_count,64);
+        if(captured) {
+            const auto sample=runtime.GetStagingPool().Request(captured,VideoCore::MemoryType::HostCached,16);
+            const vk::BufferCopy region{base,sample.offset,captured};
+            runtime.CopyBuffer(buffer,sample.buffer,std::span{&region,1});
+            const vk::MemoryBarrier2 host{.srcStageMask=vk::PipelineStageFlagBits2::eCopy,
+                .srcAccessMask=vk::AccessFlagBits2::eTransferWrite,.dstStageMask=vk::PipelineStageFlagBits2::eHost,
+                .dstAccessMask=vk::AccessFlagBits2::eHostRead};
+            scheduler.Record([host](vk::CommandBuffer c){c.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount=1,.pMemoryBarriers=&host});});
+            const u64 vs_hash=vs.pgm_hash,ps_hash=ps ? ps->pgm_hash : 0;
+            scheduler.DeferOperation([sample,captured,vs_hash,ps_hash,address=indirect.args] {
+                sample.Invalidate();const auto* words=reinterpret_cast<const u32*>(sample.mapped);
+                std::fprintf(stderr,"DEBUG_INDIRECT_GPU vs=%016llx ps=%016llx address=%#llx bytes=%u words=",
+                    static_cast<unsigned long long>(vs_hash),static_cast<unsigned long long>(ps_hash),
+                    static_cast<unsigned long long>(address),captured);
+                for(u32 i=0;i<captured/4;++i) std::fprintf(stderr,"%s%u",i ? "," : "",words[i]);
+                std::fputc('\n',stderr);
+            });
+        }
+    }
     DebugState.IncDrawCall();
 
     ResetBindings(false);
@@ -1421,6 +1471,7 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
         cmdbuf.dispatchIndirect(args, args_offset);
     });
+    runtime.TrackIndirectRead(buffer,base,size);
     DebugState.IncDispatch();
 
     ResetBindings(true);
@@ -1567,7 +1618,7 @@ void Rasterizer::JoinBindHelper(void* context) {
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
-    BbStats::Timer bind_timer{BbStats::bind_ns};
+    BbStats::SampledTimer<1> bind_timer{BbStats::bind_ns};
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
         return false;
@@ -1714,7 +1765,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     }
 
     if (uses_dma) {
-        buffer_cache.InvalidateReadbackHints(); // Unknown-address shaders cannot reuse an older snapshot.
+        // uses_dma is set only for dynamic ReadConst loads. These reads do not
+        // modify guest buffers; actual writes invalidate their ranges in ObtainBuffer.
         buffer_cache.SynchronizeDmaBuffers();
         fault_process_pending = true;
     }
@@ -2094,7 +2146,7 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
 void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* prepared,
                              Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data, u32& write_index) {
-    BbStats::Timer buffer_timer{BbStats::buffer_bind_ns};
+    BbStats::SampledTimer<2> buffer_timer{BbStats::buffer_bind_ns};
     const u64 alignment = instance.StorageMinAlignment();
     for (u32 buffer_index = 0; buffer_index < stage.buffers.size(); ++buffer_index) {
         const auto& desc = stage.buffers[buffer_index];
@@ -2113,7 +2165,14 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
             if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
                 const auto* gds_buf = buffer_cache.GetGdsBuffer();
                 buffer_infos.emplace_back(gds_buf->Handle(), 0, gds_buf->SizeBytes());
-                needs_barrier |= runtime.IsBufferAccessed(gds_buf, 0, gds_buf->SizeBytes());
+                static const bool track=[] {
+                    const char* value=std::getenv("BB_PARTICLE_GDS_SYNC");return !value || value[0]!='0';
+                }();
+                // GDS append/consume atomics are translated to this persistent SSBO.
+                // Unlike temporary flat constants, it must participate in write/read
+                // hazards and be marked after this dispatch/draw executes.
+                needs_barrier |= runtime.IsBufferAccessed(gds_buf,0,gds_buf->SizeBytes(),track);
+                if (track) bound_buffers.emplace_back(gds_buf,0,gds_buf->SizeBytes(),true);
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
                 auto& vk_buffer = buffer_cache.GetStreamBuffer();
                 const u32 ubo_size = stage.FlatUserData().size() * sizeof(u32);
@@ -2207,6 +2266,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
                 }
+                BbVisibilityTrace::Buffer(stage.pgm_hash,binding.buffer,vsharp.base_address,
+                                          size,desc.is_written);
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted);
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
@@ -2283,7 +2344,7 @@ Rasterizer::ImageDescCacheEntry& Rasterizer::CachedImageDescEntry(const AmdGpu::
 void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* prepared,
                               Shader::Backend::Bindings& binding, u32& write_index,
                               bool& barrier, bool on_helper) {
-    BbStats::Timer texture_timer{BbStats::texture_bind_ns};
+    BbStats::SampledTimer<3> texture_timer{BbStats::texture_bind_ns};
     const u32 first_image_idx = image_infos.size();
     TextureSet* set_slot = nullptr;
     if (!on_helper && BindTexturesFromSet(stage, prepared, first_image_idx, barrier, set_slot)) {
@@ -2576,7 +2637,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
 
 void Rasterizer::BindSamplers(const Shader::Info& stage, const PreparedStage* prepared,
                               Shader::Backend::Bindings& binding, u32& write_index) {
-    BbStats::Timer sampler_timer{BbStats::sampler_bind_ns};
+    BbStats::SampledTimer<4> sampler_timer{BbStats::sampler_bind_ns};
     for (u32 sampler_index = 0; sampler_index < stage.samplers.size(); ++sampler_index) {
         const auto& sampler = stage.samplers[sampler_index];
         auto ssharp =
@@ -3234,6 +3295,14 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
 void Rasterizer::ProcessDownloadImages() {
     DrainDrawPipe();
     texture_cache.ProcessDownloadImages();
+    buffer_cache.PrefetchReadbacks(true);
+}
+
+void Rasterizer::OnGuestFlip() {
+    DrainDrawPipe();
+    // Motion/upscaler mode already counts at its display pass. Native inFAMOUS
+    // has that path disabled and must use its actual flip packet instead.
+    if(!camera_motion->Enabled()) NoteFrameStart();
 }
 
 bool Rasterizer::IsMapped(VAddr addr, u64 size) {

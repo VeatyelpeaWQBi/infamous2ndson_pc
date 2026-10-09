@@ -26,4 +26,6 @@ patches.json
 /Bloodborne.cmd
 .vscode
 patches
+/game/
 /profiles/
+game

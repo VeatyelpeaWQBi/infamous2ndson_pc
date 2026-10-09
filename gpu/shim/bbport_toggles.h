@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include "bbport_sampling.h"
 
 extern "C" std::uint64_t runtime_disabled_optimizations;
 /// Recovery point for speculative guest memory reads on this thread (runtime_memory.c).
@@ -117,6 +118,10 @@ inline std::atomic<std::uint64_t> buffer_residency_ns{0},buffer_sync_ns{0},buffe
 inline std::atomic<std::uint64_t> fault_slot_wait_ns{0},frame_ahead_wait_ns{0},stream_reuse_wait_ns{0};
 inline std::atomic<std::uint64_t> buffer_readback_wait_ns{0},image_readback_wait_ns{0},gds_store_wait_ns{0};
 inline std::atomic<std::uint64_t> buffer_readback_calls{0},buffer_readback_bytes{0};
+// Guest-thread wait sums are not GPU command-thread stalls. Keep the legacy
+// aggregate, but report the two disjoint categories and command round trips.
+inline std::atomic<std::uint64_t> readback_guest_wait_ns{0},readback_gpu_wait_ns{0},
+    readback_begin_roundtrip_ns{0},readback_complete_roundtrip_ns{0},readback_retries{0};
 inline thread_local std::uintptr_t fault_instruction{};
 inline thread_local std::uint64_t write_data_bytes{};
 inline std::atomic<std::uint64_t> readback_prefetches{0},readback_prefetch_hits{0};
@@ -150,6 +155,24 @@ struct Timer {
                         std::memory_order_relaxed);
     }
 };
+inline const unsigned bind_timer_stride=[] {
+    const char* value=std::getenv("BB_BIND_TIMER_STRIDE");
+    if(!value) return 1u;
+    char* end=nullptr;const unsigned long stride=std::strtoul(value,&end,10);
+    return end && !*end && stride && stride<=64 && !(stride&(stride-1)) ? unsigned(stride) : 1u;
+}();
+// Only high-frequency binding/selection estimates use this timer. Frame
+// intervals, CPU clocks, counts and synchronization waits stay exact.
+template<unsigned Slot> struct SampledTimer {
+    static inline thread_local BbDiagnosticSampler sampler{0x9e3779b9u ^ (Slot+1)*0x85ebca6bu};
+    std::atomic<std::uint64_t>& total;
+    bool sampled=enabled && sampler.Select(bind_timer_stride);
+    std::chrono::steady_clock::time_point start=sampled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    ~SampledTimer() {
+        if(sampled) total.fetch_add(bind_timer_stride*std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now()-start).count(),std::memory_order_relaxed);
+    }
+};
 /// Wall time the GPU command thread waited for guest submissions (ns).
 inline std::atomic<std::uint64_t> gpu_idle_ns{0};
 /// Draws recorded into the reduced scene targets, and draws after the scene started.
@@ -160,11 +183,13 @@ inline std::atomic<std::uint64_t> sync_recording_ns{0}, host_copies_wait_ns{0}, 
     copy_threads_wait_ns{0}, host_copy_waits{0};
 struct WaitTimer {
     std::atomic<std::uint64_t>& total;
+    std::atomic<std::uint64_t>* category{};
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
     ~WaitTimer() {
-        total.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - start).count(),
-                        std::memory_order_relaxed);
+        const auto elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now()-start).count();
+        total.fetch_add(elapsed,std::memory_order_relaxed);
+        if(category) category->fetch_add(elapsed,std::memory_order_relaxed);
     }
 };
 /// GPU thread rusage, refreshed after each graphics submission.

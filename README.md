@@ -4,12 +4,14 @@ This fork targets **Windows 10/11 x86-64 only**, using an existing MSYS2 CLANG64
 and Windows Python 3.12+. Linux, Unix, NixOS, Steam Deck, AppImage and WSL compatibility
 are outside its development and verification scope.
 
-**Current stage: first Second Son adaptation and test baseline.** Windows executables build
-successfully. All 92 Python/native cases, two standalone native tests, 13 CTest unit checks,
-and four Vulkan integration tests pass on this machine. CUSA00309 now has a fingerprint-gated
-native-render profile, scoped import resolution, PlayGo/event flags, direct Videodec and
-1D/array texture compatibility changes. Real gameplay has not been tested; unresolved system
-interfaces and actual game/resource behavior still need validation.
+**Current stage: Second Son gameplay compatibility and performance investigation.**
+Windows executables build; user testing has confirmed gameplay and controller input, and
+local captures show restored fire/smoke bodies. Stable 50–60 FPS with complete effects has
+not been achieved. Latest checks: 186 Python cases and 31 native CTest checks pass;
+16 real Vulkan integration checks also passed for the renderer changes. Legacy Linux/AppImage
+packaging tests are excluded. No complete play-through is verified.
+All adaptation is in the runtime engine; original game programs, assets and shader packages
+remain read-only. Translated caches and isolated benchmark data are stored under `out/`.
 
 - [Windows development and verification guide / Windows 开发与验证](docs/WINDOWS_DEVELOPMENT.zh-CN.md)
 - [Windows build and test report / 构建与测试报告](docs/WINDOWS_TEST_REPORT.2026-10-06.zh-CN.md)
@@ -17,12 +19,21 @@ interfaces and actual game/resource behavior still need validation.
 - [Second Son feasibility and adaptation plan / 可行性评估与适配方案](docs/INFAMOUS_FEASIBILITY.zh-CN.md)
 - [Second Son adaptation and first game test / 首轮适配与游戏测试](docs/INFAMOUS_ADAPTATION.2026-10-06.zh-CN.md)
 - [Development rules](AGENTS.md) / [agent.md](agent.md)
+- [Reverse analysis, actual-game measurements and limits / 反编译与性能实测](docs/INFAMOUS_REVERSE_ANALYSIS.2026-10-09.zh-CN.md)
 
 Entry points: `build.bat --check`, `build.bat --build-tests`, `test.bat`, and `test.bat --gpu`.
 `test.bat --python-only` runs the Python subset without compiling the runtime.
 Ordinary builds do not download missing dependencies; `--allow-downloads` is an explicit opt-in.
-After building and testing, `run-infamous.bat` starts the local `patches/CUSA00309` dump
+After building and testing, `run-infamous.bat` starts the local `game/CUSA00309` dump
 and writes its diagnostics to `out/CUSA00309/game-test.log`.
+Full session diagnostics are under `out/CUSA00309/debug/`; `active.json` identifies the session.
+F10 requests a snapshot and F11 toggles an asynchronous performance recording.
+`runtime-benchmark.bat run --allow-test-data --checkpoint current --warmup 45 --seconds 15`
+measures the real game with an isolated save and a 512 MiB output budget. It validates input
+delivery and keeps post-measurement scene images; scene correctness still needs inspection.
+`--cpu-profile` collects instruction observations during warmup only. Overlapping CPU samples
+or hardware watchpoints invalidate optimization comparisons. Instruction observations and
+sampled binding timers are diagnostic estimates, not offline predictions of gameplay FPS.
 
 ## Upstream reference: Bloodborne / Linux
 

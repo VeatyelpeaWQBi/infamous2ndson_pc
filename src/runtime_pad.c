@@ -18,6 +18,7 @@
 #include <SDL3/SDL.h>
 #include <sys/stat.h>
 #include "pad_motion.h"
+#include "pad_feedback.h"
 
 #define ERR_INVALID_ARG ((int32_t)0x80920001)
 #define ERR_INVALID_HANDLE ((int32_t)0x80920003)
@@ -60,6 +61,25 @@ _Static_assert(sizeof(ControllerInfo)==28,"OrbisPadControllerInformation layout"
 static HostMutex lock=HOST_MUTEX_INIT;
 static int initialized, opened, sdl_ready;
 static SDL_Gamepad *gamepad;
+static PadFeedback feedback;
+static SDL_JoystickID feedback_device;
+static PadData host_cached;
+static int host_cached_valid;
+
+static void feedback_send(void *context,uint32_t device,uint16_t low,uint16_t high) {
+    (void)context;
+    /* Hold our own SDL reference: guest close/disconnect must not invalidate it. */
+    const uint64_t start=host_monotonic_ns();
+    const uint64_t start_tick=GetTickCount64();
+    SDL_Gamepad *g=SDL_OpenGamepad(device);
+    const int ok=g && SDL_RumbleGamepad(g,low,high,low || high ? 1000 : 0);
+    if (g) SDL_CloseGamepad(g);
+    const uint64_t elapsed=host_monotonic_ns()-start;
+    if (getenv("BB_DEBUG_DIR"))
+        fprintf(stderr,"PAD_FEEDBACK tick_ms=%llu start_tick_ms=%llu device=%u low=%u high=%u backend_ns=%llu ok=%d\n",
+            (unsigned long long)GetTickCount64(),(unsigned long long)start_tick,device,low,high,(unsigned long long)elapsed,ok);
+}
+static void feedback_shutdown(void) { pad_feedback_stop(&feedback); }
 static size_t reads;
 static uint8_t connected_count;
 static uint8_t lightbar[3];
@@ -85,13 +105,13 @@ static void touch_click(PadData *d, int right) {
 static SDL_Gamepad *current_gamepad(void) {
     if (!sdl_ready) sdl_ready = SDL_WasInit(SDL_INIT_GAMEPAD) ? 1 : SDL_InitSubSystem(SDL_INIT_GAMEPAD) ? 1 : -1;
     if (sdl_ready<0) return NULL;
-    if (gamepad && !SDL_GamepadConnected(gamepad)) { SDL_CloseGamepad(gamepad); gamepad=NULL; }
+    if (gamepad && !SDL_GamepadConnected(gamepad)) { SDL_CloseGamepad(gamepad); gamepad=NULL; feedback_device=0; }
     if (!gamepad) {
         int count=0;
         SDL_JoystickID *ids=SDL_GetGamepads(&count);
         if (ids && count>0) {
             gamepad=SDL_OpenGamepad(ids[0]);
-            if (gamepad) { ++connected_count; printf("Runtime: gamepad connected: %s\n",SDL_GetGamepadName(gamepad)); }
+            if (gamepad) { feedback_device=ids[0]; ++connected_count; printf("Runtime: gamepad connected: %s\n",SDL_GetGamepadName(gamepad)); }
         }
         SDL_free(ids);
     }
@@ -106,6 +126,13 @@ static void sample_host(PadData *d) {
     /* Owned automated benchmark children use scripted input exclusively. */
     const char *exclusive=getenv("BB_BENCHMARK_INPUT");
     if (exclusive && exclusive[0]=='1') return;
+    /* SDL also locks its joystick registry during device output. While a slow output is
+     * in flight, use the last host sample rather than block the guest behind that lock.
+     * Scripted/mouse input is still applied below; timestamps remain current. */
+    if (pad_feedback_busy(&feedback)) {
+        if (host_cached_valid) { const uint64_t stamp=d->timestamp; *d=host_cached; d->timestamp=stamp; }
+        return;
+    }
     SDL_Gamepad *g=current_gamepad();
     if (bbgpu_overlay_captures_input()) return; /* settings menu open: neutral input */
     const bool *k=SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(NULL) : NULL;
@@ -141,6 +168,7 @@ static void sample_host(PadData *d) {
         if ((d->buttons & BTN_TOUCHPAD) && !d->touch_count) touch_click(d,0);
         if (k && k[SDL_SCANCODE_TAB]) touch_click(d,0);
         if (k && k[SDL_SCANCODE_BACKSPACE]) touch_click(d,1);
+        host_cached=*d; host_cached_valid=1;
         return;
     }
     if (!k) return;
@@ -172,24 +200,38 @@ static struct { uint32_t buttons; int stick[4]; int touch_side; } injected={0,{-
 static int replay_armed;      /* 1 while a BB_PAD_REPLAY recording plays, 2 once it ended */
 static uint64_t replay_start; /* 0: (re)start at the next sample */
 static void read_inject(void) {
-    static const char *path; static int checked; static uint64_t last_check; static struct timespec mtime;
+    static const char *path; static int checked; static uint64_t last_check;
+#ifdef _WIN32
+    static uint64_t file_stamp,file_size;
+#else
+    static struct timespec mtime;
+#endif
     if (!checked) { path=getenv("BB_PAD_FILE"); checked=1; }
     if (!path || !*path) return;
     uint64_t now=now_us();
     if (now-last_check<20000) return;
     last_check=now;
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA attributes;
+    if (!GetFileAttributesExA(path,GetFileExInfoStandard,&attributes)) return;
+    const uint64_t stamp=((uint64_t)attributes.ftLastWriteTime.dwHighDateTime<<32)|attributes.ftLastWriteTime.dwLowDateTime;
+    const uint64_t bytes=((uint64_t)attributes.nFileSizeHigh<<32)|attributes.nFileSizeLow;
+    /* CRT stat loses sub-second changes, including same-sized analog updates. */
+    if (stamp==file_stamp && bytes==file_size) return;
+#else
     struct stat st;
     if (stat(path,&st)!=0) return;
-#ifdef _WIN32
-    /* Whole-second times: the size tells writes within the same second apart. */
-    if (st.st_mtime==mtime.tv_sec && st.st_size==mtime.tv_nsec) return;
-    mtime.tv_sec=st.st_mtime; mtime.tv_nsec=(long)st.st_size;
-#else
     if (st.st_mtim.tv_sec==mtime.tv_sec && st.st_mtim.tv_nsec==mtime.tv_nsec) return;
-    mtime=st.st_mtim;
 #endif
     FILE *f=fopen(path,"r");
     if (!f) return;
+    /* A transient sharing failure must not acknowledge an unread update.
+     * Retry the same file metadata on the next poll after the writer closes. */
+#ifdef _WIN32
+    file_stamp=stamp; file_size=bytes;
+#else
+    mtime=st.st_mtim;
+#endif
     static const struct { const char *name; uint32_t ps; } names[]={
         {"cross",BTN_CROSS}, {"circle",BTN_CIRCLE}, {"square",BTN_SQUARE}, {"triangle",BTN_TRIANGLE},
         {"l1",BTN_L1}, {"r1",BTN_R1}, {"l2",BTN_L2}, {"r2",BTN_R2}, {"l3",BTN_L3}, {"r3",BTN_R3},
@@ -387,7 +429,16 @@ static void sample(PadData *d) {
     runtime_debug_input(d->buttons,d->left_x,d->left_y,d->right_x,d->right_y,d->l2,d->r2,d->touch_count);
 }
 
-static ABI int32_t pad_init(void) { host_lock(&lock); initialized=1; host_unlock(&lock); return 0; }
+static ABI int32_t pad_init(void) {
+    host_lock(&lock);
+    if (!initialized) {
+        feedback.input_gate=&lock;
+        if (pad_feedback_start(&feedback,feedback_send,NULL)) atexit(feedback_shutdown);
+        else fputs("Runtime: feedback worker unavailable; vibration disabled to avoid guest stalls\n",stderr);
+        initialized=1;
+    }
+    host_unlock(&lock); return 0;
+}
 static ABI int32_t pad_open(int32_t user, int32_t type, int32_t index, const void *param) {
     (void)param;
     if (!initialized) return ERR_NOT_INITIALIZED;
@@ -403,7 +454,9 @@ static ABI int32_t pad_open(int32_t user, int32_t type, int32_t index, const voi
 }
 static ABI int32_t pad_close(int32_t handle) {
     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
-    opened=0; return 0;
+    host_lock(&lock); opened=0;
+    pad_feedback_submit(&feedback,feedback_device,0,0);
+    host_unlock(&lock); return 0;
 }
 static ABI int32_t pad_read_state(int32_t handle, PadData *data) {
     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
@@ -428,7 +481,7 @@ static ABI int32_t pad_info(int32_t handle, ControllerInfo *info) {
     info->dead_zone_left=info->dead_zone_right=2;
     info->connection_type=0; info->connected=1; info->device_class=0;
     host_lock(&lock);
-    current_gamepad();
+    if (!pad_feedback_busy(&feedback)) current_gamepad();
     info->connected_count=connected_count ? connected_count : 1;
     host_unlock(&lock);
     return 0;
@@ -437,8 +490,8 @@ static ABI int32_t pad_vibration(int32_t handle, const uint8_t *param) {
     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
     if (!param) return ERR_INVALID_ARG;
     host_lock(&lock);
-    SDL_Gamepad *g=current_gamepad();
-    if (g) SDL_RumbleGamepad(g,(uint16_t)(param[0]*257),(uint16_t)(param[1]*257),1000);
+    /* No discovery, device calls or device waits under the input/guest lock. */
+    if (feedback_device) pad_feedback_submit(&feedback,feedback_device,(uint16_t)(param[0]*257),(uint16_t)(param[1]*257));
     host_unlock(&lock);
     return 0;
 }
@@ -469,7 +522,7 @@ static ABI int32_t pad_lightbar(int32_t handle,const uint8_t *param) {
     if (!param) return ERR_INVALID_ARG;
     host_lock(&lock);
     memcpy(lightbar,param,3);
-    SDL_Gamepad *g=current_gamepad();
+    SDL_Gamepad *g=pad_feedback_busy(&feedback) ? NULL : current_gamepad();
     if (g && SDL_GetBooleanProperty(SDL_GetGamepadProperties(g),SDL_PROP_GAMEPAD_CAP_RGB_LED_BOOLEAN,false))
         SDL_SetGamepadLED(g,param[0],param[1],param[2]);
     host_unlock(&lock); return 0;

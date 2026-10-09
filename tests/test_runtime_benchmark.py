@@ -9,6 +9,89 @@ import runtime_benchmark as bench
 
 
 class RuntimeBenchmarkTests(unittest.TestCase):
+    def test_post_measurement_image_rejects_stale_capture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);session=root/'session';session.mkdir()
+            (session/'frame-snapshot-0.json').write_text(json.dumps({'tick_ms':99}))
+            (session/'frame-snapshot-0.bmp').write_bytes(b'old image')
+            with patch.object(bench,'BASE',root):
+                self.assertFalse(bench.preserve_phase_snapshot(session,100,200,root,'static')['available'])
+                (session/'frame-snapshot-1.json').write_text(json.dumps({'tick_ms':150}))
+                (session/'frame-snapshot-1.bmp').write_bytes(b'fresh image')
+                result=bench.preserve_phase_snapshot(session,100,200,root,'static')
+            self.assertTrue(result['available']);self.assertFalse(result['scene_verified'])
+            self.assertEqual((root/'static-post.bmp').read_bytes(),b'fresh image')
+
+    def test_post_measurement_capture_respects_existing_storage_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            (root/'frame-snapshot-1.json').write_text(json.dumps({'tick_ms':150}))
+            (root/'frame-snapshot-1.bmp').write_bytes(b'fresh image')
+            with patch.object(bench,'BASE',root),patch.object(bench,'LIMIT',1):
+                with self.assertRaisesRegex(ValueError,'budget'):
+                    bench.preserve_phase_snapshot(root,100,200,root,'static')
+
+    def test_missing_or_neutral_input_rejects_camera_workload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)
+            self.assertFalse(bench.input_report(path,100,1100,'rx=180')['valid'])
+            (path/'input.txt').write_text(''.join(f'{t} 1 0 128 128 128 128 0 0 0\n' for t in range(100,1101,50)))
+            self.assertTrue(bench.input_report(path,100,1100,'')['valid'])
+            self.assertFalse(bench.input_report(path,100,1100,'rx=180')['valid'])
+
+    def test_delivered_camera_input_requires_broad_coverage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)
+            rows=''.join(f'{t} 1 0 128 128 180 128 0 0 0\n' for t in range(100,1101,50))
+            (path/'input.txt').write_text(rows)
+            (path/'input.txt.1').write_text(rows) # Rotation overlap must not double-count.
+            report=bench.input_report(path,100,1100,'rx=180')
+            self.assertTrue(report['valid']);self.assertEqual(report['samples'],21)
+            (path/'input.txt').write_text('100 1 0 128 128 180 128 0 0 0\n')
+            (path/'input.txt.1').unlink()
+            self.assertFalse(bench.input_report(path,100,1100,'rx=180')['valid'])
+
+    def test_cpu_sample_overlap_is_excluded_from_optimization_comparison(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session=Path(directory)
+            marker=session/'cpu-profile-test.json'
+            marker.write_text(json.dumps({'record_type':'cpu-sampling-interval','start_tick_ms':150,'stop_tick_ms':160}))
+            report={'phases':[{'name':'static','start_tick_ms':100,'stop_tick_ms':200}]}
+            bench.mark_cpu_profile_interference(report,session)
+            self.assertTrue(report['diagnostic_only'])
+            with self.assertRaisesRegex(ValueError,'sampling overlaps'):bench.compare(report,{})
+            marker.write_text(json.dumps({'record_type':'cpu-sampling-interval','start_tick_ms':50,'stop_tick_ms':60}))
+            bench.mark_cpu_profile_interference(report,session)
+            self.assertFalse(report['diagnostic_only'])
+    def test_watchpoint_run_cannot_be_accepted_as_an_optimization(self):
+        watched = {'native_manifest': {'settings': {'BB_HW_WATCH': 'watch.txt'}}}
+        for previous, current in ((watched, {}), ({}, watched)):
+            with self.assertRaisesRegex(ValueError, 'Hardware watchpoints'):
+                bench.compare(previous, current)
+
+    def test_current_checkpoint_freezes_save_without_duplicate_shader_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); base=root/'out/runtime-benchmark'
+            source=root/'formal'; cache=root/'formal-cache'
+            source.mkdir(); cache.mkdir(); (source/'save.dat').write_bytes(b'checkpoint A')
+            (cache/'shader.bin').write_bytes(b'cached shader')
+            description={'save_source':str(source),'cache_source':str(cache),
+                         'seed_path':str(base/'seed-current'),'cache_output':str(base/'gpu-current'),
+                         'save_bytes':12,'cache_bytes':13}
+            before=bench.fingerprint(source)
+            with patch.object(bench,'ROOT',root),patch.object(bench,'BASE',base),\
+                 patch.object(bench,'plan',return_value=description),patch.object(bench,'check_game_stopped'):
+                _, manifest=bench.prepare(True,'current')
+                self.assertEqual(bench.fingerprint(source),before)
+                self.assertFalse((base/'seed-current/gpu').exists())
+                (source/'save.dat').write_bytes(b'checkpoint B')
+                (base/'gpu-current/shader.bin').write_bytes(b'warmed independent cache')
+                _, frozen=bench.prepare(True,'current')
+                self.assertEqual(frozen['save_fingerprint'],manifest['save_fingerprint'])
+                self.assertEqual((base/'seed-current/user/save.dat').read_bytes(),b'checkpoint A')
+                self.assertEqual((base/'gpu-current/shader.bin').read_bytes(),b'warmed independent cache')
+                self.assertEqual((cache/'shader.bin').read_bytes(),b'cached shader')
+
     def test_control_replace_retries_sharing_conflicts_and_bounds_acl_failures(self):
         from unittest.mock import Mock
         conflict=PermissionError('Windows sharing conflict');conflict.winerror=32

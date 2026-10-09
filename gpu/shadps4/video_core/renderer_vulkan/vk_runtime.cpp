@@ -781,6 +781,7 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
     };
 
     constexpr static vk::AccessFlags2 READ_MASK =
+        vk::AccessFlagBits2::eIndirectCommandRead |
         vk::AccessFlagBits2::eIndexRead | vk::AccessFlagBits2::eVertexAttributeRead |
         vk::AccessFlagBits2::eUniformRead | vk::AccessFlagBits2::eShaderRead |
         vk::AccessFlagBits2::eColorAttachmentRead |
@@ -826,6 +827,14 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
 
     memory_barrier.srcStageMask |= src_stage;
     memory_barrier.srcAccessMask |= src_access & WRITE_MASK;
+}
+
+void Runtime::TrackIndirectRead(const VideoCore::Buffer* buffer,u64 offset,u64 size) {
+    static const bool enabled=[] {
+        const char* value=std::getenv("BB_INDIRECT_TRACK");return !value || value[0]!='0';
+    }();
+    if (enabled && size) AccessBuffer(buffer,offset,size,vk::PipelineStageFlagBits2::eDrawIndirect,
+                                     vk::AccessFlagBits2::eIndirectCommandRead);
 }
 
 void Runtime::FlushBarriers() {
